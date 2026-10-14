@@ -20,3 +20,29 @@
 .replica-status.is-disabled {
   opacity: 0.6;
 }
+
+.replica-diag {
+  padding: 8px 0 12px;
+  font-size: var(--font-ui-small);
+}
+.replica-diag-row {
+  display: flex;
+  gap: 12px;
+  padding: 2px 0;
+}
+.replica-diag-label {
+  min-width: 120px;
+  color: var(--text-muted);
+}
+.replica-diag-value {
+  word-break: break-all;
+}
+.replica-diag-value.is-ok {
+  color: var(--color-green);
+}
+.replica-diag-value.is-bad {
+  color: var(--color-red);
+}
+.replica-diag-value.is-warn {
+  color: var(--color-orange);
+}

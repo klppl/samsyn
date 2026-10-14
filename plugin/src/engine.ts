@@ -1,4 +1,4 @@
-import { App, Editor, MarkdownView, Notice, TAbstractFile, TFile, TFolder, normalizePath } from "obsidian";
+import { App, Editor, MarkdownView, Notice, Platform, TAbstractFile, TFile, TFolder, normalizePath } from "obsidian";
 import * as Y from "yjs";
 import { WebsocketProvider } from "y-websocket";
 import { BlobClient } from "./blobs";
@@ -17,6 +17,18 @@ export type EngineStatus = "disabled" | "offline" | "connecting" | "connected";
 
 export interface EngineEvents {
   onStatus(status: EngineStatus, peers: number): void;
+}
+
+export interface Diagnostics {
+  status: EngineStatus;
+  wsUrl: string;
+  synced: boolean;
+  peers: number;
+  textFiles: number;
+  blobFiles: number;
+  lastError: string | null;
+  lastConnectedAt: number | null;
+  hint: string | null;
 }
 
 /**
@@ -40,6 +52,10 @@ export class SyncEngine {
   private stopped = false;
   private unsubscribers: Array<() => void> = [];
   private status: EngineStatus = "offline";
+  private wsUrl = "";
+  private lastError: string | null = null;
+  private lastConnectedAt: number | null = null;
+  private hint: string | null = null;
 
   constructor(
     private app: App,
@@ -106,21 +122,65 @@ export class SyncEngine {
 
   private connect(wsBase: string): void {
     this.setStatus("connecting");
-    const provider = new WebsocketProvider(wsBase, this.settings.vaultId, this.doc, {
-      params: { token: this.settings.token },
-      disableBc: true,
-      maxBackoffTime: 10_000,
-      resyncInterval: 60_000,
-    });
+    this.wsUrl = `${wsBase}/${this.settings.vaultId}`;
+    if (wsBase.startsWith("ws://") && Platform.isMobileApp) {
+      this.hint =
+        "Plain ws:// is blocked on mobile (insecure WebSocket from a secure app). Use an https:// server URL with a valid certificate.";
+    } else if (typeof WebSocket === "undefined") {
+      this.hint = "WebSocket is not available in this environment.";
+    } else {
+      this.hint = null;
+    }
+    let provider: WebsocketProvider;
+    try {
+      provider = new WebsocketProvider(wsBase, this.settings.vaultId, this.doc, {
+        params: { token: this.settings.token },
+        disableBc: true,
+        maxBackoffTime: 10_000,
+        resyncInterval: 60_000,
+      });
+    } catch (e) {
+      this.lastError = `WebSocket could not be created: ${(e as Error).message}`;
+      console.error("[replica]", this.lastError);
+      this.setStatus("offline");
+      return;
+    }
     provider.awareness.setLocalStateField("user", { name: this.settings.deviceName });
     provider.on("status", ({ status }: { status: string }) => {
-      if (status === "connected") this.setStatus("connected");
-      else if (status === "connecting") this.setStatus("connecting");
+      if (status === "connected") {
+        this.lastError = null;
+        this.lastConnectedAt = Date.now();
+        this.setStatus("connected");
+      } else if (status === "connecting") this.setStatus("connecting");
       else this.setStatus("offline");
     });
-    provider.on("connection-error", () => this.setStatus("offline"));
+    provider.on("connection-error", (ev: Event) => {
+      this.lastError = `WebSocket error (${ev?.type ?? "error"}) connecting to ${this.wsUrl}`;
+      console.warn("[replica]", this.lastError, ev);
+      this.setStatus("offline");
+    });
+    provider.on("connection-close", (ev: CloseEvent | null) => {
+      if (ev && ev.code !== 1000 && ev.code !== 1005) {
+        this.lastError = `WebSocket closed: code ${ev.code}${ev.reason ? " " + ev.reason : ""}`;
+        if (ev.code === 1006) this.lastError += " (server unreachable, TLS/certificate problem, or blocked insecure ws://)";
+      }
+    });
     provider.awareness.on("change", () => this.setStatus(this.status));
     this.provider = provider;
+  }
+
+  getDiagnostics(): Diagnostics {
+    return {
+      status: this.status,
+      wsUrl: this.wsUrl,
+      synced: this.provider?.synced ?? false,
+      peers: this.provider ? Math.max(0, this.provider.awareness.getStates().size - 1) : 0,
+      textFiles: this.texts.size,
+      blobFiles: this.blobs.size,
+      lastError: this.lastError,
+      lastConnectedAt: this.lastConnectedAt,
+      hint: this.hint,
+    };
   }
 
   private waitForSync(timeoutMs: number): Promise<void> {

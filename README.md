@@ -36,6 +36,38 @@ docker compose up -d
 docker compose logs server | grep token
 ```
 
+### 1b. HTTPS (required for iOS, recommended everywhere)
+
+Obsidian on iOS runs in a secure WebKit context and refuses plain `ws://` WebSockets, so the server must be reachable over `https://` with a certificate the phone trusts. Three easy ways:
+
+**Tailscale (personal use, zero config).** Install Tailscale on the server and the phone, then:
+
+```sh
+tailscale serve --bg --https=443 http://127.0.0.1:8787
+```
+
+Server URL in the plugin: `https://<machine>.<tailnet>.ts.net`. Valid certificate, no port forwarding, works away from home.
+
+**Caddy (public hostname).** With a DNS name pointing at the server:
+
+```
+sync.example.com {
+    reverse_proxy 127.0.0.1:8787
+}
+```
+
+Caddy fetches a Let's Encrypt certificate automatically. Server URL: `https://sync.example.com`.
+
+**Built-in TLS.** If you already have a certificate (Let's Encrypt via certbot, or your own CA installed on the phone):
+
+```sh
+replica-server serve --tls-cert fullchain.pem --tls-key privkey.pem
+```
+
+Server URL: `https://host:8787`. A self-signed certificate works only if its CA is installed and trusted on the phone (Settings → General → About → Certificate Trust Settings).
+
+Desktop Obsidian accepts plain `http://` on a LAN, so you can develop without TLS and add it when you bring in a phone.
+
 ### 2. Install the plugin
 
 Until it is in the community list, install it manually or with [BRAT](https://github.com/TfTHacker/obsidian42-brat). See [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md) for desktop and phone instructions.
@@ -50,7 +82,7 @@ Obsidian → Settings → Replica:
 | Token      | the `rp_…` token printed by the server                       |
 | Vault ID   | defaults to the vault name; use the same ID on every device  |
 
-Press **Test connection**, then **Reconnect**. The status bar shows `Replica` when live, and how many other devices are on the same vault.
+Press **Test connection** (checks server and token), then **Reconnect**. The **Status** section at the top of the settings page shows live state, last error and hints; on desktop the status bar shows it too. The command **Replica: Show sync status** works on every platform.
 
 Repeat on each device with the same server, token and vault ID. That is all.
 

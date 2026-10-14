@@ -87,6 +87,14 @@ pub struct ServeArgs {
     /// Automatic snapshots to keep per vault.
     #[arg(long, env = "REPLICA_SNAPSHOT_KEEP", default_value_t = 14)]
     pub snapshot_keep: usize,
+
+    /// PEM certificate chain. With --tls-key, serve HTTPS/WSS directly (required for iOS).
+    #[arg(long, env = "REPLICA_TLS_CERT", requires = "tls_key")]
+    pub tls_cert: Option<PathBuf>,
+
+    /// PEM private key for --tls-cert.
+    #[arg(long, env = "REPLICA_TLS_KEY", requires = "tls_cert")]
+    pub tls_key: Option<PathBuf>,
 }
 
 #[derive(Subcommand, Debug, Clone)]

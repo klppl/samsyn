@@ -102,10 +102,6 @@ async fn serve(args: ServeArgs, storage: Storage) -> anyhow::Result<()> {
         .layer(TraceLayer::new_for_http())
         .with_state(state.clone());
 
-    let listener = tokio::net::TcpListener::bind(state.serve.bind)
-        .await
-        .with_context(|| format!("binding {}", state.serve.bind))?;
-
     if state.serve.snapshot_hours > 0 {
         let st = state.clone();
         tokio::spawn(async move {
@@ -117,12 +113,37 @@ async fn serve(args: ServeArgs, storage: Storage) -> anyhow::Result<()> {
         });
     }
 
-    tracing::info!("replica-server listening on http://{}", state.serve.bind);
     tracing::info!("data dir: {}", state.storage.root().display());
 
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
-        .await?;
+    let handle = axum_server::Handle::new();
+    {
+        let handle = handle.clone();
+        tokio::spawn(async move {
+            shutdown_signal().await;
+            handle.graceful_shutdown(Some(Duration::from_secs(5)));
+        });
+    }
+
+    match (&state.serve.tls_cert, &state.serve.tls_key) {
+        (Some(cert), Some(key)) => {
+            let tls = axum_server::tls_rustls::RustlsConfig::from_pem_file(cert, key)
+                .await
+                .with_context(|| format!("loading TLS cert {} / key {}", cert.display(), key.display()))?;
+            tracing::info!("replica-server listening on https://{} (TLS)", state.serve.bind);
+            axum_server::bind_rustls(state.serve.bind, tls)
+                .handle(handle)
+                .serve(app.into_make_service())
+                .await?;
+        }
+        _ => {
+            tracing::info!("replica-server listening on http://{}", state.serve.bind);
+            tracing::info!("note: iOS needs https; put this behind Caddy/Tailscale or pass --tls-cert/--tls-key");
+            axum_server::bind(state.serve.bind)
+                .handle(handle)
+                .serve(app.into_make_service())
+                .await?;
+        }
+    }
 
     tracing::info!("flushing snapshots before exit");
     state.vaults.snapshot_all(state.serve.snapshot_keep);

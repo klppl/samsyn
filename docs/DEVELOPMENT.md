@@ -127,6 +127,7 @@ adb push plugin/main.js plugin/manifest.json plugin/styles.css \
 
 Obsidian mobile does not expose a developer console. Options, in order of usefulness:
 
+0. **Settings → Replica → Status.** Live status, whether the initial sync completed, peer count, file counts, the exact WebSocket URL, last error and a hint. Also the command **Replica: Show sync status**. Check this first.
 1. **Watch the server.** `RUST_LOG=debug cargo run -- serve` shows every connection, auth failure and message. Most mobile issues (wrong URL, token, mixed content) are visible there.
 2. **Use the status bar and Notices.** Replica reports connection state in the status bar and shows a Notice on errors that matter.
 3. **Android: Chrome remote debugging.** With USB debugging enabled, `chrome://inspect` on a desktop Chrome lists the Obsidian WebView and gives a full console. Obsidian on Android must be a debuggable build for this; recent releases are, if not, fall back to 1 and 2.
@@ -134,7 +135,8 @@ Obsidian mobile does not expose a developer console. Options, in order of useful
 
 ### Mobile gotchas
 
-- Plain `http://` to a LAN IP works in Obsidian mobile, but iOS may block it if the server is on a `.local` hostname; use the IP.
+- **iOS needs `https://`.** The WebView is a secure context, so `new WebSocket("ws://…")` is refused as insecure mixed content, while `Test connection` still passes because `requestUrl` goes through native code. Symptoms: test OK, status stays "Offline" or "Connecting", hint on the settings page mentions ws://. Fix: Tailscale serve, Caddy, or `--tls-cert/--tls-key` (see README). Android is more lenient but treat it the same.
+- Self-signed certificates: install the CA on the phone and enable full trust for it (iOS: Settings → General → About → Certificate Trust Settings). `mkcert -install` plus AirDropping `rootCA.pem` is the quickest dev setup.
 - iOS suspends the app in the background and closes the WebSocket. Replica reconnects when the app returns and the reconcile step catches up on anything missed.
 - `WebSocket` headers cannot be set on mobile, which is why the token also goes in the URL query string.
 

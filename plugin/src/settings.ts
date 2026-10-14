@@ -56,8 +56,43 @@ export function serverUrls(raw: string): { http: string; ws: string } | null {
 }
 
 export class ReplicaSettingTab extends PluginSettingTab {
+  private statusTimer: ReturnType<typeof setInterval> | null = null;
+
   constructor(app: App, private plugin: ReplicaPlugin) {
     super(app, plugin);
+  }
+
+  hide(): void {
+    if (this.statusTimer) clearInterval(this.statusTimer);
+    this.statusTimer = null;
+  }
+
+  private renderStatus(el: HTMLElement): void {
+    el.empty();
+    const d = this.plugin.engine?.getDiagnostics();
+    if (!d) {
+      el.createDiv({ text: this.plugin.settings.enabled ? "Not running. Set a server URL and press Reconnect." : "Sync is disabled." });
+      return;
+    }
+    const line = (label: string, value: string, cls?: string) => {
+      const row = el.createDiv({ cls: "replica-diag-row" });
+      row.createSpan({ cls: "replica-diag-label", text: label });
+      row.createSpan({ cls: "replica-diag-value" + (cls ? " " + cls : ""), text: value });
+    };
+    const statusText: Record<string, string> = {
+      connected: "Connected, live",
+      connecting: "Connecting…",
+      offline: "Offline (changes queued locally)",
+      disabled: "Disabled / not configured",
+    };
+    line("Status", statusText[d.status] ?? d.status, d.status === "connected" ? "is-ok" : d.status === "offline" ? "is-bad" : "");
+    line("Initial sync", d.synced ? "done" : "pending");
+    line("Other devices", String(d.peers));
+    line("Synced files", `${d.textFiles} text, ${d.blobFiles} other`);
+    line("WebSocket", d.wsUrl || "–");
+    if (d.lastConnectedAt) line("Last connected", new Date(d.lastConnectedAt).toLocaleTimeString());
+    if (d.lastError) line("Last error", d.lastError, "is-bad");
+    if (d.hint) line("Hint", d.hint, "is-warn");
   }
 
   display(): void {
@@ -65,7 +100,13 @@ export class ReplicaSettingTab extends PluginSettingTab {
     containerEl.empty();
     const s = this.plugin.settings;
 
-    new Setting(containerEl).setName("Replica").setHeading();
+    new Setting(containerEl).setName("Status").setHeading();
+    const statusEl = containerEl.createDiv({ cls: "replica-diag" });
+    this.renderStatus(statusEl);
+    if (this.statusTimer) clearInterval(this.statusTimer);
+    this.statusTimer = setInterval(() => this.renderStatus(statusEl), 2000);
+
+    new Setting(containerEl).setName("Server").setHeading();
 
     new Setting(containerEl)
       .setName("Enable sync")
@@ -134,11 +175,12 @@ export class ReplicaSettingTab extends PluginSettingTab {
           }
           try {
             const res = await requestUrl({
-              url: `${urls.http}/health`,
+              url: `${urls.http}/me`,
               headers: { Authorization: `Bearer ${s.token}` },
               throw: false,
             });
-            if (res.status === 200) new Notice(`Replica: server OK (v${res.json?.version ?? "?"})`);
+            if (res.status === 200) new Notice(`Replica: server OK, token valid for user "${res.json?.user ?? "?"}"`);
+            else if (res.status === 401) new Notice("Replica: server reachable but token rejected");
             else new Notice(`Replica: server responded ${res.status}`);
           } catch (e) {
             new Notice(`Replica: cannot reach server (${(e as Error).message})`);

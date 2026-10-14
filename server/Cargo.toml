@@ -9,6 +9,7 @@ license = "MIT"
 anyhow = "1"
 bytes = "1"
 axum = { version = "0.8", features = ["ws", "macros"] }
+axum-server = { version = "0.8", features = ["tls-rustls"] }
 chrono = "0.4"
 clap = { version = "4", features = ["derive", "env"] }
 flate2 = "1"

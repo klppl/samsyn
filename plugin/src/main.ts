@@ -38,6 +38,24 @@ export default class ReplicaPlugin extends Plugin {
       },
     });
     this.addCommand({
+      id: "status",
+      name: "Show sync status",
+      callback: () => {
+        const d = this.engine?.getDiagnostics();
+        if (!d) {
+          new Notice("Replica: not running");
+          return;
+        }
+        const lines = [
+          `Replica: ${d.status}${d.synced ? ", synced" : ""}, ${d.peers} other device(s)`,
+          `${d.textFiles} text + ${d.blobFiles} other files`,
+        ];
+        if (d.lastError) lines.push(`Error: ${d.lastError}`);
+        if (d.hint) lines.push(d.hint);
+        new Notice(lines.join("\n"), 10_000);
+      },
+    });
+    this.addCommand({
       id: "toggle",
       name: "Toggle sync on/off",
       callback: async () => {
