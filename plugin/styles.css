@@ -1,0 +1,22 @@
+.replica-status {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  cursor: pointer;
+}
+.replica-status-icon svg {
+  width: 14px;
+  height: 14px;
+}
+.replica-status.is-connected .replica-status-icon {
+  color: var(--color-green);
+}
+.replica-status.is-offline .replica-status-icon {
+  color: var(--color-red);
+}
+.replica-status.is-connecting .replica-status-icon {
+  color: var(--color-yellow);
+}
+.replica-status.is-disabled {
+  opacity: 0.6;
+}

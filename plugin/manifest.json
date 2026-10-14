@@ -1,0 +1,10 @@
+{
+  "id": "replica",
+  "name": "Replica",
+  "version": "0.1.0",
+  "minAppVersion": "1.5.0",
+  "description": "Conflict-free live sync for your vault using CRDTs and your own server.",
+  "author": "mrboatsman",
+  "authorUrl": "https://github.com/mrboatsman/samsyn",
+  "isDesktopOnly": false
+}

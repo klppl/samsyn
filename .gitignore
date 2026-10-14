@@ -1,0 +1,9 @@
+# Rust
+server/target/
+# Node
+plugin/node_modules/
+plugin/main.js
+# Local data
+data/
+*.log
+.DS_Store
