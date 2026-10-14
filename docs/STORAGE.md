@@ -61,7 +61,11 @@ Roll a vault back with:
 replica-server restore-snapshot owner/notes path/to/2026-10-14T18-16-11Z.ybin --yes
 ```
 
-A safety snapshot of the current state is written first. Because Yjs merges, clients that still hold newer state will push it back after a rollback; if you want a hard reset, also reset the plugin's local state on each device (Settings → Replica → Reset).
+A safety snapshot of the current state is written first. Because Yjs merges, clients that still hold newer state will push it back after a rollback. That includes *deletions*: a device whose cached document contains "file X was deleted" will delete it again on reconnect. So a rollback is a three-step dance:
+
+1. Stop the server, `restore-snapshot … --yes`, start the server.
+2. On **every** device: Settings → Replica → **Reset local sync state** (drops the cached document; files on disk are untouched).
+3. Each device reconnects, downloads the restored state, and reconciles its disk against it. Files that exist on disk but not in the snapshot are pushed up again as new files.
 
 ## Backups
 
@@ -95,6 +99,7 @@ The server does not encrypt data itself. Recommended: run on an encrypted filesy
 | Server disk lost | `restore --from <latest backup>`; devices reconnect and re-merge anything newer they still hold |
 | One vault corrupted | `restore-snapshot user/vault <snapshot> --yes`, or `restore --merge` from a backup containing just that vault |
 | `registry.db` lost, vault dirs intact | re-create users (`user add`), then `restore --merge` from any backup, or copy vault dirs and re-register them from their `vault.json` (tooling for this is a TODO) |
+| Files vanished from the shared vault (a device pushed mass deletions) | Restore them from that device's Obsidian/system trash and let reconcile push them back, or roll back with `restore-snapshot` + reset local state on every device (see Snapshots). The plugin's mass-delete guard now refuses such pushes without explicit confirmation. |
 | Token leaked | `user revoke <name> --label <label>` (or all), then `user token <name>` |
 | Need to move servers | stop, `backup`, `restore` on the new host, point the plugin at the new URL |
 

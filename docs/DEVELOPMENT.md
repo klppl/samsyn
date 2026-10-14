@@ -140,6 +140,12 @@ Obsidian mobile does not expose a developer console. Options, in order of useful
 - iOS suspends the app in the background and closes the WebSocket. Replica reconnects when the app returns and the reconcile step catches up on anything missed.
 - `WebSocket` headers cannot be set on mobile, which is why the token also goes in the URL query string.
 
+## Safety behaviour worth knowing while testing
+
+- **Sync state is device-bound.** `state.json` records which files this install has seen in sync. It is tagged with a per-device install id (Obsidian's `appId`, falling back to localStorage) and ignored if it was copied from another device along with `.obsidian`. Copying `doc.bin` is harmless; copying `state.json` used to make the new device think every file had been deleted locally.
+- **Mass-delete guard.** If one reconcile would remove at least 5 files and more than half of the shared vault, the plugin refuses, re-downloads them, shows a Notice, and lists them under *Held back* on the settings page. The command **Replica: Apply held-back deletions** does it for real. Single and small deletions are applied normally.
+- **Remote deletions go to trash**, never a hard delete (Obsidian's "Deleted files" setting decides system trash vs `.trash/`).
+
 ## Tests
 
 ```sh

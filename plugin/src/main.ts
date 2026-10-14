@@ -38,6 +38,24 @@ export default class ReplicaPlugin extends Plugin {
       },
     });
     this.addCommand({
+      id: "apply-deletions",
+      name: "Apply held-back deletions to the shared vault (danger)",
+      callback: async () => {
+        const n = this.engine?.pendingDeletions.length ?? 0;
+        if (!this.engine || n === 0) {
+          new Notice("Replica: nothing held back");
+          return;
+        }
+        // The guard re-downloaded them; remove locally again first so reconcile sees them missing.
+        for (const p of this.engine.pendingDeletions) {
+          const f = this.app.vault.getAbstractFileByPath(p);
+          if (f) await this.app.fileManager.trashFile(f);
+        }
+        await this.engine.reconcileAll({ allowMassDelete: true });
+        new Notice(`Replica: removed ${n} files from the shared vault`);
+      },
+    });
+    this.addCommand({
       id: "status",
       name: "Show sync status",
       callback: () => {
@@ -52,6 +70,7 @@ export default class ReplicaPlugin extends Plugin {
         ];
         if (d.lastError) lines.push(`Error: ${d.lastError}`);
         if (d.hint) lines.push(d.hint);
+        if (d.pendingDeletions > 0) lines.push(`${d.pendingDeletions} deletions held back by the safety guard`);
         new Notice(lines.join("\n"), 10_000);
       },
     });

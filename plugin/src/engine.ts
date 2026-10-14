@@ -4,7 +4,7 @@ import { WebsocketProvider } from "y-websocket";
 import { BlobClient } from "./blobs";
 import { diffText } from "./diff";
 import { hashText, sha256Hex } from "./hash";
-import { LocalState, Persistence } from "./persistence";
+import { LocalState, Persistence, deviceInstallId } from "./persistence";
 import { ReplicaSettings, serverUrls } from "./settings";
 
 export interface BlobMeta {
@@ -29,7 +29,14 @@ export interface Diagnostics {
   lastError: string | null;
   lastConnectedAt: number | null;
   hint: string | null;
+  installId: string;
+  pendingDeletions: number;
 }
+
+/** Refuse to delete from the shared vault when one reconcile wants to remove this many files… */
+const MASS_DELETE_MIN = 5;
+/** …and they make up more than this share of the shared vault. */
+const MASS_DELETE_RATIO = 0.5;
 
 /**
  * Document layout (one Y.Doc per vault):
@@ -56,6 +63,9 @@ export class SyncEngine {
   private lastError: string | null = null;
   private lastConnectedAt: number | null = null;
   private hint: string | null = null;
+  private installId = "";
+  /** Deletions from the shared vault that the mass-delete guard held back. */
+  pendingDeletions: string[] = [];
 
   constructor(
     private app: App,
@@ -80,10 +90,15 @@ export class SyncEngine {
   // ---------------------------------------------------------------- lifecycle
 
   async start(): Promise<void> {
-    this.state = await this.persistence.loadState();
+    this.installId = deviceInstallId(this.app);
+    this.state = await this.persistence.loadState(this.installId);
     const hadDoc = await this.persistence.loadDoc(this.doc);
 
     this.doc.on("update", () => this.persistence.scheduleSaveDoc(this.doc));
+
+    // Observers go in before we connect so nothing that arrives during the initial sync or
+    // during reconcile is missed. All handlers are idempotent, so overlap with reconcile is safe.
+    this.installObservers();
 
     const urls = serverUrls(this.settings.serverUrl);
     if (urls && this.settings.vaultId) {
@@ -99,7 +114,6 @@ export class SyncEngine {
     }
 
     await this.reconcileAll();
-    this.installObservers();
     this.installVaultListeners();
   }
 
@@ -180,6 +194,8 @@ export class SyncEngine {
       lastError: this.lastError,
       lastConnectedAt: this.lastConnectedAt,
       hint: this.hint,
+      installId: this.installId,
+      pendingDeletions: this.pendingDeletions.length,
     };
   }
 
@@ -273,10 +289,17 @@ export class SyncEngine {
     this.markSynced(path, hashText(content));
     const existing = this.app.vault.getAbstractFileByPath(path);
     if (existing instanceof TFile) {
-      await this.app.vault.modify(existing, content);
-    } else {
-      await this.ensureFolder(path);
+      if ((await this.app.vault.read(existing)) !== content) await this.app.vault.modify(existing, content);
+      return;
+    }
+    await this.ensureFolder(path);
+    try {
       await this.app.vault.create(path, content);
+    } catch (e) {
+      // Raced with another writer (observer vs reconcile); fall back to modify.
+      const f = this.app.vault.getAbstractFileByPath(path);
+      if (f instanceof TFile) await this.app.vault.modify(f, content);
+      else throw e;
     }
   }
 
@@ -285,9 +308,15 @@ export class SyncEngine {
     const existing = this.app.vault.getAbstractFileByPath(path);
     if (existing instanceof TFile) {
       await this.app.vault.modifyBinary(existing, data);
-    } else {
-      await this.ensureFolder(path);
+      return;
+    }
+    await this.ensureFolder(path);
+    try {
       await this.app.vault.createBinary(path, data);
+    } catch (e) {
+      const f = this.app.vault.getAbstractFileByPath(path);
+      if (f instanceof TFile) await this.app.vault.modifyBinary(f, data);
+      else throw e;
     }
   }
 
@@ -591,7 +620,7 @@ export class SyncEngine {
    * Three-way compare of every file: local disk, shared doc, and the hash we recorded the
    * last time the two agreed. Runs at startup and on demand. Idempotent.
    */
-  async reconcileAll(): Promise<void> {
+  async reconcileAll(opts: { allowMassDelete?: boolean } = {}): Promise<void> {
     const localFiles = new Map<string, TFile>();
     for (const f of this.app.vault.getFiles()) {
       if (this.shouldSync(f.path)) localFiles.set(f.path, f);
@@ -608,11 +637,12 @@ export class SyncEngine {
     }
 
     // Then entries in the doc that are missing locally.
+    const toDelete: string[] = [];
     for (const path of [...this.texts.keys()]) {
       if (localFiles.has(path) || !this.shouldSync(path)) continue;
       if (this.state.synced[path]) {
         // We had it and it is gone locally: deleted while offline.
-        this.removeFromDoc(path);
+        toDelete.push(path);
       } else {
         const t = this.texts.get(path);
         if (t) await this.writeTextToDisk(path, t.toString());
@@ -621,11 +651,37 @@ export class SyncEngine {
     for (const path of [...this.blobs.keys()]) {
       if (localFiles.has(path) || !this.shouldSync(path)) continue;
       if (this.state.synced[path]) {
-        this.removeFromDoc(path);
+        toDelete.push(path);
       } else {
         const m = this.blobs.get(path);
         if (m) await this.applyRemoteBlob(path, m);
       }
+    }
+
+    const total = this.texts.size + this.blobs.size;
+    const massDelete = toDelete.length >= MASS_DELETE_MIN && toDelete.length > total * MASS_DELETE_RATIO;
+    if (massDelete && !opts.allowMassDelete) {
+      this.pendingDeletions = toDelete;
+      console.warn(`[replica] refusing to delete ${toDelete.length} of ${total} shared files; held back`, toDelete);
+      new Notice(
+        `Replica: ${toDelete.length} files are missing here but exist in the shared vault. ` +
+          `Not deleting them for safety. They will be re-downloaded on next reconcile, or run ` +
+          `"Replica: Apply held-back deletions" if you really removed them.`,
+        15_000,
+      );
+      // Bring them back locally instead, so this device matches the shared vault.
+      for (const path of toDelete) {
+        this.forgetSynced(path);
+        const t = this.texts.get(path);
+        if (t) await this.writeTextToDisk(path, t.toString());
+        else {
+          const m = this.blobs.get(path);
+          if (m) await this.applyRemoteBlob(path, m);
+        }
+      }
+    } else {
+      this.pendingDeletions = [];
+      for (const path of toDelete) this.removeFromDoc(path);
     }
     await this.persistence.saveState(this.state);
   }

@@ -93,6 +93,8 @@ export class ReplicaSettingTab extends PluginSettingTab {
     if (d.lastConnectedAt) line("Last connected", new Date(d.lastConnectedAt).toLocaleTimeString());
     if (d.lastError) line("Last error", d.lastError, "is-bad");
     if (d.hint) line("Hint", d.hint, "is-warn");
+    if (d.pendingDeletions > 0) line("Held back", `${d.pendingDeletions} deletions (see command "Apply held-back deletions")`, "is-warn");
+    line("Install id", d.installId);
   }
 
   display(): void {
