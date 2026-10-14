@@ -1,0 +1,16 @@
+services:
+  server:
+    build:
+      context: .
+      dockerfile: server/Dockerfile
+    # Or use the prebuilt image instead of building:
+    # image: ghcr.io/mrboatsman/samsyn:latest
+    restart: unless-stopped
+    ports:
+      - "8787:8787"
+    volumes:
+      - ./data:/data
+    environment:
+      RUST_LOG: info
+      # REPLICA_SNAPSHOT_HOURS: "24"
+      # REPLICA_MAX_BLOB_MB: "256"

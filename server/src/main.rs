@@ -1,20 +1,23 @@
-//! Replica server: a y-sync compatible WebSocket server backed by yrs + SQLite.
+//! Replica server: a y-sync compatible WebSocket server backed by yrs, with per-user vaults.
 //!
-//! One Yjs document per vault. Clients connect to `/ws/{vault_id}?token=...`
-//! and speak the standard y-sync protocol (same one as y-websocket), so the
-//! Obsidian plugin can use `y-protocols` unchanged.
+//! Clients connect to `/ws/{vault_name}?token=...`. The token identifies the user; the vault
+//! name is scoped to that user and created on first use. Protocol = standard y-sync, so the
+//! Obsidian plugin uses `y-websocket` unchanged.
 
 mod blobs;
+mod cli;
 mod config;
-mod store;
+mod ids;
+mod storage;
 mod vault;
 mod ws;
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::Context;
 use axum::{
-    extract::State,
+    extract::{DefaultBodyLimit, State},
     http::StatusCode,
     routing::{get, put},
     Json, Router,
@@ -24,58 +27,105 @@ use tower_http::cors::{Any, CorsLayer};
 use tower_http::trace::TraceLayer;
 use tracing_subscriber::EnvFilter;
 
-use crate::config::Config;
-use crate::store::Store;
+use crate::config::{Cli, Command, ServeArgs};
+use crate::storage::Storage;
 use crate::vault::VaultRegistry;
 
 pub struct AppState {
-    pub config: Config,
-    pub store: Store,
+    pub serve: ServeArgs,
+    pub storage: Storage,
     pub vaults: VaultRegistry,
 }
 
 pub type SharedState = Arc<AppState>;
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info,tower_http=warn")),
         )
+        .with_writer(std::io::stderr)
         .init();
 
-    let config = Config::parse().resolve().context("resolving configuration")?;
-    let store = Store::open(&config.data_dir.join("replica.db")).context("opening database")?;
+    let cli = Cli::parse();
+    let command = cli.command.unwrap_or(Command::Serve(ServeArgs::parse_from(["serve"])));
+
+    match command {
+        Command::Serve(args) => {
+            let storage = Storage::open(&cli.data_dir).context("opening data dir")?;
+            tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()?
+                .block_on(serve(args, storage))
+        }
+        Command::User { cmd } => cli::user(&Storage::open(&cli.data_dir)?, cmd),
+        Command::Vault { cmd } => cli::vault(&Storage::open(&cli.data_dir)?, cmd),
+        Command::Snapshot { target, keep } => cli::snapshot(&Storage::open(&cli.data_dir)?, target, keep),
+        Command::Backup { out, user, vault } => cli::backup(&Storage::open(&cli.data_dir)?, out, user, vault),
+        Command::Restore { from, merge } => cli::restore(&cli.data_dir, &from, merge),
+        Command::RestoreSnapshot { target, file, yes } => {
+            cli::restore_snapshot(&Storage::open(&cli.data_dir)?, &target, &file, yes)
+        }
+    }
+}
+
+async fn serve(args: ServeArgs, storage: Storage) -> anyhow::Result<()> {
+    // Zero-config first start: create an owner user and print the token once.
+    if storage.registry().user_count()? == 0 {
+        let u = storage.registry().create_user("owner")?;
+        let token = storage.registry().create_token(&u.id, "initial")?;
+        tracing::info!("first start: created user 'owner'");
+        tracing::info!("========================================================");
+        tracing::info!("  token: {token}");
+        tracing::info!("  paste the server URL and this token into the plugin");
+        tracing::info!("  add more users with: replica-server user add <name>");
+        tracing::info!("========================================================");
+    }
+
+    let max_blob = args.max_blob_mb * 1024 * 1024;
     let state: SharedState = Arc::new(AppState {
-        vaults: VaultRegistry::new(store.clone()),
-        config,
-        store,
+        vaults: VaultRegistry::new(storage.clone()),
+        storage,
+        serve: args,
     });
 
     let app = Router::new()
         .route("/", get(index))
         .route("/health", get(health))
-        .route("/ws/{vault_id}", get(ws::ws_handler))
+        .route("/me", get(ws::whoami))
+        .route("/ws/{vault}", get(ws::ws_handler))
         .route(
-            "/blobs/{vault_id}/{hash}",
-            put(blobs::put_blob).get(blobs::get_blob),
+            "/blobs/{vault}/{hash}",
+            put(blobs::put_blob).get(blobs::get_blob).layer(DefaultBodyLimit::max(max_blob)),
         )
         .layer(CorsLayer::new().allow_origin(Any).allow_methods(Any).allow_headers(Any))
         .layer(TraceLayer::new_for_http())
         .with_state(state.clone());
 
-    let listener = tokio::net::TcpListener::bind(state.config.bind)
+    let listener = tokio::net::TcpListener::bind(state.serve.bind)
         .await
-        .with_context(|| format!("binding {}", state.config.bind))?;
+        .with_context(|| format!("binding {}", state.serve.bind))?;
 
-    tracing::info!("replica-server listening on http://{}", state.config.bind);
-    tracing::info!("data dir: {}", state.config.data_dir.display());
-    tracing::info!("auth token: {}", state.config.token);
-    tracing::info!("paste the URL and token into the Replica plugin settings");
+    if state.serve.snapshot_hours > 0 {
+        let st = state.clone();
+        tokio::spawn(async move {
+            let every = Duration::from_secs(st.serve.snapshot_hours * 3600);
+            loop {
+                tokio::time::sleep(every).await;
+                st.vaults.snapshot_all(st.serve.snapshot_keep);
+            }
+        });
+    }
+
+    tracing::info!("replica-server listening on http://{}", state.serve.bind);
+    tracing::info!("data dir: {}", state.storage.root().display());
 
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
         .await?;
+
+    tracing::info!("flushing snapshots before exit");
+    state.vaults.snapshot_all(state.serve.snapshot_keep);
     Ok(())
 }
 

@@ -93,7 +93,7 @@ export class ReplicaSettingTab extends PluginSettingTab {
 
     new Setting(containerEl)
       .setName("Token")
-      .setDesc("The auth token printed by the server on first start.")
+      .setDesc("Your user token (rp_…). The server prints one on first start; admins create more with `replica-server user add`.")
       .addText((t) => {
         t.inputEl.type = "password";
         t.setValue(s.token).onChange(async (v) => {
@@ -104,7 +104,7 @@ export class ReplicaSettingTab extends PluginSettingTab {
 
     new Setting(containerEl)
       .setName("Vault ID")
-      .setDesc("Devices with the same vault ID on the same server share one vault. Defaults to the vault name.")
+      .setDesc("Vault name on the server, scoped to your user. Use the same ID on every device that should share this vault. Defaults to the vault name.")
       .addText((t) =>
         t.setValue(s.vaultId).onChange(async (v) => {
           s.vaultId = slugify(v);

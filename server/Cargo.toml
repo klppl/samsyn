@@ -9,16 +9,20 @@ license = "MIT"
 anyhow = "1"
 bytes = "1"
 axum = { version = "0.8", features = ["ws", "macros"] }
+chrono = "0.4"
 clap = { version = "4", features = ["derive", "env"] }
+flate2 = "1"
 futures = "0.3"
 rand = "0.9"
-rusqlite = { version = "0.40", features = ["bundled"] }
+rusqlite = { version = "0.40", features = ["bundled", "backup"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
 hex = "0.4"
 tokio = { version = "1", features = ["full"] }
 tower-http = { version = "0.7", features = ["cors", "trace"] }
+tar = "0.4"
+tempfile = "3"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 yrs = { version = "0.28", features = ["sync"] }

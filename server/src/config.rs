@@ -1,72 +1,126 @@
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
-use anyhow::Context;
-use clap::Parser;
-use rand::RngCore;
+use clap::{Parser, Subcommand};
 
-/// Command line / environment configuration.
 #[derive(Parser, Debug, Clone)]
 #[command(name = "replica-server", version, about = "CRDT sync server for the Replica Obsidian plugin")]
-pub struct Config {
+pub struct Cli {
+    /// Directory holding all server data (registry, vaults, blobs, snapshots).
+    #[arg(long, global = true, env = "REPLICA_DATA_DIR", default_value = "./data")]
+    pub data_dir: PathBuf,
+
+    #[command(subcommand)]
+    pub command: Option<Command>,
+}
+
+#[derive(Subcommand, Debug, Clone)]
+pub enum Command {
+    /// Run the sync server (default when no subcommand is given).
+    Serve(ServeArgs),
+    /// Manage users and their tokens.
+    User {
+        #[command(subcommand)]
+        cmd: UserCmd,
+    },
+    /// Inspect vaults.
+    Vault {
+        #[command(subcommand)]
+        cmd: VaultCmd,
+    },
+    /// Write a full-state snapshot of one vault (or all) and compact its log.
+    Snapshot {
+        /// `user/vault`; omit for every vault.
+        target: Option<String>,
+        /// Snapshots to keep per vault after pruning.
+        #[arg(long, default_value_t = 14)]
+        keep: usize,
+    },
+    /// Create a tar.gz backup of the data directory (safe while the server runs).
+    Backup {
+        /// Output file, or `-` for stdout (pipe into age/gpg to encrypt).
+        #[arg(long, short)]
+        out: Option<String>,
+        /// Only this user's vaults.
+        #[arg(long)]
+        user: Option<String>,
+        /// Only this vault name (with --user).
+        #[arg(long)]
+        vault: Option<String>,
+    },
+    /// Restore a tar.gz backup into the data directory. Stop the server first.
+    Restore {
+        /// Input file, or `-` for stdin.
+        #[arg(long, short)]
+        from: String,
+        /// Allow restoring into a non-empty data dir (adds/overwrites the vaults in the archive).
+        #[arg(long)]
+        merge: bool,
+    },
+    /// Roll one vault back to a snapshot file. Destructive; stop the server first.
+    RestoreSnapshot {
+        /// `user/vault`
+        target: String,
+        /// Path to a `.ybin` snapshot.
+        file: PathBuf,
+        /// Confirm you understand the current log is replaced.
+        #[arg(long)]
+        yes: bool,
+    },
+}
+
+#[derive(Parser, Debug, Clone)]
+#[command(name = "serve")]
+pub struct ServeArgs {
     /// Address to listen on.
     #[arg(long, env = "REPLICA_BIND", default_value = "0.0.0.0:8787")]
     pub bind: SocketAddr,
 
-    /// Directory for the SQLite database and generated token.
-    #[arg(long, env = "REPLICA_DATA_DIR", default_value = "./data")]
-    pub data_dir: PathBuf,
-
-    /// Shared secret clients must present. Generated and persisted on first start if omitted.
-    #[arg(long, env = "REPLICA_TOKEN", default_value = "")]
-    pub token: String,
-
     /// Maximum blob size in megabytes.
     #[arg(long, env = "REPLICA_MAX_BLOB_MB", default_value_t = 256)]
     pub max_blob_mb: usize,
+
+    /// Hours between automatic snapshots of active vaults (0 disables).
+    #[arg(long, env = "REPLICA_SNAPSHOT_HOURS", default_value_t = 24)]
+    pub snapshot_hours: u64,
+
+    /// Automatic snapshots to keep per vault.
+    #[arg(long, env = "REPLICA_SNAPSHOT_KEEP", default_value_t = 14)]
+    pub snapshot_keep: usize,
 }
 
-impl Config {
-    /// Create the data dir and load or generate the token.
-    pub fn resolve(mut self) -> anyhow::Result<Self> {
-        std::fs::create_dir_all(&self.data_dir)
-            .with_context(|| format!("creating data dir {}", self.data_dir.display()))?;
-
-        if self.token.is_empty() {
-            let token_file = self.data_dir.join("token");
-            if token_file.exists() {
-                self.token = std::fs::read_to_string(&token_file)?.trim().to_string();
-            } else {
-                self.token = generate_token();
-                std::fs::write(&token_file, &self.token)?;
-                tracing::info!("generated new auth token at {}", token_file.display());
-            }
-        }
-        Ok(self)
-    }
-
-    pub fn token_matches(&self, presented: Option<&str>) -> bool {
-        match presented {
-            Some(t) => constant_time_eq(t.as_bytes(), self.token.as_bytes()),
-            None => false,
-        }
-    }
+#[derive(Subcommand, Debug, Clone)]
+pub enum UserCmd {
+    /// Create a user and print their first token.
+    Add { name: String },
+    /// List users.
+    List,
+    /// Issue an additional token for a user (e.g. one per device).
+    Token {
+        name: String,
+        #[arg(long, default_value = "device")]
+        label: String,
+    },
+    /// Revoke tokens of a user (all, or one label).
+    Revoke {
+        name: String,
+        #[arg(long)]
+        label: Option<String>,
+    },
+    /// Delete a user from the registry. Their vault directories are left on disk.
+    Remove { name: String },
 }
 
-fn generate_token() -> String {
-    let mut bytes = [0u8; 24];
-    rand::rng().fill_bytes(&mut bytes);
-    hex::encode(bytes)
+#[derive(Subcommand, Debug, Clone)]
+pub enum VaultCmd {
+    /// List vaults, optionally for one user.
+    List {
+        #[arg(long)]
+        user: Option<String>,
+    },
 }
 
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
-}
-
-/// Extract a bearer token from either the `Authorization` header or the `token` query param.
+/// Extract a bearer token from the `Authorization` header or the `token` query param.
 /// Obsidian mobile cannot set WebSocket headers, hence the query param fallback.
 pub fn extract_token(headers: &axum::http::HeaderMap, query_token: Option<&str>) -> Option<String> {
     if let Some(v) = headers.get(axum::http::header::AUTHORIZATION) {

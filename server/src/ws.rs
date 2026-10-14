@@ -1,7 +1,6 @@
-//! WebSocket endpoint speaking the y-sync protocol.
+//! WebSocket endpoint speaking the y-sync protocol, scoped to the authenticated user's vault.
 
-use std::collections::HashMap;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use axum::{
     extract::{
@@ -10,6 +9,7 @@ use axum::{
     },
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
+    Json,
 };
 use bytes::Bytes;
 use futures::{SinkExt, StreamExt};
@@ -20,52 +20,81 @@ use yrs::updates::decoder::DecoderV1;
 use yrs::updates::encoder::{Encoder, EncoderV1};
 
 use crate::config::extract_token;
-use crate::vault::{encode_message, valid_vault_id};
+use crate::ids::valid_name;
+use crate::storage::User;
+use crate::vault::encode_message;
 use crate::SharedState;
 
-pub async fn ws_handler(
-    ws: WebSocketUpgrade,
-    Path(vault_id): Path<String>,
+/// Shared auth for ws + blob routes.
+pub fn authenticate(state: &SharedState, headers: &HeaderMap, query: &HashMap<String, String>) -> Result<User, Response> {
+    let token = extract_token(headers, query.get("token").map(String::as_str));
+    match token.and_then(|t| state.storage.registry().authenticate(&t).ok().flatten()) {
+        Some(u) => Ok(u),
+        None => Err((StatusCode::UNAUTHORIZED, "bad token").into_response()),
+    }
+}
+
+pub async fn whoami(
     Query(query): Query<HashMap<String, String>>,
     headers: HeaderMap,
     State(state): State<SharedState>,
 ) -> Response {
-    if !valid_vault_id(&vault_id) {
-        return (StatusCode::BAD_REQUEST, "invalid vault id").into_response();
+    match authenticate(&state, &headers, &query) {
+        Ok(u) => {
+            let vaults: Vec<String> = state
+                .storage
+                .registry()
+                .list_vaults(Some(&u.id))
+                .map(|v| v.into_iter().map(|v| v.name).collect())
+                .unwrap_or_default();
+            Json(serde_json::json!({ "user": u.name, "vaults": vaults })).into_response()
+        }
+        Err(r) => r,
     }
-    let token = extract_token(&headers, query.get("token").map(String::as_str));
-    if !state.config.token_matches(token.as_deref()) {
-        return (StatusCode::UNAUTHORIZED, "bad token").into_response();
+}
+
+pub async fn ws_handler(
+    ws: WebSocketUpgrade,
+    Path(vault_name): Path<String>,
+    Query(query): Query<HashMap<String, String>>,
+    headers: HeaderMap,
+    State(state): State<SharedState>,
+) -> Response {
+    if !valid_name(&vault_name) {
+        return (StatusCode::BAD_REQUEST, "invalid vault name").into_response();
     }
-    let vault = match state.vaults.get_or_load(&vault_id) {
+    let user = match authenticate(&state, &headers, &query) {
+        Ok(u) => u,
+        Err(r) => return r,
+    };
+    let vault = match state.vaults.get_or_load(&user, &vault_name) {
         Ok(v) => v,
         Err(e) => {
-            tracing::error!(vault = %vault_id, "failed to load vault: {e}");
+            tracing::error!(vault = %vault_name, user = %user.name, "failed to load vault: {e}");
             return (StatusCode::INTERNAL_SERVER_ERROR, "failed to load vault").into_response();
         }
     };
-    ws.on_upgrade(move |socket| handle_socket(socket, state, vault_id, vault))
+    ws.on_upgrade(move |socket| handle_socket(socket, state, user, vault))
 }
 
 async fn handle_socket(
     socket: WebSocket,
     state: SharedState,
-    vault_id: String,
+    user: User,
     vault: std::sync::Arc<crate::vault::Vault>,
 ) {
     let (mut sink, mut stream) = socket.split();
-    // Subscribe before the initial sync so nothing is missed in between.
     let mut rx = vault.tx.subscribe();
     let protocol = DefaultProtocol;
+    let label = format!("{}/{}", user.name, vault.info.name);
 
-    // Initial handshake: our state vector + current awareness.
     let hello = {
         let aw = vault.awareness.lock().unwrap();
         let mut enc = EncoderV1::new();
         match protocol.start(&aw, &mut enc) {
             Ok(()) => Bytes::from(enc.to_vec()),
             Err(e) => {
-                tracing::warn!(vault = %vault_id, "protocol start failed: {e}");
+                tracing::warn!(vault = %label, "protocol start failed: {e}");
                 return;
             }
         }
@@ -74,9 +103,8 @@ async fn handle_socket(
         return;
     }
 
-    // Awareness client ids this connection has announced, cleaned up on disconnect.
     let mut owned_clients: HashSet<ClientID> = HashSet::new();
-    tracing::debug!(vault = %vault_id, "client connected");
+    tracing::debug!(vault = %label, "client connected");
 
     loop {
         tokio::select! {
@@ -90,14 +118,10 @@ async fn handle_socket(
                         match replies {
                             Ok(replies) => {
                                 for r in replies {
-                                    if sink.send(WsMessage::Binary(r)).await.is_err() {
-                                        break;
-                                    }
+                                    if sink.send(WsMessage::Binary(r)).await.is_err() { break; }
                                 }
                             }
-                            Err(e) => {
-                                tracing::warn!(vault = %vault_id, "bad message from client: {e}");
-                            }
+                            Err(e) => tracing::warn!(vault = %label, "bad message from client: {e}"),
                         }
                     }
                     Some(Ok(WsMessage::Ping(p))) => {
@@ -106,7 +130,7 @@ async fn handle_socket(
                     Some(Ok(WsMessage::Close(_))) | None => break,
                     Some(Ok(_)) => {}
                     Some(Err(e)) => {
-                        tracing::debug!(vault = %vault_id, "ws error: {e}");
+                        tracing::debug!(vault = %label, "ws error: {e}");
                         break;
                     }
                 }
@@ -117,8 +141,7 @@ async fn handle_socket(
                         if sink.send(WsMessage::Binary(bytes)).await.is_err() { break; }
                     }
                     Err(RecvError::Lagged(n)) => {
-                        // Too slow; resend a full sync step so the client catches up.
-                        tracing::warn!(vault = %vault_id, "client lagged {n} messages, resyncing");
+                        tracing::warn!(vault = %label, "client lagged {n} messages, resyncing");
                         let resync = {
                             let aw = vault.awareness.lock().unwrap();
                             let mut enc = EncoderV1::new();
@@ -133,7 +156,6 @@ async fn handle_socket(
         }
     }
 
-    // Remove this connection's awareness states so others see it leave.
     if !owned_clients.is_empty() {
         let mut aw = vault.awareness.lock().unwrap();
         for id in owned_clients {
@@ -141,10 +163,9 @@ async fn handle_socket(
         }
     }
     state.vaults.maybe_compact(&vault);
-    tracing::debug!(vault = %vault_id, "client disconnected");
+    tracing::debug!(vault = %label, "client disconnected");
 }
 
-/// Decode every message in a payload, track awareness client ids, run the protocol.
 fn handle_payload(
     protocol: &DefaultProtocol,
     aw: &mut yrs::sync::Awareness,
