@@ -1,5 +1,6 @@
 import { App, Notice, PluginSettingTab, Setting, requestUrl } from "obsidian";
 import type ReplicaPlugin from "./main";
+import { SharingSection } from "./sharing-ui";
 
 export interface ReplicaSettings {
   enabled: boolean;
@@ -198,6 +199,13 @@ export class ReplicaSettingTab extends PluginSettingTab {
             new Notice("Replica: reconnecting");
           }),
       );
+
+    if (s.serverUrl && s.token) {
+      const sharingEl = containerEl.createDiv();
+      const section = new SharingSection(this.plugin, sharingEl);
+      section.render();
+      void section.load();
+    }
 
     new Setting(containerEl).setName("What to sync").setHeading();
 

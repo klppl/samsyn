@@ -5,11 +5,14 @@
 //! Obsidian plugin uses `y-websocket` unchanged.
 
 mod blobs;
+mod bridge;
 mod cli;
 mod client;
 mod config;
 mod ids;
+mod sharing;
 mod storage;
+mod ticket;
 mod vault;
 mod ws;
 
@@ -20,7 +23,7 @@ use anyhow::Context;
 use axum::{
     extract::{DefaultBodyLimit, State},
     http::StatusCode,
-    routing::{get, put},
+    routing::{delete, get, post, put},
     Json, Router,
 };
 use clap::Parser;
@@ -30,12 +33,12 @@ use tracing_subscriber::EnvFilter;
 
 use crate::config::{Cli, Command, ServeArgs};
 use crate::storage::Storage;
-use crate::vault::VaultRegistry;
+use crate::vault::DocRegistry;
 
 pub struct AppState {
     pub serve: ServeArgs,
     pub storage: Storage,
-    pub vaults: VaultRegistry,
+    pub docs: DocRegistry,
 }
 
 pub type SharedState = Arc<AppState>;
@@ -87,18 +90,31 @@ async fn serve(args: ServeArgs, storage: Storage) -> anyhow::Result<()> {
         tracing::info!("========================================================");
     }
 
+    let identity = storage.identity()?;
+    let node_id = identity.public().to_string();
+    tracing::info!("server node id: {node_id}");
+
     let max_blob = args.max_blob_mb * 1024 * 1024;
     let state: SharedState = Arc::new(AppState {
-        vaults: VaultRegistry::new(storage.clone()),
+        docs: DocRegistry::new(storage.clone(), node_id),
         storage,
         serve: args,
     });
+
+    state.docs.preload_bridged();
 
     let app = Router::new()
         .route("/", get(index))
         .route("/health", get(health))
         .route("/me", get(ws::whoami))
         .route("/ws/{vault}", get(ws::ws_handler))
+        .route("/api/vaults/{vault}/sharing", get(sharing::get_sharing))
+        .route("/api/vaults/{vault}/shares", post(sharing::create_share))
+        .route("/api/shares/{id}", delete(sharing::delete_share))
+        .route("/api/shares/{id}/tickets", post(sharing::new_ticket))
+        .route("/api/shares/{id}/grants/{label}", delete(sharing::revoke_ticket))
+        .route("/api/vaults/{vault}/mounts", post(sharing::create_mount))
+        .route("/api/mounts/{id}", delete(sharing::delete_mount))
         .route(
             "/blobs/{vault}/{hash}",
             put(blobs::put_blob).get(blobs::get_blob).layer(DefaultBodyLimit::max(max_blob)),
@@ -113,7 +129,7 @@ async fn serve(args: ServeArgs, storage: Storage) -> anyhow::Result<()> {
             let every = Duration::from_secs(st.serve.snapshot_hours * 3600);
             loop {
                 tokio::time::sleep(every).await;
-                st.vaults.snapshot_all(st.serve.snapshot_keep);
+                st.docs.snapshot_all(st.serve.snapshot_keep);
             }
         });
     }
@@ -151,7 +167,7 @@ async fn serve(args: ServeArgs, storage: Storage) -> anyhow::Result<()> {
     }
 
     tracing::info!("flushing snapshots before exit");
-    state.vaults.snapshot_all(state.serve.snapshot_keep);
+    state.docs.snapshot_all(state.serve.snapshot_keep);
     Ok(())
 }
 
@@ -165,7 +181,8 @@ async fn health(State(state): State<SharedState>) -> (StatusCode, Json<serde_jso
         Json(serde_json::json!({
             "ok": true,
             "version": env!("CARGO_PKG_VERSION"),
-            "vaults_loaded": state.vaults.loaded_count(),
+            "vaults_loaded": state.docs.loaded_count(),
+            "node_id": state.docs.node_id,
         })),
     )
 }

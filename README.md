@@ -94,6 +94,16 @@ Repeat on each device with the same server, token and vault ID. That is all.
 - On startup the plugin does a three-way reconcile (disk, shared document, last-synced hash). Genuine conflicts, for example a file edited on both sides while offline for a long time and not mergeable, keep your copy as `Note (conflict Device 2026-10-14 2130).md`.
 - The server speaks the standard [y-sync](https://github.com/yjs/y-protocols) protocol over WebSocket, persists every update to SQLite, and stores binary files content-addressed on disk.
 
+## Sharing a folder or note with someone else
+
+Share part of a vault, not all of it, with live editing on both sides. The plugin stays a plain one-vault sync client; the server does the composition (see [docs/SHARING.md](docs/SHARING.md)).
+
+1. Owner: Settings → Replica → **Sharing** → *Share a folder or note*: enter `Projects/X` (or right-click a folder or note → **Replica: Share…**) → **Create**. Copy the ticket. One ticket = exactly that folder or note; make a new share for anything else.
+2. Friend: Settings → Replica → **Sharing** → *Add from ticket*: paste, choose a mount path (default `Shared/X`), **Mount**. The files appear and stay live in both directions.
+3. Tickets can be read-only. Revoke a ticket, or unshare, at any time; the friend keeps their copy as ordinary notes.
+
+Today both users must be on the same server. Server-to-server sharing over an encrypted iroh connection (no open ports) is the next phase; tickets already carry the server's node id for it.
+
 ## Headless client (no Obsidian)
 
 The same binary can keep a plain directory in sync with a vault, for servers, scripts, CI, or anything that reads and writes Markdown without Obsidian:

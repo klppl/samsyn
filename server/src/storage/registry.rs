@@ -23,6 +23,43 @@ pub struct VaultInfo {
     pub created_at: String,
 }
 
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ShareInfo {
+    pub id: String,
+    pub user_id: String,
+    pub vault_id: String,
+    pub name: String,
+    /// Folder prefix with trailing slash, or "" for the vault root.
+    pub prefix: String,
+    /// Set when the share is a single note inside `prefix`.
+    pub only_file: Option<String>,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct GrantInfo {
+    pub label: String,
+    pub access: String,
+    pub created_at: String,
+    pub revoked_at: Option<String>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct MountInfo {
+    pub id: String,
+    pub user_id: String,
+    pub vault_id: String,
+    pub share_id: String,
+    pub share_name: String,
+    pub mount_prefix: String,
+    pub access: String,
+    pub home_node: String,
+    #[serde(skip_serializing)]
+    pub secret: String,
+    pub created_at: String,
+    pub revoked_at: Option<String>,
+}
+
 #[derive(Debug, Clone)]
 pub struct TokenInfo {
     pub label: String,
@@ -63,15 +100,39 @@ impl Registry {
                 created_at TEXT NOT NULL,
                 UNIQUE (user_id, name)
             );
-            -- Reserved for shared folders (server-to-server). Not used yet; see docs/STORAGE.md.
-            CREATE TABLE IF NOT EXISTS mounts (
-                id            TEXT PRIMARY KEY,
-                vault_id      TEXT NOT NULL REFERENCES vaults(id) ON DELETE CASCADE,
-                mount_path    TEXT NOT NULL,
-                share_id      TEXT NOT NULL,
-                remote_server TEXT,
-                created_at    TEXT NOT NULL
+            CREATE TABLE IF NOT EXISTS shares (
+                id         TEXT PRIMARY KEY,
+                user_id    TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                vault_id   TEXT NOT NULL REFERENCES vaults(id) ON DELETE CASCADE,
+                name       TEXT NOT NULL,
+                prefix     TEXT NOT NULL,
+                only_file  TEXT,
+                created_at TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS share_grants (
+                share_id    TEXT NOT NULL REFERENCES shares(id) ON DELETE CASCADE,
+                secret_hash TEXT NOT NULL,
+                label       TEXT NOT NULL,
+                access      TEXT NOT NULL,
+                created_at  TEXT NOT NULL,
+                revoked_at  TEXT,
+                PRIMARY KEY (share_id, label)
+            );
+            CREATE TABLE IF NOT EXISTS mounts (
+                id           TEXT PRIMARY KEY,
+                user_id      TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                vault_id     TEXT NOT NULL REFERENCES vaults(id) ON DELETE CASCADE,
+                share_id     TEXT NOT NULL,
+                share_name   TEXT NOT NULL,
+                mount_prefix TEXT NOT NULL,
+                access       TEXT NOT NULL,
+                home_node    TEXT NOT NULL,
+                secret       TEXT NOT NULL,
+                created_at   TEXT NOT NULL,
+                revoked_at   TEXT
+            );
+            CREATE INDEX IF NOT EXISTS mounts_vault ON mounts(vault_id);
+            CREATE INDEX IF NOT EXISTS mounts_share ON mounts(share_id);
             "#,
         )?;
         Ok(Self { conn: Arc::new(Mutex::new(conn)) })
@@ -268,6 +329,203 @@ impl Registry {
         backup.run_to_completion(256, std::time::Duration::from_millis(5), None)?;
         Ok(())
     }
+}
+
+impl Registry {
+    // ----------------------------------------------------------------- shares
+
+    pub fn create_share(&self, user_id: &str, vault_id: &str, name: &str, prefix: &str, only_file: Option<&str>) -> anyhow::Result<ShareInfo> {
+        let s = ShareInfo {
+            id: new_id(),
+            user_id: user_id.into(),
+            vault_id: vault_id.into(),
+            name: name.into(),
+            prefix: prefix.into(),
+            only_file: only_file.map(|s| s.to_string()),
+            created_at: Self::now(),
+        };
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO shares (id, user_id, vault_id, name, prefix, only_file, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![s.id, s.user_id, s.vault_id, s.name, s.prefix, s.only_file, s.created_at],
+        )?;
+        Ok(s)
+    }
+
+    pub fn share_by_id(&self, id: &str) -> anyhow::Result<Option<ShareInfo>> {
+        let conn = self.conn.lock().unwrap();
+        Ok(conn
+            .query_row("SELECT id, user_id, vault_id, name, prefix, only_file, created_at FROM shares WHERE id = ?1", params![id], row_to_share)
+            .optional()?)
+    }
+
+    pub fn shares_for_vault(&self, vault_id: &str) -> anyhow::Result<Vec<ShareInfo>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare("SELECT id, user_id, vault_id, name, prefix, only_file, created_at FROM shares WHERE vault_id = ?1 ORDER BY prefix")?;
+        let rows = stmt.query_map(params![vault_id], row_to_share)?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    pub fn delete_share(&self, id: &str) -> anyhow::Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        Ok(conn.execute("DELETE FROM shares WHERE id = ?1", params![id])? > 0)
+    }
+
+    pub fn create_grant(&self, share_id: &str, label: &str, access: &str) -> anyhow::Result<String> {
+        let secret = hex::encode({
+            let mut b = [0u8; 32];
+            rand::RngCore::fill_bytes(&mut rand::rng(), &mut b);
+            b
+        });
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO share_grants (share_id, secret_hash, label, access, created_at) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![share_id, token_hash(&secret), label, access, Self::now()],
+        )
+        .with_context(|| format!("creating ticket '{label}' (label already used?)"))?;
+        Ok(secret)
+    }
+
+    pub fn grants_for_share(&self, share_id: &str) -> anyhow::Result<Vec<GrantInfo>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare("SELECT label, access, created_at, revoked_at FROM share_grants WHERE share_id = ?1 ORDER BY created_at")?;
+        let rows = stmt.query_map(params![share_id], |r| {
+            Ok(GrantInfo { label: r.get(0)?, access: r.get(1)?, created_at: r.get(2)?, revoked_at: r.get(3)? })
+        })?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    /// Validate a presented share secret. Returns the grant's access level if valid and not revoked.
+    pub fn check_grant(&self, share_id: &str, secret: &str) -> anyhow::Result<Option<(String, String)>> {
+        let conn = self.conn.lock().unwrap();
+        Ok(conn
+            .query_row(
+                "SELECT label, access FROM share_grants WHERE share_id = ?1 AND secret_hash = ?2 AND revoked_at IS NULL",
+                params![share_id, token_hash(secret)],
+                |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
+            )
+            .optional()?)
+    }
+
+    pub fn grant_secret_hash(&self, share_id: &str, label: &str) -> anyhow::Result<Option<String>> {
+        let conn = self.conn.lock().unwrap();
+        Ok(conn
+            .query_row("SELECT secret_hash FROM share_grants WHERE share_id = ?1 AND label = ?2", params![share_id, label], |r| r.get(0))
+            .optional()?)
+    }
+
+    pub fn revoke_grant(&self, share_id: &str, label: &str) -> anyhow::Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        let n = conn.execute(
+            "UPDATE share_grants SET revoked_at = ?1 WHERE share_id = ?2 AND label = ?3 AND revoked_at IS NULL",
+            params![Self::now(), share_id, label],
+        )?;
+        Ok(n > 0)
+    }
+
+    // ----------------------------------------------------------------- mounts
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn create_mount(
+        &self,
+        user_id: &str,
+        vault_id: &str,
+        share_id: &str,
+        share_name: &str,
+        mount_prefix: &str,
+        access: &str,
+        home_node: &str,
+        secret: &str,
+    ) -> anyhow::Result<MountInfo> {
+        let m = MountInfo {
+            id: new_id(),
+            user_id: user_id.into(),
+            vault_id: vault_id.into(),
+            share_id: share_id.into(),
+            share_name: share_name.into(),
+            mount_prefix: mount_prefix.into(),
+            access: access.into(),
+            home_node: home_node.into(),
+            secret: secret.into(),
+            created_at: Self::now(),
+            revoked_at: None,
+        };
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO mounts (id, user_id, vault_id, share_id, share_name, mount_prefix, access, home_node, secret, created_at)              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            params![m.id, m.user_id, m.vault_id, m.share_id, m.share_name, m.mount_prefix, m.access, m.home_node, m.secret, m.created_at],
+        )?;
+        Ok(m)
+    }
+
+    pub fn mount_by_id(&self, id: &str) -> anyhow::Result<Option<MountInfo>> {
+        let conn = self.conn.lock().unwrap();
+        Ok(conn.query_row(&format!("{MOUNT_COLS} WHERE id = ?1"), params![id], row_to_mount).optional()?)
+    }
+
+    pub fn mounts_for_vault(&self, vault_id: &str) -> anyhow::Result<Vec<MountInfo>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(&format!("{MOUNT_COLS} WHERE vault_id = ?1 ORDER BY mount_prefix"))?;
+        let rows = stmt.query_map(params![vault_id], row_to_mount)?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    pub fn mounts_for_share(&self, share_id: &str) -> anyhow::Result<Vec<MountInfo>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(&format!("{MOUNT_COLS} WHERE share_id = ?1"))?;
+        let rows = stmt.query_map(params![share_id], row_to_mount)?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    pub fn delete_mount(&self, id: &str) -> anyhow::Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        Ok(conn.execute("DELETE FROM mounts WHERE id = ?1", params![id])? > 0)
+    }
+
+    pub fn revoke_mounts_with_secret(&self, share_id: &str, secret_hash: &str) -> anyhow::Result<Vec<String>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare("SELECT id, secret FROM mounts WHERE share_id = ?1 AND revoked_at IS NULL")?;
+        let ids: Vec<String> = stmt
+            .query_map(params![share_id], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
+            .filter_map(|r| r.ok())
+            .filter(|(_, s)| token_hash(s) == secret_hash)
+            .map(|(id, _)| id)
+            .collect();
+        for id in &ids {
+            conn.execute("UPDATE mounts SET revoked_at = ?1 WHERE id = ?2", params![Self::now(), id])?;
+        }
+        Ok(ids)
+    }
+}
+
+const MOUNT_COLS: &str = "SELECT id, user_id, vault_id, share_id, share_name, mount_prefix, access, home_node, secret, created_at, revoked_at FROM mounts";
+
+fn row_to_share(r: &rusqlite::Row) -> rusqlite::Result<ShareInfo> {
+    Ok(ShareInfo {
+        id: r.get(0)?,
+        user_id: r.get(1)?,
+        vault_id: r.get(2)?,
+        name: r.get(3)?,
+        prefix: r.get(4)?,
+        only_file: r.get(5)?,
+        created_at: r.get(6)?,
+    })
+}
+
+fn row_to_mount(r: &rusqlite::Row) -> rusqlite::Result<MountInfo> {
+    Ok(MountInfo {
+        id: r.get(0)?,
+        user_id: r.get(1)?,
+        vault_id: r.get(2)?,
+        share_id: r.get(3)?,
+        share_name: r.get(4)?,
+        mount_prefix: r.get(5)?,
+        access: r.get(6)?,
+        home_node: r.get(7)?,
+        secret: r.get(8)?,
+        created_at: r.get(9)?,
+        revoked_at: r.get(10)?,
+    })
 }
 
 fn row_to_vault(r: &rusqlite::Row) -> rusqlite::Result<VaultInfo> {

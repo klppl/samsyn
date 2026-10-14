@@ -46,3 +46,32 @@
 .replica-diag-value.is-warn {
   color: var(--color-orange);
 }
+
+.replica-ticket {
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 6px;
+  padding: 8px 12px;
+  margin: 8px 0 12px;
+}
+.replica-ticket-label {
+  font-size: var(--font-ui-small);
+  color: var(--text-muted);
+  margin-bottom: 4px;
+}
+.replica-ticket-text {
+  width: 100%;
+  font-family: var(--font-monospace);
+  font-size: var(--font-ui-smaller);
+  word-break: break-all;
+}
+.replica-wide input,
+.replica-wide {
+  min-width: 220px;
+}
+.replica-grant {
+  padding-left: 24px;
+  border-top: none;
+}
+.replica-muted {
+  color: var(--text-faint);
+}

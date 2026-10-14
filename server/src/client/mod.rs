@@ -2,7 +2,7 @@
 //! Same document model and reconcile rules as the Obsidian plugin, driven by a filesystem
 //! watcher instead of editor events.
 
-mod diff;
+pub mod diff;
 mod engine;
 mod state;
 mod ws;

@@ -26,7 +26,7 @@ use std::path::{Path, PathBuf};
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
 
-pub use registry::{Registry, User, VaultInfo};
+pub use registry::{MountInfo, Registry, ShareInfo, User, VaultInfo};
 pub use vault_store::VaultStore;
 
 pub const SCHEMA_VERSION: u32 = 1;
@@ -82,6 +82,42 @@ impl Storage {
 
     pub fn vault_dir(&self, user_id: &str, vault_id: &str) -> PathBuf {
         self.root.join("users").join(user_id).join("vaults").join(vault_id)
+    }
+
+    pub fn share_dir(&self, user_id: &str, share_id: &str) -> PathBuf {
+        self.root.join("users").join(user_id).join("shares").join(share_id)
+    }
+
+    /// Store for a share this server owns.
+    pub fn share_store(&self, info: &ShareInfo) -> anyhow::Result<VaultStore> {
+        let dir = self.share_dir(&info.user_id, &info.id);
+        let as_vault = VaultInfo {
+            id: info.id.clone(),
+            user_id: info.user_id.clone(),
+            name: format!("share:{}", info.name),
+            created_at: info.created_at.clone(),
+        };
+        VaultStore::open(&dir, &as_vault)
+    }
+
+    /// This server's long-lived identity (ed25519). Public half is the node id in tickets.
+    pub fn identity(&self) -> anyhow::Result<iroh_base::SecretKey> {
+        let path = self.root.join("identity.key");
+        if path.exists() {
+            let hex_key = std::fs::read_to_string(&path)?;
+            let bytes = hex::decode(hex_key.trim()).context("identity.key is not hex")?;
+            let arr: [u8; 32] = bytes.as_slice().try_into().context("identity.key has wrong length")?;
+            return Ok(iroh_base::SecretKey::from_bytes(&arr));
+        }
+        let key = iroh_base::SecretKey::generate();
+        std::fs::write(&path, hex::encode(key.to_bytes()))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+        }
+        tracing::info!("generated server identity {}", key.public());
+        Ok(key)
     }
 
     /// Open (creating on disk if needed) the store for a vault already present in the registry.

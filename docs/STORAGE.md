@@ -103,6 +103,10 @@ The server does not encrypt data itself. Recommended: run on an encrypted filesy
 | Token leaked | `user revoke <name> --label <label>` (or all), then `user token <name>` |
 | Need to move servers | stop, `backup`, `restore` on the new host, point the plugin at the new URL |
 
+## Shares and mounts
+
+Shares are separate documents stored like vaults under `users/<uid>/shares/<share_id>/`. Registry tables `shares`, `share_grants` (hashed ticket secrets) and `mounts` describe who shares what and who mounted it. The server keeps shared subtrees equal between documents at runtime; see `docs/SHARING.md`. Backup and restore include share directories automatically because they sit inside the user's tree.
+
 ## Future: shared folders between users (server-to-server)
 
 Goal from the plugin's point of view: "add my friend's `Projects/Shared` folder to my vault at `Shared/Anna`", after which it is just another folder that syncs. The plugin should not know whether the other user is on the same server or a different one.

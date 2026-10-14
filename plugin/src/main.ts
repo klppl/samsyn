@@ -6,6 +6,8 @@ import { DEFAULT_SETTINGS, ReplicaSettingTab, ReplicaSettings, randomSuffix, slu
 export default class ReplicaPlugin extends Plugin {
   settings!: ReplicaSettings;
   engine: SyncEngine | null = null;
+  /** Path pre-filled in the Sharing section when opened from the file menu. */
+  pendingSharePath: string | null = null;
   private statusEl!: HTMLElement;
   private restarting = false;
 
@@ -84,6 +86,24 @@ export default class ReplicaPlugin extends Plugin {
         new Notice(`Replica: sync ${this.settings.enabled ? "enabled" : "disabled"}`);
       },
     });
+
+    this.registerEvent(
+      this.app.workspace.on("file-menu", (menu, file) => {
+        if (!this.settings.serverUrl) return;
+        menu.addItem((item) =>
+          item
+            .setTitle("Replica: Share…")
+            .setIcon("share-2")
+            .onClick(() => {
+              this.pendingSharePath = file.path;
+              // @ts-expect-error setting API is not typed
+              this.app.setting.open();
+              // @ts-expect-error setting API is not typed
+              this.app.setting.openTabById(this.manifest.id);
+            }),
+        );
+      }),
+    );
 
     // Wait for the vault index so we do not get a 'create' event for every existing file.
     this.app.workspace.onLayoutReady(() => void this.startEngine());

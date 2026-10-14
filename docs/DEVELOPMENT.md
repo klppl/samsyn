@@ -168,6 +168,16 @@ echo hi > /tmp/a/x.md && sleep 1 && cat /tmp/b/x.md
 
 Leftover `sync` processes keep watching their directory. Kill them before deleting a test directory, or the guard will (rightly) hold back the deletions and log about it.
 
+## Sharing (server-side bridges)
+
+`server/src/bridge.rs` and the `DocRegistry` in `server/src/vault.rs`. Every CRDT apply on the server goes through `DocRegistry::apply_lock`; after an apply the caller runs `propagate`, which drains the changes recorded by observers and replays them across bridges. Rules that bit during development:
+
+- Never call `doc.get_or_insert_map` while a `transact_mut` on the same doc is alive (self-deadlock with the `sync` feature); use `txn.get_or_insert_map`.
+- Do not hold a `vaults`/`shares` map guard across a call that locks it again (`if let Some(x) = self.map.lock()...` keeps the guard for the whole `if let`).
+- All vaults that take part in a bridge are loaded at startup (`preload_bridged`), otherwise a share can advance while one end is unloaded and the later reconcile overwrites it.
+
+Scenario test (one server, three users, headless clients as plugins): `share-e2e.sh` in the session scratchpad; a copy belongs in `server/tests/` once it is turned into a Rust integration test.
+
 ## Tests
 
 ```sh

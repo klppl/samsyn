@@ -67,7 +67,7 @@ pub async fn ws_handler(
         Ok(u) => u,
         Err(r) => return r,
     };
-    let vault = match state.vaults.get_or_load(&user, &vault_name) {
+    let vault = match state.docs.get_or_load(&user, &vault_name) {
         Ok(v) => v,
         Err(e) => {
             tracing::error!(vault = %vault_name, user = %user.name, "failed to load vault: {e}");
@@ -80,13 +80,13 @@ pub async fn ws_handler(
 async fn handle_socket(
     socket: WebSocket,
     state: SharedState,
-    user: User,
-    vault: std::sync::Arc<crate::vault::Vault>,
+    _user: User,
+    vault: std::sync::Arc<crate::vault::LiveDoc>,
 ) {
     let (mut sink, mut stream) = socket.split();
     let mut rx = vault.tx.subscribe();
     let protocol = DefaultProtocol;
-    let label = format!("{}/{}", user.name, vault.info.name);
+    let label = vault.label.clone();
 
     let hello = {
         let aw = vault.awareness.lock().unwrap();
@@ -112,8 +112,14 @@ async fn handle_socket(
                 match incoming {
                     Some(Ok(WsMessage::Binary(data))) => {
                         let replies = {
-                            let mut aw = vault.awareness.lock().unwrap();
-                            handle_payload(&protocol, &mut aw, &data, &mut owned_clients)
+                            // Serialize all CRDT applies server-wide; see DocRegistry.
+                            let _apply = state.docs.apply_lock.lock().unwrap();
+                            let r = {
+                                let mut aw = vault.awareness.lock().unwrap();
+                                handle_payload(&protocol, &mut aw, &data, &mut owned_clients)
+                            };
+                            state.docs.propagate(&vault);
+                            r
                         };
                         match replies {
                             Ok(replies) => {
@@ -162,7 +168,7 @@ async fn handle_socket(
             aw.remove_state(id);
         }
     }
-    state.vaults.maybe_compact(&vault);
+    state.docs.maybe_compact(&vault);
     tracing::debug!(vault = %label, "client disconnected");
 }
 
