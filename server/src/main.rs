@@ -6,6 +6,7 @@
 
 mod blobs;
 mod cli;
+mod client;
 mod config;
 mod ids;
 mod storage;
@@ -58,6 +59,10 @@ fn main() -> anyhow::Result<()> {
                 .build()?
                 .block_on(serve(args, storage))
         }
+        Command::Sync(args) => tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()?
+            .block_on(client::run(args)),
         Command::User { cmd } => cli::user(&Storage::open(&cli.data_dir)?, cmd),
         Command::Vault { cmd } => cli::vault(&Storage::open(&cli.data_dir)?, cmd),
         Command::Snapshot { target, keep } => cli::snapshot(&Storage::open(&cli.data_dir)?, target, keep),

@@ -18,6 +18,8 @@ pub struct Cli {
 pub enum Command {
     /// Run the sync server (default when no subcommand is given).
     Serve(ServeArgs),
+    /// Run as a headless client: keep a local directory in sync with a vault on a server.
+    Sync(crate::client::SyncArgs),
     /// Manage users and their tokens.
     User {
         #[command(subcommand)]

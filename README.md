@@ -5,7 +5,7 @@ Conflict-free live sync for [Obsidian](https://obsidian.md), self-hosted.
 Replica is two parts:
 
 - **`plugin/`** — an Obsidian plugin (TypeScript, no native code, runs on desktop, iOS and Android).
-- **`server/`** — a small Rust server that stores each vault as a CRDT document and relays changes between devices in real time.
+- **`server/`** — a small Rust server that stores each vault as a CRDT document and relays changes between devices in real time. The same binary also runs as a headless client (`replica-server sync`) to keep a plain directory in sync without Obsidian.
 
 Text files (`.md`, `.txt`, …) are merged character by character with [Yjs](https://github.com/yjs/yjs) on the plugin side and [yrs](https://github.com/y-crdt/y-crdt) on the server, so two devices editing the same note at the same time converge without a conflict. Binary files (images, PDFs) are synced whole, last writer wins. Everything works offline and catches up when you reconnect.
 
@@ -93,6 +93,39 @@ Repeat on each device with the same server, token and vault ID. That is all.
 - Files not open in an editor are written to disk; Obsidian's own file events feed changes back the other way.
 - On startup the plugin does a three-way reconcile (disk, shared document, last-synced hash). Genuine conflicts, for example a file edited on both sides while offline for a long time and not mergeable, keep your copy as `Note (conflict Device 2026-10-14 2130).md`.
 - The server speaks the standard [y-sync](https://github.com/yjs/y-protocols) protocol over WebSocket, persists every update to SQLite, and stores binary files content-addressed on disk.
+
+## Headless client (no Obsidian)
+
+The same binary can keep a plain directory in sync with a vault, for servers, scripts, CI, or anything that reads and writes Markdown without Obsidian:
+
+```sh
+replica-server sync --server https://sync.example.com --token rp_... --vault notes --dir /srv/notes
+```
+
+- Watches the directory; a file save is pushed within ~300 ms and merged like an editor edit. Concurrent edits to different parts of the same file merge; overlapping edits keep a `(conflict …)` copy.
+- Remote changes are written to disk; removed files go to `<dir>/.replica/trash/` instead of being deleted.
+- Works offline and catches up on reconnect. Bookkeeping lives in `<dir>/.replica/` (do not copy that folder to another machine).
+- `--once` connects, syncs, and exits when idle. Good for cron or a deploy step.
+- Same mass-delete guard as the plugin: removing most of the vault from the directory is held back unless `--allow-mass-delete` is set.
+
+All flags can be environment variables (`REPLICA_SERVER`, `REPLICA_TOKEN`, `REPLICA_VAULT`, `REPLICA_DIR`). A systemd unit:
+
+```ini
+[Unit]
+Description=Replica sync for /srv/notes
+After=network-online.target
+
+[Service]
+Environment=REPLICA_SERVER=https://sync.example.com
+Environment=REPLICA_TOKEN=rp_...
+Environment=REPLICA_VAULT=notes
+Environment=REPLICA_DIR=/srv/notes
+ExecStart=/usr/local/bin/replica-server sync
+Restart=always
+
+[Install]
+WantedBy=multi-user.target
+```
 
 ## Server administration
 

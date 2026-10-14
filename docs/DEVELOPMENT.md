@@ -146,6 +146,28 @@ Obsidian mobile does not expose a developer console. Options, in order of useful
 - **Mass-delete guard.** If one reconcile would remove at least 5 files and more than half of the shared vault, the plugin refuses, re-downloads them, shows a Notice, and lists them under *Held back* on the settings page. The command **Replica: Apply held-back deletions** does it for real. Single and small deletions are applied normally.
 - **Remote deletions go to trash**, never a hard delete (Obsidian's "Deleted files" setting decides system trash vs `.trash/`).
 
+## Headless client
+
+`replica-server sync` lives in `server/src/client/`. It reuses the server's yrs dependency and speaks the same y-sync protocol as a client. Structure:
+
+- `mod.rs` — flags, URL building, the main `select!` loop (WebSocket events, watcher batches, 2 s housekeeping tick, `--once` exit).
+- `ws.rs` — connection task with exponential reconnect; hands the engine a per-connection sender.
+- `engine.rs` — owns the `Doc`/`Awareness`, `texts` and `blobs` maps, reconcile, local → doc pushes, doc → disk writes, three-way merge for pending local edits, mass-delete guard.
+- `diff.rs` — byte-offset single-span diff (yrs text indexes are UTF-8 bytes by default).
+- `state.rs` — `<dir>/.replica/{state.json,doc.bin,trash/}`; install id derived from hostname + absolute path.
+
+Quick manual test with two directories:
+
+```sh
+cargo run -- serve --data-dir /tmp/rd --bind 127.0.0.1:8787    # note the token
+mkdir -p /tmp/a /tmp/b
+cargo run -- sync --server http://127.0.0.1:8787 --token rp_… --vault t --dir /tmp/a --device A
+cargo run -- sync --server http://127.0.0.1:8787 --token rp_… --vault t --dir /tmp/b --device B
+echo hi > /tmp/a/x.md && sleep 1 && cat /tmp/b/x.md
+```
+
+Leftover `sync` processes keep watching their directory. Kill them before deleting a test directory, or the guard will (rightly) hold back the deletions and log about it.
+
 ## Tests
 
 ```sh
