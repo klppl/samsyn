@@ -43,7 +43,15 @@ export class SharingSection {
     this.timer = null;
   }
 
+  private hasServer(): boolean {
+    return !!(this.plugin.settings.serverUrl && this.plugin.settings.token);
+  }
+
   async load(quiet = false): Promise<void> {
+    if (!this.hasServer()) {
+      this.render();
+      return;
+    }
     const before = this.info;
     try {
       const next = await this.api.sharing();
@@ -82,10 +90,16 @@ export class SharingSection {
   render(): void {
     const el = this.root;
     el.empty();
+    const reload = () => void this.load();
 
+    if (!this.hasServer()) {
+      this.renderGuestMounts(el, reload);
+      return;
+    }
     if (this.error) {
       el.createDiv({ cls: "replica-diag replica-error", text: `Cannot reach the sharing API: ${this.error}` });
       new Setting(el).addButton((b) => b.setButtonText("Retry").onClick(() => void this.load()));
+      this.renderGuestMounts(el, reload);
       return;
     }
     if (!this.info) {
@@ -93,7 +107,6 @@ export class SharingSection {
       return;
     }
     const info = this.info;
-    const reload = () => void this.load();
 
     // ---------------------------------------------------------- shared by me
     new Setting(el)
@@ -164,9 +177,10 @@ export class SharingSection {
           .setCta()
           .onClick(() => new MountModal(this.plugin, reload).open()),
       );
-    if (info.mounts.length === 0) {
+    if (info.mounts.length === 0 && this.plugin.settings.guestMounts.length === 0) {
       el.createDiv({ cls: "replica-empty", text: "Nothing mounted. Paste a ticket someone sent you with the button above." });
     }
+    this.renderGuestCards(el);
     for (const m of info.mounts) {
       const revoked = m.status.startsWith("revoked");
       const card = el.createDiv({ cls: "replica-card" + (revoked ? " replica-revoked" : "") });
@@ -186,5 +200,53 @@ export class SharingSection {
     }
 
     el.createDiv({ cls: "replica-diag replica-muted", text: `This server's node id: ${info.node_id.slice(0, 16)}…` });
+  }
+
+  /** "Shared with me" when there is no server of our own: guest mounts only. */
+  private renderGuestMounts(el: HTMLElement, reload: () => void): void {
+    new Setting(el)
+      .setName("Shared with me")
+      .setHeading()
+      .setDesc("Folders or notes other people share with you. This device talks to their server directly.")
+      .addButton((b) =>
+        b
+          .setButtonText("Add from ticket…")
+          .setCta()
+          .onClick(() => new MountModal(this.plugin, reload).open()),
+      );
+    if (this.plugin.settings.guestMounts.length === 0) {
+      el.createDiv({ cls: "replica-empty", text: "Nothing mounted. Paste a ticket someone sent you with the button above." });
+    }
+    this.renderGuestCards(el);
+  }
+
+  private renderGuestCards(el: HTMLElement): void {
+    for (const m of this.plugin.settings.guestMounts) {
+      const d = this.plugin.guestEngine(m.id)?.getDiagnostics();
+      const status = !m.enabled
+        ? "paused"
+        : !d
+          ? "starting…"
+          : d.status === "connected"
+            ? `live as guest · ${d.peers} other${d.peers === 1 ? "" : "s"} online`
+            : d.status === "connecting"
+              ? "connecting to the owner's server…"
+              : `offline${d.lastError ? ` · ${d.lastError}` : ""}`;
+      const card = el.createDiv({ cls: "replica-card" });
+      new Setting(card)
+        .setName(m.name)
+        .setClass("replica-card-head")
+        .setDesc(`${m.mountPath} · ${accessText(m.access)} · guest of ${m.url.replace(/^https?:\/\//, "")} · ${status}`)
+        .addButton((b) =>
+          b.setButtonText("Unmount").onClick(() =>
+            this.confirm(
+              `Unmount ${m.name}?`,
+              `The files under ${m.mountPath} stay in your vault as ordinary notes; they just stop syncing with the owner.`,
+              "Unmount",
+              () => this.plugin.removeGuestMount(m.id),
+            ),
+          ),
+        );
+    }
   }
 }

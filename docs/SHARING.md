@@ -78,7 +78,7 @@ Limits on the link (the node id is public, so everything before the hello must b
 
 ## Guests (no server of their own)
 
-A person without a replica server can still join a share: the plugin or the headless client (`replica-server sync --ticket <ticket> --dir …`) connects straight to the **owner's** server and syncs the share document, authenticated by the ticket secret. The owner's server must be reachable over HTTPS and started with `--public-url https://…`, which is embedded in every ticket it issues (ticket v2; v1 tickets still decode). Full design in `GUEST-MODE.md`.
+A person without a replica server can still join a share: the plugin (*Add from ticket…* → **Mount as guest**, or simply **Mount** when no server is configured) or the headless client (`replica-server sync --ticket <ticket> --dir …`) connects straight to the **owner's** server and syncs the share document, authenticated by the ticket secret. In the plugin each guest mount is its own engine with its own document, scoped to one folder; the home engine excludes those folders, so nothing from a guest folder ever reaches your own server and nothing else in your vault reaches the owner. Read-only guests never push; their local edits are overwritten by the shared version (kept as a conflict copy when they differ at reconcile time). The owner's server must be reachable over HTTPS and started with `--public-url https://…`, which is embedded in every ticket it issues (ticket v2; v1 tickets still decode). Full design in `GUEST-MODE.md`.
 
 Guest routes, all authenticated by `(share id, secret)` given as `?secret=` or `Authorization: Bearer`:
 

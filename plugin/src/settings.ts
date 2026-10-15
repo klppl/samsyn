@@ -2,6 +2,20 @@ import { App, Notice, PluginSettingTab, Setting, requestUrl } from "obsidian";
 import type ReplicaPlugin from "./main";
 import { SharingSection } from "./sharing-ui";
 
+/** A share mounted straight from the owner's server with a ticket (no server of our own). */
+export interface GuestMount {
+  id: string;
+  /** Owner server's public URL from the ticket. */
+  url: string;
+  shareId: string;
+  secret: string;
+  access: "rw" | "ro";
+  name: string;
+  /** Vault folder, no trailing slash, e.g. "Shared/X". */
+  mountPath: string;
+  enabled: boolean;
+}
+
 export interface ReplicaSettings {
   enabled: boolean;
   serverUrl: string;
@@ -12,6 +26,7 @@ export interface ReplicaSettings {
   syncBinary: boolean;
   excludePaths: string;
   liveDebounceMs: number;
+  guestMounts: GuestMount[];
 }
 
 export const DEFAULT_SETTINGS: ReplicaSettings = {
@@ -24,6 +39,7 @@ export const DEFAULT_SETTINGS: ReplicaSettings = {
   syncBinary: true,
   excludePaths: "",
   liveDebounceMs: 150,
+  guestMounts: [],
 };
 
 export function slugify(name: string): string {
@@ -261,7 +277,14 @@ export class ReplicaSettingTab extends PluginSettingTab {
     el.empty();
     const d = this.plugin.engine?.getDiagnostics();
     if (!d) {
-      el.createDiv({ text: this.plugin.settings.enabled ? "Not running. Set a server URL and press Reconnect." : "Sync is disabled." });
+      const guests = this.plugin.settings.guestMounts.length;
+      el.createDiv({
+        text: !this.plugin.settings.enabled
+          ? "Sync is disabled."
+          : guests > 0
+            ? `No server of your own configured; ${guests} shared folder${guests === 1 ? "" : "s"} syncing as guest (see the Sharing tab).`
+            : "Not running. Set a server URL and press Reconnect, or add a shared folder from a ticket on the Sharing tab.",
+      });
       return;
     }
     const line = (label: string, value: string, cls?: string) => {
@@ -301,14 +324,13 @@ export class ReplicaSettingTab extends PluginSettingTab {
 
   private renderSharingTab(containerEl: HTMLElement): void {
     const s = this.plugin.settings;
-    if (!s.serverUrl || !s.token) {
-      containerEl.createDiv({ cls: "replica-empty", text: "Sharing needs a server connection. Set the server URL and token on the Server tab first." });
-      return;
-    }
     containerEl.createEl("p", {
       cls: "replica-muted",
       text: "Share one folder or note, not the whole vault. The other person pastes a ticket and gets the same folder in their vault, live in both directions. Tickets can be read-only and can be revoked at any time.",
     });
+    if (!s.serverUrl || !s.token) {
+      containerEl.createDiv({ cls: "replica-empty", text: "Sharing your own folders needs a server connection (Server tab). Folders others share with you can still be added below with their ticket." });
+    }
     const sharingEl = containerEl.createDiv();
     const section = new SharingSection(this.plugin, sharingEl);
     this.sharing = section;

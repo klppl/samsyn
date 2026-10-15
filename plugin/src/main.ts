@@ -1,16 +1,26 @@
 import { Notice, Platform, Plugin, setIcon } from "obsidian";
-import { SyncEngine, EngineStatus } from "./engine";
+import { BlobClient } from "./blobs";
+import { SyncEngine, EngineStatus, EngineTarget } from "./engine";
 import { Persistence, deviceInstallId } from "./persistence";
 import { MountModal, ShareModal } from "./sharing-modals";
-import { DEFAULT_SETTINGS, ReplicaSettingTab, ReplicaSettings, randomSuffix, slugify } from "./settings";
+import { DEFAULT_SETTINGS, GuestMount, ReplicaSettingTab, ReplicaSettings, randomSuffix, serverUrls, slugify } from "./settings";
 
 export default class ReplicaPlugin extends Plugin {
   settings!: ReplicaSettings;
-  engine: SyncEngine | null = null;
-  /** Path pre-filled in the Sharing section when opened from the file menu. */
+  /** Running engines: "home" (own server, whole vault) plus one per enabled guest mount. */
+  engines = new Map<string, SyncEngine>();
   settingTab: ReplicaSettingTab | null = null;
   private statusEl!: HTMLElement;
   private restarting = false;
+
+  /** The home engine (own server). Guest engines are in `engines` under their mount id. */
+  get engine(): SyncEngine | null {
+    return this.engines.get("home") ?? null;
+  }
+
+  guestEngine(mountId: string): SyncEngine | null {
+    return this.engines.get(mountId) ?? null;
+  }
 
   async onload(): Promise<void> {
     await this.loadSettings();
@@ -89,18 +99,18 @@ export default class ReplicaPlugin extends Plugin {
       id: "status",
       name: "Show sync status",
       callback: () => {
-        const d = this.engine?.getDiagnostics();
-        if (!d) {
+        const diags = [...this.engines.values()].map((e) => e.getDiagnostics());
+        if (diags.length === 0) {
           new Notice("Replica: not running");
           return;
         }
-        const lines = [
-          `Replica: ${d.status}${d.synced ? ", synced" : ""}, ${d.peers} other device(s)`,
-          `${d.textFiles} text + ${d.blobFiles} other files`,
-        ];
-        if (d.lastError) lines.push(`Error: ${d.lastError}`);
-        if (d.hint) lines.push(d.hint);
-        if (d.pendingDeletions > 0) lines.push(`${d.pendingDeletions} deletions held back by the safety guard`);
+        const lines: string[] = [];
+        for (const d of diags) {
+          lines.push(`${d.kind === "home" ? "Vault" : d.label}: ${d.status}${d.synced ? ", synced" : ""}, ${d.peers} other(s), ${d.textFiles} text + ${d.blobFiles} other files`);
+          if (d.lastError) lines.push(`  error: ${d.lastError}`);
+          if (d.hint) lines.push(`  ${d.hint}`);
+          if (d.pendingDeletions > 0) lines.push(`  ${d.pendingDeletions} deletions held back by the safety guard`);
+        }
         new Notice(lines.join("\n"), 10_000);
       },
     });
@@ -118,6 +128,7 @@ export default class ReplicaPlugin extends Plugin {
     this.registerEvent(
       this.app.workspace.on("file-menu", (menu, file) => {
         if (!this.settings.serverUrl) return;
+        if (this.settings.guestMounts.some((m) => file.path === m.mountPath || file.path.startsWith(m.mountPath + "/"))) return;
         menu.addItem((item) =>
           item
             .setTitle("Replica: Share…")
@@ -137,42 +148,129 @@ export default class ReplicaPlugin extends Plugin {
 
   // ------------------------------------------------------------- engine control
 
-  private persistence(): Persistence {
+  private persistence(scope: string): Persistence {
     return new Persistence(
       this.app.vault.adapter,
       `${this.app.vault.configDir}/plugins/${this.manifest.id}`,
-      `${deviceInstallId(this.app)}|${this.settings.vaultId}`,
+      `${deviceInstallId(this.app)}|${scope}`,
     );
   }
 
+  private guestRoots(): string[] {
+    return this.settings.guestMounts.map((m) => m.mountPath.replace(/\/+$/, "") + "/");
+  }
+
+  private homeTarget(): EngineTarget | null {
+    const urls = serverUrls(this.settings.serverUrl);
+    if (!urls || !this.settings.vaultId) return null;
+    return {
+      kind: "home",
+      id: "home",
+      label: "your vault",
+      wsBase: urls.ws,
+      room: this.settings.vaultId,
+      params: { token: this.settings.token },
+      blobClient: BlobClient.forVault(urls.http, this.settings.vaultId, this.settings.token),
+      root: "",
+      readOnly: false,
+      excludeRoots: this.guestRoots(),
+    };
+  }
+
+  private guestTarget(m: GuestMount): EngineTarget | null {
+    const urls = serverUrls(m.url);
+    if (!urls) return null;
+    return {
+      kind: "guest",
+      id: m.id,
+      label: `“${m.name}” (shared with you)`,
+      wsBase: urls.ws.replace(/\/ws$/, "/guest/ws"),
+      room: m.shareId,
+      params: { secret: m.secret },
+      blobClient: BlobClient.forShare(urls.http, m.shareId, m.secret),
+      root: m.mountPath.replace(/\/+$/, "") + "/",
+      readOnly: m.access === "ro",
+      excludeRoots: [],
+    };
+  }
+
+  private async launch(target: EngineTarget, scope: string): Promise<void> {
+    if (this.engines.has(target.id)) return;
+    const engine = new SyncEngine(this.app, this.settings, this.persistence(scope), target, {
+      onStatus: () => this.renderAggregateStatus(),
+    });
+    this.engines.set(target.id, engine);
+    try {
+      await engine.start();
+    } catch (e) {
+      console.error(`[replica] ${target.label} failed to start`, e);
+      new Notice(`Replica: ${target.label} failed to start (${(e as Error).message})`);
+      this.renderAggregateStatus();
+    }
+  }
+
   async startEngine(): Promise<void> {
-    if (this.engine) return;
     if (!this.settings.enabled) {
       this.renderStatus("disabled", 0);
       return;
     }
-    if (!this.settings.serverUrl) {
+    const home = this.homeTarget();
+    const guests = this.settings.guestMounts.filter((m) => m.enabled);
+    if (!home && guests.length === 0) {
       this.renderStatus("disabled", 0);
-      new Notice("Replica: set a server URL in settings to start syncing");
+      new Notice("Replica: set a server URL in settings, or add a shared folder from a ticket, to start syncing");
       return;
     }
-    const engine = new SyncEngine(this.app, this.settings, this.persistence(), {
-      onStatus: (s, peers) => this.renderStatus(s, peers),
-    });
-    this.engine = engine;
-    try {
-      await engine.start();
-    } catch (e) {
-      console.error("[replica] engine failed to start", e);
-      new Notice(`Replica: failed to start (${(e as Error).message})`);
-      this.renderStatus("offline", 0);
+    const starts: Promise<void>[] = [];
+    if (home) starts.push(this.launch(home, this.settings.vaultId));
+    for (const m of guests) {
+      const t = this.guestTarget(m);
+      if (t) starts.push(this.launch(t, `guest:${m.shareId}`));
     }
+    await Promise.all(starts);
   }
 
   async stopEngine(): Promise<void> {
-    const e = this.engine;
-    this.engine = null;
-    if (e) await e.stop();
+    const all = [...this.engines.values()];
+    this.engines.clear();
+    await Promise.all(all.map((e) => e.stop()));
+  }
+
+  /** Start syncing a guest mount that was just added (the home engine must re-exclude it). */
+  async addGuestMount(m: GuestMount): Promise<void> {
+    this.settings.guestMounts.push(m);
+    await this.saveSettings();
+    await this.restartEngine();
+  }
+
+  /** Stop syncing a guest mount and forget it. Files stay in the vault. */
+  async removeGuestMount(id: string): Promise<void> {
+    const m = this.settings.guestMounts.find((x) => x.id === id);
+    this.settings.guestMounts = this.settings.guestMounts.filter((x) => x.id !== id);
+    await this.saveSettings();
+    const e = this.engines.get(id);
+    if (e) {
+      this.engines.delete(id);
+      await e.stop();
+    }
+    if (m) await this.persistence(`guest:${m.shareId}`).clear();
+    await this.restartEngine();
+  }
+
+  private renderAggregateStatus(): void {
+    const diags = [...this.engines.values()].map((e) => e.getDiagnostics());
+    if (diags.length === 0) {
+      this.renderStatus("disabled", 0);
+      return;
+    }
+    const rank: Record<EngineStatus, number> = { disabled: 0, connected: 1, connecting: 2, offline: 3 };
+    let worst: EngineStatus = "disabled";
+    let peers = 0;
+    for (const d of diags) {
+      if (rank[d.status] > rank[worst]) worst = d.status;
+      peers += d.peers;
+    }
+    this.renderStatus(worst, peers);
   }
 
   async restartEngine(): Promise<void> {
@@ -188,7 +286,8 @@ export default class ReplicaPlugin extends Plugin {
 
   async resetLocalState(): Promise<void> {
     await this.stopEngine();
-    await this.persistence().clear();
+    await this.persistence(this.settings.vaultId).clear();
+    for (const m of this.settings.guestMounts) await this.persistence(`guest:${m.shareId}`).clear();
     await this.startEngine();
   }
 

@@ -5,7 +5,7 @@ import { BlobClient } from "./blobs";
 import { diffText } from "./diff";
 import { hashText, sha256Hex } from "./hash";
 import { LocalState, Persistence, StorageInfo, deviceInstallId } from "./persistence";
-import { ReplicaSettings, serverUrls } from "./settings";
+import { ReplicaSettings } from "./settings";
 
 export interface BlobMeta {
   hash: string;
@@ -19,7 +19,36 @@ export interface EngineEvents {
   onStatus(status: EngineStatus, peers: number): void;
 }
 
+/**
+ * What one engine syncs against. The home engine syncs the whole vault with the user's own
+ * server; a guest engine syncs one folder with a share on someone else's server, authenticated
+ * by the ticket secret. Inside the engine every path is a *document key*: for the home engine
+ * that is the vault path, for a guest engine the path relative to `root`.
+ */
+export interface EngineTarget {
+  kind: "home" | "guest";
+  /** "home", or the guest mount id. */
+  id: string;
+  label: string;
+  /** ws(s)://host/ws or ws(s)://host/guest/ws */
+  wsBase: string;
+  /** Vault id or share id. */
+  room: string;
+  /** Query params for the WebSocket: {token} or {secret}. */
+  params: Record<string, string>;
+  blobClient: BlobClient | null;
+  /** "" for the home engine; "Shared/X/" (with trailing slash) for a guest mount. */
+  root: string;
+  readOnly: boolean;
+  /** Vault paths (with trailing slash) this engine must never touch: the guest mount roots. */
+  excludeRoots: string[];
+}
+
 export interface Diagnostics {
+  kind: "home" | "guest";
+  label: string;
+  root: string;
+  readOnly: boolean;
   status: EngineStatus;
   wsUrl: string;
   synced: boolean;
@@ -40,12 +69,12 @@ const MASS_DELETE_MIN = 5;
 const MASS_DELETE_RATIO = 0.5;
 
 /**
- * Document layout (one Y.Doc per vault):
- *   texts: Y.Map<path, Y.Text>   character-level merged files (.md, .txt, ...)
- *   blobs: Y.Map<path, BlobMeta> last-writer-wins pointers to content-addressed blobs
+ * Document layout (one Y.Doc per engine):
+ *   texts: Y.Map<key, Y.Text>   character-level merged files (.md, .txt, ...)
+ *   blobs: Y.Map<key, BlobMeta> last-writer-wins pointers to content-addressed blobs
  */
 export class SyncEngine {
-  readonly doc = new Y.Doc({ gc: true });
+  readonly doc = new Y.Doc();
   readonly texts: Y.Map<Y.Text>;
   readonly blobs: Y.Map<BlobMeta>;
   /** Transactions we originate carry this origin so observers can ignore them. */
@@ -66,6 +95,7 @@ export class SyncEngine {
   private lastConnectedAt: number | null = null;
   private hint: string | null = null;
   private installId = "";
+  private warnedReadOnly = false;
   /** Deletions from the shared vault that the mass-delete guard held back. */
   pendingDeletions: string[] = [];
 
@@ -73,6 +103,7 @@ export class SyncEngine {
     private app: App,
     private settings: ReplicaSettings,
     private persistence: Persistence,
+    readonly target: EngineTarget,
     private events: EngineEvents,
   ) {
     this.texts = this.doc.getMap<Y.Text>("texts");
@@ -83,10 +114,15 @@ export class SyncEngine {
         .map((s) => s.trim().toLowerCase().replace(/^\./, ""))
         .filter(Boolean),
     );
-    this.excludes = settings.excludePaths
-      .split(",")
-      .map((s) => s.trim())
-      .filter(Boolean);
+    // Exclude paths are a home-vault setting; a guest folder is already a narrow scope.
+    this.excludes =
+      target.kind === "home"
+        ? settings.excludePaths
+            .split(",")
+            .map((s) => s.trim())
+            .filter(Boolean)
+        : [];
+    this.blobClient = target.blobClient;
   }
 
   // ---------------------------------------------------------------- lifecycle
@@ -100,10 +136,8 @@ export class SyncEngine {
     // during reconcile is missed. All handlers are idempotent, so overlap with reconcile is safe.
     this.installObservers();
 
-    const urls = serverUrls(this.settings.serverUrl);
-    if (urls && this.settings.vaultId) {
-      this.blobClient = new BlobClient(urls.http, this.settings.vaultId, this.settings.token);
-      this.connect(urls.ws);
+    if (this.target.wsBase && this.target.room) {
+      this.connect();
       if (!hadDoc) {
         // First run on this device: wait for the server state before reconciling so that
         // files which already exist on both sides are merged, not duplicated.
@@ -133,9 +167,10 @@ export class SyncEngine {
     return this.status === "connected";
   }
 
-  private connect(wsBase: string): void {
+  private connect(): void {
+    const { wsBase, room, params } = this.target;
     this.setStatus("connecting");
-    this.wsUrl = `${wsBase}/${this.settings.vaultId}`;
+    this.wsUrl = `${wsBase}/${room}`;
     if (wsBase.startsWith("ws://") && Platform.isMobileApp) {
       this.hint =
         "Plain ws:// is blocked on mobile (insecure WebSocket from a secure app). Use an https:// server URL with a valid certificate.";
@@ -146,8 +181,8 @@ export class SyncEngine {
     }
     let provider: WebsocketProvider;
     try {
-      provider = new WebsocketProvider(wsBase, this.settings.vaultId, this.doc, {
-        params: { token: this.settings.token },
+      provider = new WebsocketProvider(wsBase, room, this.doc, {
+        params,
         disableBc: true,
         maxBackoffTime: 10_000,
         resyncInterval: 60_000,
@@ -184,6 +219,10 @@ export class SyncEngine {
 
   getDiagnostics(): Diagnostics {
     return {
+      kind: this.target.kind,
+      label: this.target.label,
+      root: this.target.root,
+      readOnly: this.target.readOnly,
       status: this.status,
       wsUrl: this.wsUrl,
       synced: this.provider?.synced ?? false,
@@ -230,45 +269,91 @@ export class SyncEngine {
     this.events.onStatus(s, peers);
   }
 
-  setActiveFile(path: string | null): void {
-    this.provider?.awareness.setLocalStateField("file", path);
+  /** Tell other clients which file we are in (doc key, or null when outside this scope). */
+  setActiveFile(vaultPath: string | null): void {
+    const key = vaultPath ? this.keyOf(vaultPath) : null;
+    this.provider?.awareness.setLocalStateField("file", key);
+  }
+
+  // ---------------------------------------------------------------- scope: vault path <-> doc key
+
+  /** Doc key for a vault path, or null when this engine does not handle it. */
+  private keyOf(vaultPath: string): string | null {
+    if (vaultPath.startsWith(this.app.vault.configDir + "/") || vaultPath.startsWith(".")) return null;
+    const { root, excludeRoots } = this.target;
+    if (root) {
+      if (!vaultPath.startsWith(root)) return null;
+      const key = vaultPath.slice(root.length);
+      return key || null;
+    }
+    for (const r of excludeRoots) if (vaultPath.startsWith(r)) return null;
+    if (this.excludes.some((e) => vaultPath === e || vaultPath.startsWith(e.endsWith("/") ? e : e + "/") || vaultPath.startsWith(e))) {
+      return null;
+    }
+    return vaultPath;
+  }
+
+  /** Doc-key prefix covered by a vault folder, or null if the folder is outside this scope. */
+  private keyPrefixOf(folderPath: string): string | null {
+    const p = folderPath + "/";
+    const { root } = this.target;
+    if (root) {
+      if (p.startsWith(root)) return p.slice(root.length);
+      if (root.startsWith(p)) return ""; // an ancestor of the mount: everything
+      return null;
+    }
+    return this.keyOf(p) === null ? null : p;
+  }
+
+  private pathOf(key: string): string {
+    return this.target.root + key;
+  }
+
+  private fileOf(key: string): TAbstractFile | null {
+    return this.app.vault.getAbstractFileByPath(this.pathOf(key));
   }
 
   // ---------------------------------------------------------------- helpers
 
-  private isExcluded(path: string): boolean {
-    if (path.startsWith(this.app.vault.configDir + "/") || path.startsWith(".")) return true;
-    return this.excludes.some((e) => path === e || path.startsWith(e.endsWith("/") ? e : e + "/") || path.startsWith(e));
-  }
-
-  private isText(path: string): boolean {
-    const dot = path.lastIndexOf(".");
+  private isText(key: string): boolean {
+    const dot = key.lastIndexOf(".");
     if (dot < 0) return false;
-    return this.textExts.has(path.slice(dot + 1).toLowerCase());
+    return this.textExts.has(key.slice(dot + 1).toLowerCase());
   }
 
-  private shouldSync(path: string): boolean {
-    if (this.isExcluded(path)) return false;
-    if (this.isText(path)) return true;
+  private shouldSync(key: string): boolean {
+    if (key.split("/").some((seg) => seg.startsWith("."))) return false;
+    if (this.isText(key)) return true;
     return this.settings.syncBinary;
   }
 
-  private markSynced(path: string, hash: string): void {
-    this.state.synced[path] = hash;
-    this.persistence.noteSynced(path, hash, this.state);
+  /** Read-only guests never write to the document; say so once. */
+  private blockedReadOnly(key: string): boolean {
+    if (!this.target.readOnly) return false;
+    if (!this.warnedReadOnly) {
+      this.warnedReadOnly = true;
+      new Notice(`Replica: ${this.target.label} is read-only. Your edits under ${this.target.root} are not sent and will be overwritten by the shared version.`, 10_000);
+    }
+    console.info(`[replica] read-only ${this.target.label}: not pushing ${key}`);
+    return true;
   }
 
-  private forgetSynced(path: string): void {
-    if (path in this.state.synced) {
-      delete this.state.synced[path];
-      this.persistence.noteForgotten(path, this.state);
+  private markSynced(key: string, hash: string): void {
+    this.state.synced[key] = hash;
+    this.persistence.noteSynced(key, hash, this.state);
+  }
+
+  private forgetSynced(key: string): void {
+    if (key in this.state.synced) {
+      delete this.state.synced[key];
+      this.persistence.noteForgotten(key, this.state);
     }
   }
 
-  private async ensureFolder(path: string): Promise<void> {
-    const idx = path.lastIndexOf("/");
+  private async ensureFolder(vaultPath: string): Promise<void> {
+    const idx = vaultPath.lastIndexOf("/");
     if (idx <= 0) return;
-    const folder = path.slice(0, idx);
+    const folder = vaultPath.slice(0, idx);
     if (this.app.vault.getAbstractFileByPath(folder)) return;
     await this.ensureFolder(folder);
     try {
@@ -278,11 +363,11 @@ export class SyncEngine {
     }
   }
 
-  private conflictPath(path: string): string {
-    const dot = path.lastIndexOf(".");
-    const slash = path.lastIndexOf("/");
-    const base = dot > slash ? path.slice(0, dot) : path;
-    const ext = dot > slash ? path.slice(dot) : "";
+  private conflictPath(key: string): string {
+    const dot = key.lastIndexOf(".");
+    const slash = key.lastIndexOf("/");
+    const base = dot > slash ? key.slice(0, dot) : key;
+    const ext = dot > slash ? key.slice(dot) : "";
     const d = new Date();
     const stamp = `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}${pad(d.getMinutes())}`;
     return `${base} (conflict ${this.settings.deviceName} ${stamp})${ext}`;
@@ -290,8 +375,9 @@ export class SyncEngine {
 
   // ---------------------------------------------------------------- disk writes
 
-  private async writeTextToDisk(path: string, content: string): Promise<void> {
-    this.markSynced(path, hashText(content));
+  private async writeTextToDisk(key: string, content: string): Promise<void> {
+    this.markSynced(key, hashText(content));
+    const path = this.pathOf(key);
     const existing = this.app.vault.getAbstractFileByPath(path);
     if (existing instanceof TFile) {
       if ((await this.app.vault.read(existing)) !== content) await this.app.vault.modify(existing, content);
@@ -308,8 +394,9 @@ export class SyncEngine {
     }
   }
 
-  private async writeBinaryToDisk(path: string, data: ArrayBuffer, hash: string): Promise<void> {
-    this.markSynced(path, hash);
+  private async writeBinaryToDisk(key: string, data: ArrayBuffer, hash: string): Promise<void> {
+    this.markSynced(key, hash);
+    const path = this.pathOf(key);
     const existing = this.app.vault.getAbstractFileByPath(path);
     if (existing instanceof TFile) {
       await this.app.vault.modifyBinary(existing, data);
@@ -325,24 +412,25 @@ export class SyncEngine {
     }
   }
 
-  private async deleteFromDisk(path: string): Promise<void> {
-    this.forgetSynced(path);
-    const f = this.app.vault.getAbstractFileByPath(path);
+  private async deleteFromDisk(key: string): Promise<void> {
+    this.forgetSynced(key);
+    const f = this.fileOf(key);
     if (f instanceof TFile) {
       await this.app.fileManager.trashFile(f);
     }
   }
 
-  private async writeConflictCopy(path: string, content: string | ArrayBuffer): Promise<void> {
-    const cp = this.conflictPath(path);
+  private async writeConflictCopy(key: string, content: string | ArrayBuffer): Promise<void> {
+    const cp = this.pathOf(this.conflictPath(key));
     await this.ensureFolder(cp);
     if (typeof content === "string") await this.app.vault.create(cp, content);
     else await this.app.vault.createBinary(cp, content);
-    new Notice(`Replica: conflict on ${path}, kept your version as ${cp.split("/").pop()}`);
+    new Notice(`Replica: conflict on ${this.pathOf(key)}, kept your version as ${cp.split("/").pop()}`);
   }
 
   /** Editors currently showing a file, so remote changes can be applied without losing the cursor. */
-  private editorsFor(path: string): Editor[] {
+  private editorsFor(key: string): Editor[] {
+    const path = this.pathOf(key);
     const out: Editor[] = [];
     for (const leaf of this.app.workspace.getLeavesOfType("markdown")) {
       const view = leaf.view;
@@ -354,12 +442,13 @@ export class SyncEngine {
   // ---------------------------------------------------------------- local -> doc
 
   /** Push the current local content of a text file into the shared doc. */
-  pushLocalText(path: string, content: string): void {
-    if (this.stopped || !this.shouldSync(path) || !this.isText(path)) return;
-    const existing = this.texts.get(path);
+  pushLocalText(key: string, content: string): void {
+    if (this.stopped || !this.shouldSync(key) || !this.isText(key)) return;
+    if (this.blockedReadOnly(key)) return;
+    const existing = this.texts.get(key);
     this.doc.transact(() => {
       if (!existing) {
-        this.texts.set(path, new Y.Text(content));
+        this.texts.set(key, new Y.Text(content));
         return;
       }
       const d = diffText(existing.toString(), content);
@@ -367,59 +456,62 @@ export class SyncEngine {
       if (d.remove > 0) existing.delete(d.index, d.remove);
       if (d.insert) existing.insert(d.index, d.insert);
     }, this.localOrigin);
-    this.markSynced(path, hashText(content));
+    this.markSynced(key, hashText(content));
   }
 
-  private async pushLocalBlob(path: string, file: TFile): Promise<void> {
-    if (this.stopped || !this.shouldSync(path) || this.isText(path)) return;
+  private async pushLocalBlob(key: string, file: TFile): Promise<void> {
+    if (this.stopped || !this.shouldSync(key) || this.isText(key)) return;
+    if (this.blockedReadOnly(key)) return;
     const data = await this.app.vault.readBinary(file);
     const hash = await sha256Hex(data);
-    const current = this.blobs.get(path);
+    const current = this.blobs.get(key);
     if (current?.hash === hash) {
-      this.markSynced(path, hash);
+      this.markSynced(key, hash);
       return;
     }
     if (this.blobClient) {
       try {
         await this.blobClient.upload(hash, data);
       } catch (e) {
-        console.warn(`[replica] upload of ${path} failed, will retry on next change`, e);
+        console.warn(`[replica] upload of ${this.pathOf(key)} failed, will retry on next change`, e);
         return;
       }
     }
     this.doc.transact(() => {
-      this.blobs.set(path, { hash, size: data.byteLength, mtime: file.stat.mtime });
+      this.blobs.set(key, { hash, size: data.byteLength, mtime: file.stat.mtime });
     }, this.localOrigin);
-    this.markSynced(path, hash);
+    this.markSynced(key, hash);
   }
 
-  private removeFromDoc(path: string): void {
+  private removeFromDoc(key: string): void {
+    if (this.blockedReadOnly(key)) return;
     this.doc.transact(() => {
-      if (this.texts.has(path)) this.texts.delete(path);
-      if (this.blobs.has(path)) this.blobs.delete(path);
+      if (this.texts.has(key)) this.texts.delete(key);
+      if (this.blobs.has(key)) this.blobs.delete(key);
     }, this.localOrigin);
-    this.forgetSynced(path);
+    this.forgetSynced(key);
   }
 
-  private moveInDoc(oldPath: string, newPath: string): void {
-    const t = this.texts.get(oldPath);
-    const b = this.blobs.get(oldPath);
+  private moveInDoc(oldKey: string, newKey: string): void {
+    if (this.blockedReadOnly(oldKey)) return;
+    const t = this.texts.get(oldKey);
+    const b = this.blobs.get(oldKey);
     this.doc.transact(() => {
       if (t) {
-        this.texts.set(newPath, new Y.Text(t.toString()));
-        this.texts.delete(oldPath);
+        this.texts.set(newKey, new Y.Text(t.toString()));
+        this.texts.delete(oldKey);
       }
       if (b) {
-        this.blobs.set(newPath, { ...b });
-        this.blobs.delete(oldPath);
+        this.blobs.set(newKey, { ...b });
+        this.blobs.delete(oldKey);
       }
     }, this.localOrigin);
-    const h = this.state.synced[oldPath];
-    this.forgetSynced(oldPath);
-    if (h) this.markSynced(newPath, h);
+    const h = this.state.synced[oldKey];
+    this.forgetSynced(oldKey);
+    if (h) this.markSynced(newKey, h);
   }
 
-  private docPathsWithPrefix(prefix: string): string[] {
+  private docKeysWithPrefix(prefix: string): string[] {
     const out: string[] = [];
     for (const k of this.texts.keys()) if (k.startsWith(prefix)) out.push(k);
     for (const k of this.blobs.keys()) if (k.startsWith(prefix)) out.push(k);
@@ -428,11 +520,11 @@ export class SyncEngine {
 
   // ---------------------------------------------------------------- doc -> local
 
-  private async applyRemoteTextDelta(path: string, ytext: Y.Text, delta: Y.YTextEvent["delta"]): Promise<void> {
-    const editors = this.editorsFor(path);
+  private async applyRemoteTextDelta(key: string, ytext: Y.Text, delta: Y.YTextEvent["delta"]): Promise<void> {
+    const editors = this.editorsFor(key);
     const target = ytext.toString();
     if (editors.length === 0) {
-      await this.writeTextToDisk(path, target);
+      await this.writeTextToDisk(key, target);
       return;
     }
     const editor = editors[0];
@@ -453,22 +545,22 @@ export class SyncEngine {
       editor.setValue(target);
       editor.setCursor(cursor);
     }
-    this.markSynced(path, hashText(target));
+    this.markSynced(key, hashText(target));
   }
 
-  private async applyRemoteBlob(path: string, meta: BlobMeta): Promise<void> {
-    if (!this.shouldSync(path)) return;
-    if (this.state.synced[path] === meta.hash) return;
-    const existing = this.app.vault.getAbstractFileByPath(path);
+  private async applyRemoteBlob(key: string, meta: BlobMeta): Promise<void> {
+    if (!this.shouldSync(key)) return;
+    if (this.state.synced[key] === meta.hash) return;
+    const existing = this.fileOf(key);
     if (existing instanceof TFile) {
       const localHash = await sha256Hex(await this.app.vault.readBinary(existing));
       if (localHash === meta.hash) {
-        this.markSynced(path, meta.hash);
+        this.markSynced(key, meta.hash);
         return;
       }
-      const lastSynced = this.state.synced[path];
+      const lastSynced = this.state.synced[key];
       if (lastSynced && lastSynced !== localHash) {
-        await this.writeConflictCopy(path, await this.app.vault.readBinary(existing));
+        await this.writeConflictCopy(key, await this.app.vault.readBinary(existing));
       }
     }
     if (!this.blobClient) return;
@@ -481,20 +573,20 @@ export class SyncEngine {
       try {
         const data = await client.download(meta.hash);
         if (data) {
-          await this.writeBinaryToDisk(path, data, meta.hash);
+          await this.writeBinaryToDisk(key, data, meta.hash);
           return;
         }
       } catch (e) {
-        console.warn(`[replica] download of ${path} failed`, e);
+        console.warn(`[replica] download of ${this.pathOf(key)} failed`, e);
         return;
       }
       if (attempt >= delays.length) {
-        console.warn(`[replica] blob for ${path} never appeared on server, giving up`);
+        console.warn(`[replica] blob for ${this.pathOf(key)} never appeared on server, giving up`);
         return;
       }
-      console.warn(`[replica] blob for ${path} not on server yet, retrying in ${delays[attempt] / 1000}s`);
+      console.warn(`[replica] blob for ${this.pathOf(key)} not on server yet, retrying in ${delays[attempt] / 1000}s`);
       await new Promise((r) => setTimeout(r, delays[attempt]));
-      if (this.blobs.get(path)?.hash !== meta.hash) return; // superseded or removed meanwhile
+      if (this.blobs.get(key)?.hash !== meta.hash) return; // superseded or removed meanwhile
     }
   }
 
@@ -504,19 +596,19 @@ export class SyncEngine {
       for (const ev of events) {
         if (ev.target === this.texts) {
           const mapEv = ev as Y.YMapEvent<Y.Text>;
-          for (const [path, change] of mapEv.changes.keys) {
-            if (!this.shouldSync(path)) continue;
+          for (const [key, change] of mapEv.changes.keys) {
+            if (!this.shouldSync(key)) continue;
             if (change.action === "delete") {
-              void this.deleteFromDisk(path);
+              void this.deleteFromDisk(key);
             } else {
-              const ytext = this.texts.get(path);
-              if (ytext) void this.applyRemoteTextReplace(path, ytext.toString(), change.action === "update");
+              const ytext = this.texts.get(key);
+              if (ytext) void this.applyRemoteTextReplace(key, ytext.toString(), change.action === "update");
             }
           }
         } else if (ev.target instanceof Y.Text && ev.path.length === 1) {
-          const path = String(ev.path[0]);
-          if (!this.shouldSync(path)) continue;
-          void this.applyRemoteTextDelta(path, ev.target, (ev as Y.YTextEvent).delta);
+          const key = String(ev.path[0]);
+          if (!this.shouldSync(key)) continue;
+          void this.applyRemoteTextDelta(key, ev.target, (ev as Y.YTextEvent).delta);
         }
       }
     };
@@ -525,12 +617,12 @@ export class SyncEngine {
 
     const onBlobs = (ev: Y.YMapEvent<BlobMeta>, txn: Y.Transaction) => {
       if (txn.origin === this.localOrigin) return;
-      for (const [path, change] of ev.changes.keys) {
-        if (!this.shouldSync(path)) continue;
-        if (change.action === "delete") void this.deleteFromDisk(path);
+      for (const [key, change] of ev.changes.keys) {
+        if (!this.shouldSync(key)) continue;
+        if (change.action === "delete") void this.deleteFromDisk(key);
         else {
-          const meta = this.blobs.get(path);
-          if (meta) void this.applyRemoteBlob(path, meta);
+          const meta = this.blobs.get(key);
+          if (meta) void this.applyRemoteBlob(key, meta);
         }
       }
     };
@@ -539,27 +631,29 @@ export class SyncEngine {
   }
 
   /** A whole Y.Text was added or replaced remotely (new file, rename, or concurrent create). */
-  private async applyRemoteTextReplace(path: string, content: string, replaced: boolean): Promise<void> {
-    const existing = this.app.vault.getAbstractFileByPath(path);
+  private async applyRemoteTextReplace(key: string, content: string, replaced: boolean): Promise<void> {
+    const existing = this.fileOf(key);
     if (existing instanceof TFile) {
       const local = await this.app.vault.read(existing);
       if (local === content) {
-        this.markSynced(path, hashText(content));
+        this.markSynced(key, hashText(content));
         return;
       }
-      if (replaced || this.state.synced[path] !== hashText(local)) {
-        await this.writeConflictCopy(path, local);
+      const lastSynced = this.state.synced[key];
+      if (!replaced && lastSynced === undefined && local !== content) {
+        // Concurrent create on both sides with different content: keep ours as a conflict copy.
+        await this.writeConflictCopy(key, local);
+      }
+      const editors = this.editorsFor(key);
+      if (editors.length > 0) {
+        const cursor = editors[0].getCursor();
+        editors[0].setValue(content);
+        editors[0].setCursor(cursor);
+        this.markSynced(key, hashText(content));
+        return;
       }
     }
-    const editors = this.editorsFor(path);
-    if (editors.length > 0) {
-      const cursor = editors[0].getCursor();
-      editors[0].setValue(content);
-      editors[0].setCursor(cursor);
-      this.markSynced(path, hashText(content));
-    } else {
-      await this.writeTextToDisk(path, content);
-    }
+    await this.writeTextToDisk(key, content);
   }
 
   // ---------------------------------------------------------------- vault listeners
@@ -575,8 +669,10 @@ export class SyncEngine {
       v.on("rename", (f, oldPath) => this.onLocalRenamed(f, oldPath)),
       w.on("editor-change", (editor, info) => {
         const file = info.file;
-        if (!file || !this.isText(file.path) || !this.shouldSync(file.path)) return;
-        this.scheduleEditorPush(file.path, editor);
+        if (!file) return;
+        const key = this.keyOf(file.path);
+        if (!key || !this.isText(key) || !this.shouldSync(key)) return;
+        this.scheduleEditorPush(key, editor);
       }),
       w.on("active-leaf-change", () => {
         const f = w.getActiveFile();
@@ -586,50 +682,70 @@ export class SyncEngine {
     for (const r of refs) this.unsubscribers.push(() => this.app.vault.offref(r));
   }
 
-  private scheduleEditorPush(path: string, editor: Editor): void {
-    const prev = this.editorTimers.get(path);
+  private scheduleEditorPush(key: string, editor: Editor): void {
+    const prev = this.editorTimers.get(key);
     if (prev) clearTimeout(prev);
     this.editorTimers.set(
-      path,
+      key,
       setTimeout(() => {
-        this.editorTimers.delete(path);
-        this.pushLocalText(path, editor.getValue());
+        this.editorTimers.delete(key);
+        this.pushLocalText(key, editor.getValue());
       }, this.settings.liveDebounceMs),
     );
   }
 
   private async onLocalChanged(f: TAbstractFile): Promise<void> {
-    if (!(f instanceof TFile) || this.stopped || !this.shouldSync(f.path)) return;
-    if (this.isText(f.path)) {
+    if (!(f instanceof TFile) || this.stopped) return;
+    const key = this.keyOf(f.path);
+    if (!key || !this.shouldSync(key)) return;
+    if (this.isText(key)) {
       // If an editor is open the editor-change path already handles it; still verify disk content.
       const content = await this.app.vault.read(f);
-      this.pushLocalText(f.path, content);
+      this.pushLocalText(key, content);
     } else {
-      await this.pushLocalBlob(f.path, f);
+      await this.pushLocalBlob(key, f);
     }
   }
 
   private onLocalDeleted(f: TAbstractFile): void {
     if (this.stopped) return;
     if (f instanceof TFolder) {
-      for (const p of this.docPathsWithPrefix(f.path + "/")) this.removeFromDoc(p);
-    } else if (this.shouldSync(f.path)) {
-      this.removeFromDoc(f.path);
+      const prefix = this.keyPrefixOf(f.path);
+      if (prefix === null) return;
+      for (const k of this.docKeysWithPrefix(prefix)) this.removeFromDoc(k);
+      return;
     }
+    const key = this.keyOf(f.path);
+    if (key && this.shouldSync(key)) this.removeFromDoc(key);
   }
 
   private onLocalRenamed(f: TAbstractFile, oldPath: string): void {
     if (this.stopped) return;
     if (f instanceof TFolder) {
-      for (const p of this.docPathsWithPrefix(oldPath + "/")) {
-        this.moveInDoc(p, f.path + p.slice(oldPath.length));
+      const { root } = this.target;
+      if (root && root.startsWith(oldPath + "/") && !(f.path + "/" === root || root.startsWith(f.path + "/"))) {
+        new Notice(`Replica: the folder of shared ${this.target.label} was moved. Unmount it and mount again at the new place.`, 10_000);
+        return;
+      }
+      const oldPrefix = this.keyPrefixOf(oldPath);
+      const newPrefix = this.keyPrefixOf(f.path);
+      if (oldPrefix !== null && newPrefix !== null) {
+        for (const k of this.docKeysWithPrefix(oldPrefix)) this.moveInDoc(k, newPrefix + k.slice(oldPrefix.length));
+      } else if (oldPrefix !== null) {
+        for (const k of this.docKeysWithPrefix(oldPrefix)) this.removeFromDoc(k);
+      } else if (newPrefix !== null) {
+        for (const child of this.app.vault.getFiles()) {
+          if (child.path.startsWith(f.path + "/")) void this.onLocalChanged(child);
+        }
       }
       return;
     }
-    const oldOk = this.shouldSync(oldPath);
-    const newOk = this.shouldSync(f.path);
-    if (oldOk && newOk) this.moveInDoc(oldPath, f.path);
-    else if (oldOk) this.removeFromDoc(oldPath);
+    const oldKey = this.keyOf(oldPath);
+    const newKey = this.keyOf(f.path);
+    const oldOk = oldKey !== null && this.shouldSync(oldKey);
+    const newOk = newKey !== null && this.shouldSync(newKey);
+    if (oldOk && newOk) this.moveInDoc(oldKey!, newKey!);
+    else if (oldOk) this.removeFromDoc(oldKey!);
     else if (newOk) void this.onLocalChanged(f);
   }
 
@@ -642,38 +758,39 @@ export class SyncEngine {
   async reconcileAll(opts: { allowMassDelete?: boolean } = {}): Promise<void> {
     const localFiles = new Map<string, TFile>();
     for (const f of this.app.vault.getFiles()) {
-      if (this.shouldSync(f.path)) localFiles.set(f.path, f);
+      const key = this.keyOf(f.path);
+      if (key && this.shouldSync(key)) localFiles.set(key, f);
     }
 
     // Local files first.
-    for (const [path, file] of localFiles) {
+    for (const [key, file] of localFiles) {
       try {
-        if (this.isText(path)) await this.reconcileText(path, file);
-        else await this.reconcileBlob(path, file);
+        if (this.isText(key)) await this.reconcileText(key, file);
+        else await this.reconcileBlob(key, file);
       } catch (e) {
-        console.error(`[replica] reconcile failed for ${path}`, e);
+        console.error(`[replica] reconcile failed for ${this.pathOf(key)}`, e);
       }
     }
 
     // Then entries in the doc that are missing locally.
     const toDelete: string[] = [];
-    for (const path of [...this.texts.keys()]) {
-      if (localFiles.has(path) || !this.shouldSync(path)) continue;
-      if (this.state.synced[path]) {
+    for (const key of [...this.texts.keys()]) {
+      if (localFiles.has(key) || !this.shouldSync(key)) continue;
+      if (this.state.synced[key] && !this.target.readOnly) {
         // We had it and it is gone locally: deleted while offline.
-        toDelete.push(path);
+        toDelete.push(key);
       } else {
-        const t = this.texts.get(path);
-        if (t) await this.writeTextToDisk(path, t.toString());
+        const t = this.texts.get(key);
+        if (t) await this.writeTextToDisk(key, t.toString());
       }
     }
-    for (const path of [...this.blobs.keys()]) {
-      if (localFiles.has(path) || !this.shouldSync(path)) continue;
-      if (this.state.synced[path]) {
-        toDelete.push(path);
+    for (const key of [...this.blobs.keys()]) {
+      if (localFiles.has(key) || !this.shouldSync(key)) continue;
+      if (this.state.synced[key] && !this.target.readOnly) {
+        toDelete.push(key);
       } else {
-        const m = this.blobs.get(path);
-        if (m) await this.applyRemoteBlob(path, m);
+        const m = this.blobs.get(key);
+        if (m) await this.applyRemoteBlob(key, m);
       }
     }
 
@@ -683,86 +800,86 @@ export class SyncEngine {
       this.pendingDeletions = toDelete;
       console.warn(`[replica] refusing to delete ${toDelete.length} of ${total} shared files; held back`, toDelete);
       new Notice(
-        `Replica: ${toDelete.length} files are missing here but exist in the shared vault. ` +
+        `Replica: ${toDelete.length} files are missing here but exist in ${this.target.label}. ` +
           `Not deleting them for safety. They will be re-downloaded on next reconcile, or run ` +
           `"Replica: Apply held-back deletions" if you really removed them.`,
         15_000,
       );
       // Bring them back locally instead, so this device matches the shared vault.
-      for (const path of toDelete) {
-        this.forgetSynced(path);
-        const t = this.texts.get(path);
-        if (t) await this.writeTextToDisk(path, t.toString());
+      for (const key of toDelete) {
+        this.forgetSynced(key);
+        const t = this.texts.get(key);
+        if (t) await this.writeTextToDisk(key, t.toString());
         else {
-          const m = this.blobs.get(path);
-          if (m) await this.applyRemoteBlob(path, m);
+          const m = this.blobs.get(key);
+          if (m) await this.applyRemoteBlob(key, m);
         }
       }
     } else {
       this.pendingDeletions = [];
-      for (const path of toDelete) this.removeFromDoc(path);
+      for (const key of toDelete) this.removeFromDoc(key);
     }
     await this.persistence.flushState(this.state);
   }
 
-  private async reconcileText(path: string, file: TFile): Promise<void> {
+  private async reconcileText(key: string, file: TFile): Promise<void> {
     const local = await this.app.vault.read(file);
     const localHash = hashText(local);
-    const ytext = this.texts.get(path);
-    const lastSynced = this.state.synced[path];
+    const ytext = this.texts.get(key);
+    const lastSynced = this.state.synced[key];
 
     if (!ytext) {
       if (lastSynced) {
         // Was in the doc before, now gone: deleted remotely while we were offline.
-        await this.deleteFromDisk(path);
-      } else {
-        this.pushLocalText(path, local);
+        await this.deleteFromDisk(key);
+      } else if (!this.target.readOnly) {
+        this.pushLocalText(key, local);
       }
       return;
     }
 
     const remote = ytext.toString();
     if (remote === local) {
-      this.markSynced(path, localHash);
+      this.markSynced(key, localHash);
       return;
     }
     if (lastSynced === localHash) {
       // Only the remote side changed.
-      await this.writeTextToDisk(path, remote);
-    } else if (lastSynced === hashText(remote)) {
+      await this.writeTextToDisk(key, remote);
+    } else if (lastSynced === hashText(remote) && !this.target.readOnly) {
       // Only we changed.
-      this.pushLocalText(path, local);
+      this.pushLocalText(key, local);
     } else {
       // Both changed, or first contact with differing content: keep both.
-      await this.writeConflictCopy(path, local);
-      await this.writeTextToDisk(path, remote);
+      await this.writeConflictCopy(key, local);
+      await this.writeTextToDisk(key, remote);
     }
   }
 
-  private async reconcileBlob(path: string, file: TFile): Promise<void> {
-    const meta = this.blobs.get(path);
-    const lastSynced = this.state.synced[path];
+  private async reconcileBlob(key: string, file: TFile): Promise<void> {
+    const meta = this.blobs.get(key);
+    const lastSynced = this.state.synced[key];
     if (!meta) {
-      if (lastSynced) await this.deleteFromDisk(path);
-      else await this.pushLocalBlob(path, file);
+      if (lastSynced) await this.deleteFromDisk(key);
+      else if (!this.target.readOnly) await this.pushLocalBlob(key, file);
       return;
     }
     const localHash = await sha256Hex(await this.app.vault.readBinary(file));
     if (localHash === meta.hash) {
-      this.markSynced(path, localHash);
+      this.markSynced(key, localHash);
       return;
     }
     if (lastSynced === localHash) {
-      await this.applyRemoteBlob(path, meta);
-    } else if (lastSynced === meta.hash) {
-      await this.pushLocalBlob(path, file);
+      await this.applyRemoteBlob(key, meta);
+    } else if (lastSynced === meta.hash && !this.target.readOnly) {
+      await this.pushLocalBlob(key, file);
     } else {
       // Both changed: newer mtime wins, the loser is kept as a conflict copy.
-      if (file.stat.mtime > meta.mtime) {
-        await this.pushLocalBlob(path, file);
+      if (file.stat.mtime > meta.mtime && !this.target.readOnly) {
+        await this.pushLocalBlob(key, file);
       } else {
-        await this.writeConflictCopy(path, await this.app.vault.readBinary(file));
-        await this.applyRemoteBlob(path, meta);
+        await this.writeConflictCopy(key, await this.app.vault.readBinary(file));
+        await this.applyRemoteBlob(key, meta);
       }
     }
   }

@@ -1,6 +1,8 @@
 import { AbstractInputSuggest, App, Modal, Notice, Setting, TAbstractFile, TFolder } from "obsidian";
 import { ReplicaApi, ShareRow, TicketInfo } from "./api";
 import type ReplicaPlugin from "./main";
+import { serverUrls } from "./settings";
+import { decodeTicket, Ticket } from "./ticket";
 
 export async function copyText(text: string, what = "Ticket"): Promise<void> {
   try {
@@ -180,12 +182,17 @@ export class NewTicketModal extends Modal {
   }
 }
 
-/** Paste a ticket, see what it is, choose where it goes, mount. */
+/**
+ * Paste a ticket, see what it is, choose where it goes, mount: either through your own server
+ * (the server keeps a replica and bridges it into your vault) or as a guest (this plugin talks
+ * to the owner's server directly; no server of your own needed).
+ */
 export class MountModal extends Modal {
   private api: ReplicaApi;
   private ticket = "";
   private mountPath = "";
   private info: TicketInfo | null = null;
+  private local: Ticket | null = null;
   private inspectTimer: ReturnType<typeof setTimeout> | null = null;
 
   constructor(
@@ -212,17 +219,38 @@ export class MountModal extends Modal {
       pathInput = t.inputEl;
     });
     const msg = contentEl.createDiv({ cls: "replica-error" });
-    let mountBtn: import("obsidian").ButtonComponent | null = null;
-    new Setting(contentEl).addButton((b) => {
-      mountBtn = b;
-      b.setButtonText("Mount")
-        .setCta()
+    const hasServer = !!(this.plugin.settings.serverUrl && this.plugin.settings.token);
+    let serverBtn: import("obsidian").ButtonComponent | null = null;
+    let guestBtn: import("obsidian").ButtonComponent | null = null;
+    const buttons = new Setting(contentEl);
+    if (hasServer) {
+      buttons.addButton((b) => {
+        serverBtn = b;
+        b.setButtonText("Mount via my server")
+          .setCta()
+          .setDisabled(true)
+          .onClick(async () => {
+            b.setDisabled(true);
+            try {
+              const r = await this.api.mount(this.ticket.trim(), this.mountPath.trim());
+              new Notice(`Replica: mounted at ${r.mount_path} (${accessText(r.access)}). Files arrive shortly.`, 8000);
+              this.onDone?.();
+              this.close();
+            } catch (e) {
+              msg.setText((e as Error).message);
+              b.setDisabled(false);
+            }
+          });
+      });
+    }
+    buttons.addButton((b) => {
+      guestBtn = b;
+      b.setButtonText(hasServer ? "Mount as guest" : "Mount")
         .setDisabled(true)
         .onClick(async () => {
           b.setDisabled(true);
           try {
-            const r = await this.api.mount(this.ticket.trim(), this.mountPath.trim());
-            new Notice(`Replica: mounted at ${r.mount_path} (${accessText(r.access)}). Files arrive shortly.`, 8000);
+            await this.mountAsGuest();
             this.onDone?.();
             this.close();
           } catch (e) {
@@ -230,41 +258,68 @@ export class MountModal extends Modal {
             b.setDisabled(false);
           }
         });
+      if (!hasServer) b.setCta();
     });
+    contentEl.createDiv({
+      cls: "replica-muted replica-small",
+      text: hasServer
+        ? "Via my server: your server keeps a copy and links to the owner's server, works on all your devices. As guest: this device talks to the owner's server directly; no account there needed, only this device."
+        : "This device will talk to the owner's server directly. Nothing else in your vault is sent anywhere.",
+    });
+
+    const row = (label: string, value: string, cls = "") => {
+      const r = card.createDiv({ cls: "replica-diag-row" });
+      r.createSpan({ cls: "replica-diag-label", text: label });
+      r.createSpan({ cls: "replica-diag-value " + cls, text: value });
+    };
 
     const inspect = async () => {
       const t = this.ticket.trim();
       card.empty();
       msg.setText("");
       this.info = null;
-      mountBtn?.setDisabled(true);
+      this.local = null;
+      serverBtn?.setDisabled(true);
+      guestBtn?.setDisabled(true);
       if (!t) return;
+      // Decode locally first: works without any server and tells us if guest mode is possible.
+      try {
+        this.local = decodeTicket(t);
+      } catch (e) {
+        msg.setText((e as Error).message);
+        return;
+      }
+      const local = this.local;
+      row("Share", local.name);
+      row("Access", accessText(local.access));
+      if (!this.mountPath.trim() && pathInput) {
+        this.mountPath = `Shared/${local.name}`;
+        pathInput.value = this.mountPath;
+      }
+      if (local.url) {
+        const insecure = local.url.startsWith("http://") && (this.app as any).isMobile;
+        row("Guest access", insecure ? `${local.url} is plain http; mobile needs https` : `${local.url}`, insecure ? "is-bad" : "");
+        guestBtn?.setDisabled(insecure);
+      } else {
+        row("Guest access", "not offered by this ticket (owner's server has no public URL)", "is-warn");
+      }
+      if (!hasServer) return;
       try {
         const info = await this.api.inspectTicket(t);
         if (this.ticket.trim() !== t) return; // superseded
         this.info = info;
-        const row = (label: string, value: string, cls = "") => {
-          const r = card.createDiv({ cls: "replica-diag-row" });
-          r.createSpan({ cls: "replica-diag-label", text: label });
-          r.createSpan({ cls: "replica-diag-value " + cls, text: value });
-        };
-        row("Share", info.name);
-        row("Access", accessText(info.access));
-        row("Where", info.same_server ? "this server" : `another server (${info.node_id.slice(0, 10)}…), linked peer-to-peer`);
+        row("Via my server", info.same_server ? "same server as the owner" : `owner is on another server (${info.node_id.slice(0, 10)}…), linked peer-to-peer`);
         if (info.from_own_vault) row("Owner", `you (vault "${info.from_own_vault}")`, "is-warn");
         if (info.valid === false) {
           row("Status", "invalid or revoked", "is-bad");
+          guestBtn?.setDisabled(true);
           return;
         }
         if (!info.same_server && !info.p2p_available) {
-          row("Status", "this server runs with p2p disabled; cannot mount tickets from other servers", "is-bad");
+          row("Status", "your server runs with p2p disabled; cannot mount this via your server", "is-warn");
           return;
         }
-        if (!this.mountPath.trim() && pathInput) {
-          this.mountPath = `Shared/${info.name}`;
-          pathInput.value = this.mountPath;
-        }
-        mountBtn?.setDisabled(false);
+        serverBtn?.setDisabled(false);
       } catch (e) {
         msg.setText((e as Error).message);
       }
@@ -275,6 +330,36 @@ export class MountModal extends Modal {
       this.inspectTimer = setTimeout(() => void inspect(), 300);
     });
     ta.focus();
+  }
+
+  private async mountAsGuest(): Promise<void> {
+    const t = this.local;
+    if (!t) throw new Error("paste a ticket first");
+    if (!t.url) throw new Error("this ticket cannot be used as a guest; mount it via your own server instead");
+    if (!serverUrls(t.url)) throw new Error("the ticket's server URL is not valid");
+    const mountPath = this.mountPath.trim().replace(/^\/+|\/+$/g, "");
+    if (!mountPath) throw new Error("choose a folder for the shared files");
+    const s = this.plugin.settings;
+    const prefix = mountPath + "/";
+    for (const m of s.guestMounts) {
+      const p = m.mountPath + "/";
+      if (p.startsWith(prefix) || prefix.startsWith(p)) throw new Error(`overlaps the shared folder at ${m.mountPath}`);
+      if (m.shareId === t.shareId) throw new Error(`“${m.name}” is already mounted at ${m.mountPath}`);
+    }
+    const existing = this.app.vault.getAbstractFileByPath(mountPath);
+    if (existing && !(existing instanceof TFolder)) throw new Error(`${mountPath} is a file`);
+    if (existing instanceof TFolder && existing.children.length > 0) throw new Error(`${mountPath} already contains files; choose an empty or new folder`);
+    await this.plugin.addGuestMount({
+      id: "g" + Math.random().toString(36).slice(2, 10),
+      url: t.url,
+      shareId: t.shareId,
+      secret: t.secret,
+      access: t.access === "ro" ? "ro" : "rw",
+      name: t.name,
+      mountPath,
+      enabled: true,
+    });
+    new Notice(`Replica: “${t.name}” mounted at ${mountPath} as guest (${accessText(t.access)}). Files arrive shortly.`, 8000);
   }
 
   onClose(): void {

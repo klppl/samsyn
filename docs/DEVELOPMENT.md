@@ -140,6 +140,10 @@ Obsidian mobile does not expose a developer console. Options, in order of useful
 - iOS suspends the app in the background and closes the WebSocket. Replica reconnects when the app returns and the reconcile step catches up on anything missed.
 - `WebSocket` headers cannot be set on mobile, which is why the token also goes in the URL query string.
 
+## Engines and scopes
+
+`SyncEngine` is instantiated once per sync target (`EngineTarget`): the *home* engine (own server, whole vault, keys == vault paths) and one *guest* engine per guest mount (owner's server, one folder, keys relative to the folder). All path mapping happens at the Obsidian boundary: `keyOf(vaultPath)` returns the document key or `null` when the path is outside this engine's scope (other engines' roots, config dir, excludes); `pathOf(key)` goes back. Everything between (observers, reconcile, conflict copies, mass-delete guard) works on keys and is identical for both kinds. `ReplicaPlugin.engines` holds them; `plugin.engine` is the home engine.
+
 ## Local cache on the device
 
 The plugin keeps two things per device and vault, both in **IndexedDB** (`src/persistence.ts`), never in the vault folder:

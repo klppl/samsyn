@@ -1,17 +1,25 @@
 import { requestUrl } from "obsidian";
 
+/** Content-addressed blob transfer. `urlOf` builds the route (vault or guest share). */
 export class BlobClient {
-  constructor(private httpBase: string, private vaultId: string, private token: string) {}
+  constructor(
+    private urlOf: (hash: string) => string,
+    private bearer: string,
+  ) {}
 
-  private url(hash: string): string {
-    return `${this.httpBase}/blobs/${encodeURIComponent(this.vaultId)}/${hash}`;
+  static forVault(httpBase: string, vaultId: string, token: string): BlobClient {
+    return new BlobClient((hash) => `${httpBase}/blobs/${encodeURIComponent(vaultId)}/${hash}`, token);
+  }
+
+  static forShare(httpBase: string, shareId: string, secret: string): BlobClient {
+    return new BlobClient((hash) => `${httpBase}/guest/blobs/${encodeURIComponent(shareId)}/${hash}`, secret);
   }
 
   async upload(hash: string, data: ArrayBuffer): Promise<void> {
     const res = await requestUrl({
-      url: this.url(hash),
+      url: this.urlOf(hash),
       method: "PUT",
-      headers: { Authorization: `Bearer ${this.token}`, "Content-Type": "application/octet-stream" },
+      headers: { Authorization: `Bearer ${this.bearer}`, "Content-Type": "application/octet-stream" },
       body: data,
       throw: false,
     });
@@ -22,9 +30,9 @@ export class BlobClient {
 
   async download(hash: string): Promise<ArrayBuffer | null> {
     const res = await requestUrl({
-      url: this.url(hash),
+      url: this.urlOf(hash),
       method: "GET",
-      headers: { Authorization: `Bearer ${this.token}` },
+      headers: { Authorization: `Bearer ${this.bearer}` },
       throw: false,
     });
     if (res.status === 404) return null;
