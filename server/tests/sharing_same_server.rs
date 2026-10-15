@@ -99,6 +99,19 @@ fn share_mount_edit_revoke_restart() {
     assert!(!c.contains("Shared/X/a.md", "after-revoke"), "carol still receives after revoke");
     assert!(c.exists("Shared/X/a.md"), "carol keeps files");
 
+    // Un-revoke: the same ticket works again and carol's local mount resumes on its own.
+    let (code, body) = api_raw(&server, &owner, "POST", &format!("/api/shares/{share_id}/grants/carol/restore"), None);
+    assert_eq!(code, 200, "{body}");
+    a.append("Projects/X/a.md", "after-restore");
+    eventually!(15, c.contains("Shared/X/a.md", "after-restore"), "carol receives again after restore", c.proc, server.proc);
+    // Revoke again, then a second DELETE purges the ticket from the list.
+    let (code, _) = api_raw(&server, &owner, "DELETE", &format!("/api/shares/{share_id}/grants/carol"), None);
+    assert_eq!(code, 204);
+    let (code, _) = api_raw(&server, &owner, "DELETE", &format!("/api/shares/{share_id}/grants/carol"), None);
+    assert_eq!(code, 204);
+    let info = api_json(&server, &owner, "GET", "/api/vaults/va/sharing", None);
+    assert_eq!(info["shares"][0]["grants"].as_array().unwrap().len(), 1, "revoked ticket purged: {info}");
+
     // Bob moves his mount to another folder: nothing is deleted for the owner, bob's files move.
     let info = api_json(&server, &bob_tok, "GET", "/api/vaults/vb/sharing", None);
     let mid = info["mounts"][0]["id"].as_str().unwrap().to_string();

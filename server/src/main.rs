@@ -154,6 +154,7 @@ async fn serve(args: ServeArgs, storage: Storage) -> anyhow::Result<()> {
         .route("/api/shares/{id}", delete(sharing::delete_share).patch(sharing::move_share))
         .route("/api/shares/{id}/tickets", post(sharing::new_ticket))
         .route("/api/shares/{id}/grants/{label}", delete(sharing::revoke_ticket))
+        .route("/api/shares/{id}/grants/{label}/restore", post(sharing::restore_ticket))
         .route("/api/vaults/{vault}/mounts", post(sharing::create_mount))
         .route("/api/mounts/{id}", delete(sharing::delete_mount).patch(sharing::move_mount))
         .route("/api/tickets/inspect", post(sharing::inspect_ticket))

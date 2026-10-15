@@ -7,6 +7,7 @@ export interface Grant {
   created_at: string;
   revoked_at: string | null;
   mounted_by: number;
+  last_seen_at: string | null;
 }
 export interface ShareRow {
   id: string;
@@ -90,6 +91,13 @@ export class ReplicaApi {
   }
   revoke(shareId: string, label: string): Promise<void> {
     return this.call("DELETE", `/api/shares/${shareId}/grants/${encodeURIComponent(label)}`);
+  }
+  restoreTicket(shareId: string, label: string): Promise<{ restored_mounts: number }> {
+    return this.call("POST", `/api/shares/${shareId}/grants/${encodeURIComponent(label)}/restore`);
+  }
+  /** Remove an already revoked ticket from the list (same route; second DELETE purges). */
+  deleteRevoked(shareId: string, label: string): Promise<void> {
+    return this.revoke(shareId, label);
   }
   unshare(shareId: string): Promise<void> {
     return this.call("DELETE", `/api/shares/${shareId}`);

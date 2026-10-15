@@ -73,7 +73,7 @@ Limits on the link (the node id is public, so everything before the hello must b
 - Blobs: when a bridge replays a binary file it copies the bytes into the target store *before* inserting the metadata, so a client that fetches the moment the metadata arrives finds the bytes. The plugin additionally retries a missing blob with backoff (2 s, 5 s, 15 s, 30 s) in case an uploader is slow.
 - Share and mount creation run under one server-wide lock (overlap check, registry insert, bridge attach), so two concurrent requests cannot both pass the overlap check.
 - Moving things around: inside a shared folder you can reorganise freely. Moving the shared folder itself (a mount, your own shared folder, or an ancestor of either) in the file explorer is **blocked**: the plugin moves it straight back and shows one notice pointing at Settings → Sharing → **Move…**, which does the move properly (`PATCH /api/mounts/{id}` / `/api/shares/{id}`: bridge detached, keys renamed inside the vault document, bridge re-attached, so the other side never sees a deletion; guest mounts just update their path). Moving a note or folder *out of*, *into* or *between* shared areas is blocked the same way, with a notice explaining that it would disappear for (or be shared with) other people; copy instead. Obsidian reports a rename for every file inside a moved folder, so the plugin handles the top-level move once and ignores the children and its own revert. The headless client has none of this: moving a mount folder there is a delete plus a create.
-- Revoke grant: mounts made with that ticket stop bridging. Files stay in the friend's vault as ordinary files.
+- Revoke grant (confirmed in the UI, since it cuts people off): mounts made with that ticket stop bridging, guests are disconnected. Files stay in the friend's vault as ordinary files. Revoked tickets are hidden behind a "N revoked tickets" toggle and can be **restored** (the same ticket works again; mounts on this server resume by themselves, guests reconnect, mounts on other servers have to be re-mounted) or **deleted** from the list.
 - Unshare: bridge removed, share document deleted, owner's files untouched; all mounts of it go inert.
 - Unmount: bridge removed, friend's files stay.
 
@@ -98,7 +98,8 @@ Hygiene on these public routes: unknown share and bad secret answer identically 
 | GET | `/api/vaults/{vault}/sharing` | → node_id, shares (with grants), mounts |
 | POST | `/api/vaults/{vault}/shares` | `{path, name?, access?}` → share + first ticket |
 | POST | `/api/shares/{id}/tickets` | `{label?, access?}` → ticket |
-| DELETE | `/api/shares/{id}/grants/{label}` | revoke |
+| DELETE | `/api/shares/{id}/grants/{label}` | revoke; on an already revoked ticket: delete it from the list |
+| POST | `/api/shares/{id}/grants/{label}/restore` | un-revoke: same ticket valid again, local mounts re-attached (remote mounts must be mounted again) |
 | DELETE | `/api/shares/{id}` | unshare |
 | POST | `/api/vaults/{vault}/mounts` | `{ticket, mount_path}` → mount |
 | PATCH | `/api/mounts/{id}` | `{path}` → move the mount to another folder (keys renamed server-side, nothing deleted) |

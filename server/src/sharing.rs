@@ -291,6 +291,14 @@ pub async fn revoke_ticket(
         Ok(None) => return err(StatusCode::NOT_FOUND, "no such ticket"),
         Err(e) => return internal(e),
     };
+    // Already revoked: a second DELETE removes the row entirely (tidy the list).
+    let already = reg.grants_for_share(&share.id).unwrap_or_default().iter().any(|g| g.label == label && g.revoked_at.is_some());
+    if already {
+        return match reg.delete_revoked_grant(&share.id, &label) {
+            Ok(_) => StatusCode::NO_CONTENT.into_response(),
+            Err(e) => internal(e),
+        };
+    }
     if let Err(e) = reg.revoke_grant(&share.id, &label) {
         return internal(e);
     }
@@ -299,6 +307,50 @@ pub async fn revoke_ticket(
         Err(e) => return internal(e),
     }
     StatusCode::NO_CONTENT.into_response()
+}
+
+// ------------------------------------------------------------------ POST /api/shares/{id}/grants/{label}/restore
+
+/// Un-revoke a ticket: the same ticket works again. Guests reconnect by themselves; mounts on
+/// this server are re-attached; mounts on other servers have to be mounted again.
+pub async fn restore_ticket(
+    Path((id, label)): Path<(String, String)>,
+    Query(query): Query<HashMap<String, String>>,
+    headers: HeaderMap,
+    State(state): State<SharedState>,
+) -> Response {
+    let user = match authenticate(&state, &headers, &query) {
+        Ok(u) => u,
+        Err(r) => return r,
+    };
+    let share = match owned_share(&state, &user, &id) {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    let reg = state.storage.registry();
+    let hash = match reg.restore_grant(&share.id, &label) {
+        Ok(Some(h)) => h,
+        Ok(None) => return err(StatusCode::NOT_FOUND, "no such revoked ticket"),
+        Err(e) => return internal(e),
+    };
+    let mut restored = 0;
+    match reg.restore_mounts_with_secret(&share.id, &hash) {
+        Ok(ids) => {
+            for mid in ids {
+                if let Ok(Some(m)) = reg.mount_by_id(&mid) {
+                    if m.home_node == state.docs.node_id {
+                        match state.docs.add_mount_bridge(&m) {
+                            Ok(()) => restored += 1,
+                            Err(e) => tracing::warn!(mount = %mid, "re-attaching restored mount failed: {e}"),
+                        }
+                    }
+                }
+            }
+        }
+        Err(e) => return internal(e),
+    }
+    tracing::info!(user = %user.name, share = %share.name, "ticket {label} restored, {restored} local mount(s) re-attached");
+    Json(serde_json::json!({ "restored_mounts": restored })).into_response()
 }
 
 // ------------------------------------------------------------------ DELETE /api/shares/{id}

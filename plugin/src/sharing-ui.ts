@@ -24,6 +24,8 @@ export class SharingSection {
   private info: SharingInfo | null = null;
   private error: string | null = null;
   private timer: ReturnType<typeof setInterval> | null = null;
+  /** Shares whose revoked tickets are expanded. */
+  private showRevoked = new Set<string>();
 
   constructor(
     private plugin: ReplicaPlugin,
@@ -78,6 +80,15 @@ export class SharingSection {
     for (const s of after.shares) {
       const old = before.shares.find((x) => x.id === s.id);
       if (old && s.mounted_by > old.mounted_by) new Notice(`Replica: someone mounted "${s.name}"`);
+    }
+  }
+
+  private async act(label: string, fn: () => Promise<unknown>): Promise<void> {
+    try {
+      await fn();
+      await this.load();
+    } catch (e) {
+      new Notice(`Replica: ${label} failed: ${(e as Error).message}`, 8000);
     }
   }
 
@@ -145,24 +156,73 @@ export class SharingSection {
               ),
             ),
         );
-      for (const g of s.grants) {
+      const live = s.grants.filter((g) => !g.revoked_at);
+      const revoked = s.grants.filter((g) => g.revoked_at);
+      for (const g of live) {
         const uses = g.mounted_by ? ` · mounted by ${g.mounted_by}` : "";
-        const row = new Setting(card)
+        const seen = g.last_seen_at ? ` · last used ${g.last_seen_at.slice(0, 16).replace("T", " ")}` : "";
+        new Setting(card)
           .setClass("replica-grant")
           .setName(`ticket “${g.label}”`)
-          .setDesc(g.revoked_at ? `${accessText(g.access)} · revoked ${g.revoked_at.slice(0, 10)}` : `${accessText(g.access)} · issued ${g.created_at.slice(0, 10)}${uses}`);
-        if (g.revoked_at) row.setClass("replica-revoked");
-        else {
-          row.addButton((b) =>
-            b.setButtonText("Revoke").onClick(() =>
-              this.confirm(
-                `Revoke ticket “${g.label}”?`,
-                `Anyone who mounted ${s.name} with this ticket stops receiving changes and can no longer push edits. Other tickets keep working.`,
-                "Revoke",
-                () => this.api.revoke(s.id, g.label),
+          .setDesc(`${accessText(g.access)} · issued ${g.created_at.slice(0, 10)}${uses}${seen}`)
+          .addButton((b) =>
+            b
+              .setButtonText("Revoke")
+              .setWarning()
+              .onClick(() =>
+                this.confirm(
+                  `Revoke ticket “${g.label}” for ${s.name}?`,
+                  `This cannot be undone. Everyone who joined with this ticket is cut off: their copy stops syncing and their edits no longer reach you. Other tickets for ${s.name} keep working. To let them back in, issue a new ticket.`,
+                  "Yes, revoke",
+                  () => this.api.revoke(s.id, g.label),
+                ),
               ),
+          );
+      }
+      if (revoked.length > 0) {
+        const open = this.showRevoked.has(s.id);
+        const toggle = new Setting(card)
+          .setClass("replica-grant")
+          .setClass("replica-muted")
+          .setName(`${revoked.length} revoked ticket${revoked.length === 1 ? "" : "s"}`)
+          .addButton((b) =>
+            b.setButtonText(open ? "Hide" : "Show").onClick(() => {
+              if (open) this.showRevoked.delete(s.id);
+              else this.showRevoked.add(s.id);
+              this.render();
+            }),
+          );
+        if (open) {
+          toggle.addButton((b) =>
+            b.setButtonText("Delete all revoked").onClick(() =>
+              this.act("delete revoked tickets", async () => {
+                for (const g of revoked) await this.api.deleteRevoked(s.id, g.label);
+              }),
             ),
           );
+          for (const g of revoked) {
+            new Setting(card)
+              .setClass("replica-grant")
+              .setClass("replica-revoked")
+              .setName(`ticket “${g.label}”`)
+              .setDesc(`${accessText(g.access)} · revoked ${g.revoked_at!.slice(0, 10)}`)
+              .addButton((b) =>
+                b.setButtonText("Restore").onClick(() =>
+                  this.confirm(
+                    `Restore ticket “${g.label}”?`,
+                    `The same ticket becomes valid again. Guests reconnect by themselves and mounts on this server resume; people on other servers have to mount it again.`,
+                    "Restore",
+                    async () => {
+                      const r = await this.api.restoreTicket(s.id, g.label);
+                      new Notice(`Replica: ticket “${g.label}” restored${r.restored_mounts ? `, ${r.restored_mounts} mount(s) resumed` : ""}`);
+                    },
+                  ),
+                ),
+              )
+              .addButton((b) =>
+                b.setButtonText("Delete").onClick(() => this.act("delete ticket", () => this.api.deleteRevoked(s.id, g.label))),
+              );
+          }
         }
       }
     }

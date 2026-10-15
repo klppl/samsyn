@@ -437,6 +437,48 @@ impl Registry {
             .optional()?)
     }
 
+    /// Make a revoked ticket valid again. Returns its secret hash so mounts can be restored too.
+    pub fn restore_grant(&self, share_id: &str, label: &str) -> anyhow::Result<Option<String>> {
+        let conn = self.conn.lock().unwrap();
+        let hash: Option<String> = conn
+            .query_row(
+                "SELECT secret_hash FROM share_grants WHERE share_id = ?1 AND label = ?2 AND revoked_at IS NOT NULL",
+                params![share_id, label],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if hash.is_some() {
+            conn.execute("UPDATE share_grants SET revoked_at = NULL WHERE share_id = ?1 AND label = ?2", params![share_id, label])?;
+        }
+        Ok(hash)
+    }
+
+    /// Un-revoke the local mounts made with a secret. Returns their ids so bridges can be re-attached.
+    pub fn restore_mounts_with_secret(&self, share_id: &str, secret_hash: &str) -> anyhow::Result<Vec<String>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare("SELECT id, secret FROM mounts WHERE share_id = ?1 AND revoked_at IS NOT NULL")?;
+        let ids: Vec<String> = stmt
+            .query_map(params![share_id], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
+            .filter_map(|r| r.ok())
+            .filter(|(_, s)| token_hash(s) == secret_hash)
+            .map(|(id, _)| id)
+            .collect();
+        for id in &ids {
+            conn.execute("UPDATE mounts SET revoked_at = NULL WHERE id = ?1", params![id])?;
+        }
+        Ok(ids)
+    }
+
+    /// Remove a revoked ticket for good (it was dead already; this only tidies the list).
+    pub fn delete_revoked_grant(&self, share_id: &str, label: &str) -> anyhow::Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        let n = conn.execute(
+            "DELETE FROM share_grants WHERE share_id = ?1 AND label = ?2 AND revoked_at IS NOT NULL",
+            params![share_id, label],
+        )?;
+        Ok(n > 0)
+    }
+
     pub fn revoke_grant(&self, share_id: &str, label: &str) -> anyhow::Result<bool> {
         let conn = self.conn.lock().unwrap();
         let n = conn.execute(
