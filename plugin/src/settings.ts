@@ -311,13 +311,23 @@ export class ReplicaSettingTab extends PluginSettingTab {
         t.setValue(s.configSync.enabled).onChange(async (v) => {
           s.configSync.enabled = v;
           await this.plugin.saveSettings();
-          await this.plugin.restartEngine();
+          // No restart needed: the switch is read live; just register this device and sync.
+          if (v) {
+            this.plugin.configSync?.touchSelf();
+            void this.plugin.configSync?.reconcileAll();
+          }
           this.display();
         }),
       );
     const cs = this.plugin.configSync;
     if (!cs) {
-      containerEl.createDiv({ cls: "replica-empty", text: "Connect to the server to choose plugins." });
+      const d = this.plugin.engine?.getDiagnostics();
+      containerEl.createDiv({
+        cls: "replica-empty",
+        text: d ? "Starting…" : s.enabled ? "Not connected: press Reconnect on the Server tab, then come back." : "Sync is disabled (Server tab).",
+      });
+      // The engine is being (re)started; try again shortly.
+      if (this.active === "plugins") setTimeout(() => this.active === "plugins" && !this.plugin.configSync && this.display(), 2000);
       return;
     }
     const known = cs.knownDevices();

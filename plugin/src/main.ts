@@ -385,13 +385,14 @@ export default class ReplicaPlugin extends Plugin {
     };
   }
 
-  private async launch(target: EngineTarget, scope: string): Promise<void> {
+  private async launch(target: EngineTarget, scope: string, created?: (e: SyncEngine) => void): Promise<void> {
     if (this.engines.has(target.id)) return;
     const engine = new SyncEngine(this.app, this.settings, this.persistence(scope), target, {
       onStatus: () => this.renderAggregateStatus(),
       claimRename: (o, n) => this.claimRename(o, n),
     });
     this.engines.set(target.id, engine);
+    created?.(engine);
     try {
       await engine.start();
     } catch (e) {
@@ -417,12 +418,12 @@ export default class ReplicaPlugin extends Plugin {
     const starts: Promise<void>[] = [];
     if (home) {
       starts.push(
-        this.launch(home, this.settings.vaultId).then(() => {
-          const e = this.engines.get("home");
-          if (e && !this.configSync) {
-            this.configSync = new ConfigSync(this.app, this.settings, e);
-            this.configSync.start();
-          }
+        this.launch(home, this.settings.vaultId, (e) => {
+          // Created right away so the Plugins tab can show the selection; file syncing starts
+          // once the engine has its first server state (see below).
+          this.configSync = new ConfigSync(this.app, this.settings, e);
+        }).then(() => {
+          if (this.engines.has("home")) this.configSync?.start();
         }),
       );
     }
