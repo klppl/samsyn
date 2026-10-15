@@ -1,6 +1,6 @@
 import { Notice, Platform, Plugin, setIcon } from "obsidian";
 import { SyncEngine, EngineStatus } from "./engine";
-import { Persistence } from "./persistence";
+import { Persistence, deviceInstallId } from "./persistence";
 import { DEFAULT_SETTINGS, ReplicaSettingTab, ReplicaSettings, randomSuffix, slugify } from "./settings";
 
 export default class ReplicaPlugin extends Plugin {
@@ -116,7 +116,11 @@ export default class ReplicaPlugin extends Plugin {
   // ------------------------------------------------------------- engine control
 
   private persistence(): Persistence {
-    return new Persistence(this.app.vault.adapter, `${this.app.vault.configDir}/plugins/${this.manifest.id}`);
+    return new Persistence(
+      this.app.vault.adapter,
+      `${this.app.vault.configDir}/plugins/${this.manifest.id}`,
+      `${deviceInstallId(this.app)}|${this.settings.vaultId}`,
+    );
   }
 
   async startEngine(): Promise<void> {

@@ -95,6 +95,8 @@ Repeat on each device with the same server, token and vault ID. That is all.
 
 ## How it works
 
+The plugin caches the document and its sync bookkeeping in IndexedDB on the device (not in the vault folder), so typing costs one small write and a copied `.obsidian` never carries another device's state. See [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md#local-cache-on-the-device).
+
 - One Yjs document per vault, with two maps: `texts` (path → `Y.Text`) and `blobs` (path → `{hash, size, mtime}`).
 - The plugin pushes every keystroke (debounced, 150 ms by default) into the shared document and applies remote changes directly into the open editor without moving your cursor.
 - Files not open in an editor are written to disk; Obsidian's own file events feed changes back the other way.

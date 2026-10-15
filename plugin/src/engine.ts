@@ -4,7 +4,7 @@ import { WebsocketProvider } from "y-websocket";
 import { BlobClient } from "./blobs";
 import { diffText } from "./diff";
 import { hashText, sha256Hex } from "./hash";
-import { LocalState, Persistence, deviceInstallId } from "./persistence";
+import { LocalState, Persistence, StorageInfo, deviceInstallId } from "./persistence";
 import { ReplicaSettings, serverUrls } from "./settings";
 
 export interface BlobMeta {
@@ -31,6 +31,7 @@ export interface Diagnostics {
   hint: string | null;
   installId: string;
   pendingDeletions: number;
+  storage: StorageInfo | null;
 }
 
 /** Refuse to delete from the shared vault when one reconcile wants to remove this many files… */
@@ -61,6 +62,7 @@ export class SyncEngine {
   private status: EngineStatus = "offline";
   private wsUrl = "";
   private lastError: string | null = null;
+  private storage: StorageInfo | null = null;
   private lastConnectedAt: number | null = null;
   private hint: string | null = null;
   private installId = "";
@@ -94,8 +96,6 @@ export class SyncEngine {
     this.state = await this.persistence.loadState(this.installId);
     const hadDoc = await this.persistence.loadDoc(this.doc);
 
-    this.doc.on("update", () => this.persistence.scheduleSaveDoc(this.doc));
-
     // Observers go in before we connect so nothing that arrives during the initial sync or
     // during reconcile is missed. All handlers are idempotent, so overlap with reconcile is safe.
     this.installObservers();
@@ -125,8 +125,7 @@ export class SyncEngine {
     this.unsubscribers = [];
     this.provider?.destroy();
     this.provider = null;
-    await this.persistence.saveDoc(this.doc);
-    await this.persistence.saveState(this.state);
+    await this.persistence.close();
     this.doc.destroy();
   }
 
@@ -196,7 +195,13 @@ export class SyncEngine {
       hint: this.hint,
       installId: this.installId,
       pendingDeletions: this.pendingDeletions.length,
+      storage: this.storage,
     };
+  }
+
+  /** Refresh the cache-size figures shown in the status section (cheap; doc size is cached). */
+  async refreshStorage(): Promise<void> {
+    this.storage = await this.persistence.storageInfo(this.doc, Object.keys(this.state.synced).length);
   }
 
   private waitForSync(timeoutMs: number): Promise<void> {
@@ -250,13 +255,13 @@ export class SyncEngine {
 
   private markSynced(path: string, hash: string): void {
     this.state.synced[path] = hash;
-    this.persistence.scheduleSaveState(this.state);
+    this.persistence.noteSynced(path, hash, this.state);
   }
 
   private forgetSynced(path: string): void {
     if (path in this.state.synced) {
       delete this.state.synced[path];
-      this.persistence.scheduleSaveState(this.state);
+      this.persistence.noteForgotten(path, this.state);
     }
   }
 
@@ -697,7 +702,7 @@ export class SyncEngine {
       this.pendingDeletions = [];
       for (const path of toDelete) this.removeFromDoc(path);
     }
-    await this.persistence.saveState(this.state);
+    await this.persistence.flushState(this.state);
   }
 
   private async reconcileText(path: string, file: TFile): Promise<void> {

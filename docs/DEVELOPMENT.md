@@ -140,6 +140,29 @@ Obsidian mobile does not expose a developer console. Options, in order of useful
 - iOS suspends the app in the background and closes the WebSocket. Replica reconnects when the app returns and the reconcile step catches up on anything missed.
 - `WebSocket` headers cannot be set on mobile, which is why the token also goes in the URL query string.
 
+## Local cache on the device
+
+The plugin keeps two things per device and vault, both in **IndexedDB** (`src/persistence.ts`), never in the vault folder:
+
+- the Yjs document, via `y-indexeddb`: an append-only log of updates, compacted into one record every 500 entries. A keystroke costs one small write; nothing rewrites the whole document. Database `replica-doc-<installId>|<vaultId>`.
+- the per-path "last synced" hashes, one record per path, flushed in batches about a second after a change. Database `replica-state-…`.
+
+Why not files in `.obsidian/plugins/replica/`: the previous `doc.bin`/`state.json` were rewritten in full on every change (a 50 MB vault meant 50 MB writes while typing), and a copied or iCloud-synced `.obsidian` carried one device's bookkeeping to another, which is how a phone once deleted a vault. Old files are migrated into IndexedDB on first start and removed. Without IndexedDB (not a case in Obsidian today) the file backend is still there as a fallback.
+
+"Reset local state" deletes both databases. The Status section shows the backend, the encoded document size and the browser's storage usage/quota.
+
+### Size limits, and what actually bounds a vault on a phone
+
+APFS has no 4 GB file limit (that is FAT32); IndexedDB stores are split into many records anyway. What bounds a vault on iOS is **RAM**: Yjs keeps the whole document in memory with per-insert bookkeeping, roughly 2–5× the text size, and iOS kills an app that goes past about 1–1.5 GB. Rules of thumb:
+
+| Text in vault (all `.md`) | Doc in RAM | Verdict on a phone |
+|---|---|---|
+| ≤ 20 MB | ≤ 100 MB | fine |
+| 20–100 MB | 0.1–0.5 GB | works, slower start |
+| > 100 MB | > 0.5 GB | not safe; needs the partial-document design below |
+
+Binary files never enter the document (only `{hash, size, mtime}`), so attachments do not count. Mitigations, in order: the Status section warns above 100 MB of document; next step if a user hits it is splitting the vault document into per-folder subdocuments loaded on demand (Yjs subdocs, server keeps the same per-vault store), which is a protocol change on both sides and is not started.
+
 ## Safety behaviour worth knowing while testing
 
 - **Sync state is device-bound.** `state.json` records which files this install has seen in sync. It is tagged with a per-device install id (Obsidian's `appId`, falling back to localStorage) and ignored if it was copied from another device along with `.obsidian`. Copying `doc.bin` is harmless; copying `state.json` used to make the new device think every file had been deleted locally.

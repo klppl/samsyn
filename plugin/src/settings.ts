@@ -96,6 +96,16 @@ export class ReplicaSettingTab extends PluginSettingTab {
     if (d.hint) line("Hint", d.hint, "is-warn");
     if (d.pendingDeletions > 0) line("Held back", `${d.pendingDeletions} deletions (see command "Apply held-back deletions")`, "is-warn");
     line("Install id", d.installId);
+    void this.plugin.engine?.refreshStorage();
+    if (d.storage) {
+      const mb = (n: number) => `${(n / 1_048_576).toFixed(n < 10_485_760 ? 1 : 0)} MB`;
+      const where = d.storage.backend === "indexeddb" ? "IndexedDB" : "files in plugin folder";
+      let txt = `${where} · document ${mb(d.storage.docBytes)} · ${d.storage.syncedEntries} entries`;
+      if (d.storage.usageBytes !== null && d.storage.quotaBytes) {
+        txt += ` · ${mb(d.storage.usageBytes)} of ${mb(d.storage.quotaBytes)} used`;
+      }
+      line("Local cache", txt, d.storage.docBytes > 100 * 1_048_576 ? "is-warn" : "");
+    }
   }
 
   display(): void {
