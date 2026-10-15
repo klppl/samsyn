@@ -199,13 +199,15 @@ pub struct DocRegistry {
     pub share_admin: Mutex<()>,
     /// Peer-to-peer endpoint for server-to-server shares; `None` with `--no-p2p`.
     pub endpoint: Option<iroh::Endpoint>,
+    /// Largest blob we accept over a p2p link (same limit as the HTTP blob route).
+    pub max_blob_bytes: usize,
     /// Running link tasks for remote mounts, by mount id.
     links: Mutex<HashMap<String, tokio::task::JoinHandle<()>>>,
     link_status: Mutex<HashMap<String, String>>,
 }
 
 impl DocRegistry {
-    pub fn new(storage: Storage, node_id: String, endpoint: Option<iroh::Endpoint>) -> Self {
+    pub fn new(storage: Storage, node_id: String, endpoint: Option<iroh::Endpoint>, max_blob_bytes: usize) -> Self {
         Self {
             storage,
             node_id,
@@ -215,6 +217,7 @@ impl DocRegistry {
             apply_lock: Mutex::new(()),
             share_admin: Mutex::new(()),
             endpoint,
+            max_blob_bytes,
             links: Mutex::new(HashMap::new()),
             link_status: Mutex::new(HashMap::new()),
         }
@@ -406,6 +409,16 @@ impl DocRegistry {
     }
 
     pub fn remove_bridges_for_mounts(&self, mount_ids: &[String]) {
+        self.remove_mounts_inner(mount_ids, true);
+    }
+
+    /// Same as `remove_bridges_for_mounts` for one mount, called by that mount's own link task:
+    /// forgets the task handle instead of aborting it, so the caller finishes its cleanup.
+    pub fn detach_own_mount(&self, mount_id: &str) {
+        self.remove_mounts_inner(std::slice::from_ref(&mount_id.to_string()), false);
+    }
+
+    fn remove_mounts_inner(&self, mount_ids: &[String], abort_links: bool) {
         let _g = self.apply_lock.lock().unwrap();
         let mut bridges = self.bridges.lock().unwrap();
         let before = bridges.len();
@@ -415,7 +428,9 @@ impl DocRegistry {
         let mut links = self.links.lock().unwrap();
         for id in mount_ids {
             if let Some(h) = links.remove(id) {
-                h.abort();
+                if abort_links {
+                    h.abort();
+                }
             }
             self.shares.lock().unwrap().remove(id);
             self.link_status.lock().unwrap().remove(id);

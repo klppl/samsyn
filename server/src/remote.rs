@@ -42,7 +42,13 @@ use crate::ws::handle_payload;
 pub const ALPN: &[u8] = b"replica/share/1";
 const STREAM_CONTROL: u8 = 0;
 const STREAM_BLOB: u8 = 1;
-const MAX_FRAME: usize = 256 * 1024 * 1024;
+/// Absolute backstop for authenticated y-sync frames.
+const MAX_SYNC_FRAME: usize = 256 * 1024 * 1024;
+/// Pre-auth frames are tiny: a hello / hello reply and a hex hash.
+const MAX_HELLO_FRAME: usize = 4096;
+const MAX_HASH_FRAME: usize = 256;
+/// Streams a peer may have open at once on one connection (control + blob fetches).
+const MAX_STREAMS_PER_CONN: usize = 16;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(25);
 const PROTOCOL_VERSION: u8 = 1;
 
@@ -56,7 +62,10 @@ pub struct Hello {
 #[derive(Debug, Serialize, Deserialize)]
 pub enum HelloReply {
     Ok { access: String, name: String, only_file: Option<String> },
+    /// The grant is invalid or revoked: the mounting side gives up for good.
     Denied(String),
+    /// Transient: the two servers speak different protocol versions; keep retrying.
+    VersionMismatch { expected: u8 },
 }
 
 fn ae(e: impl std::fmt::Display) -> anyhow::Error {
@@ -123,7 +132,9 @@ async fn write_frame(s: &mut SendStream, data: &[u8]) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn read_frame(r: &mut RecvStream) -> anyhow::Result<Option<Vec<u8>>> {
+/// Read one frame. `max` is checked before allocating, so an unauthenticated peer can only
+/// make us allocate what its context allows (hello: 4 KB, hash: 256 B, blob: the blob limit).
+async fn read_frame(r: &mut RecvStream, max: usize) -> anyhow::Result<Option<Vec<u8>>> {
     let mut len = [0u8; 4];
     match r.read_exact(&mut len).await {
         Ok(()) => {}
@@ -131,7 +142,7 @@ async fn read_frame(r: &mut RecvStream) -> anyhow::Result<Option<Vec<u8>>> {
         Err(e) => return Err(ae(e)),
     }
     let n = u32::from_le_bytes(len) as usize;
-    anyhow::ensure!(n <= MAX_FRAME, "frame too large ({n} bytes)");
+    anyhow::ensure!(n <= max, "frame too large ({n} bytes, limit {max})");
     let mut buf = vec![0u8; n];
     r.read_exact(&mut buf).await.map_err(ae)?;
     Ok(Some(buf))
@@ -177,7 +188,7 @@ async fn sync_loop(
 
     loop {
         tokio::select! {
-            frame = read_frame(recv) => {
+            frame = read_frame(recv, MAX_SYNC_FRAME) => {
                 let Some(data) = frame? else { break };
                 let replies = {
                     let _apply = docs.apply_lock.lock().unwrap();
@@ -264,13 +275,19 @@ fn missing_blobs(doc: &LiveDoc) -> Vec<String> {
 /// Serve blob requests on streams the peer opens. `doc` is set once the control handshake
 /// has succeeded; before that every request answers "not found".
 async fn serve_streams(conn: Connection, doc: Arc<Mutex<Option<Arc<LiveDoc>>>>) {
+    let slots = Arc::new(tokio::sync::Semaphore::new(MAX_STREAMS_PER_CONN));
     loop {
         let (send, recv) = match conn.accept_bi().await {
             Ok(s) => s,
             Err(_) => return,
         };
+        let Ok(permit) = slots.clone().try_acquire_owned() else {
+            tracing::warn!("peer opened too many streams; refusing one");
+            continue; // dropping the streams resets them
+        };
         let doc = doc.clone();
         tokio::spawn(async move {
+            let _permit = permit;
             if let Err(e) = serve_one(send, recv, doc).await {
                 tracing::debug!("blob stream ended: {e}");
             }
@@ -288,7 +305,7 @@ async fn serve_one(send: SendStream, mut recv: RecvStream, doc: Arc<Mutex<Option
 /// Answer one blob request (stream kind byte already consumed): `frame(hash)` → `frame(bytes)`,
 /// empty frame when unknown or when no document is bound to this connection yet.
 async fn serve_blob_request(mut send: SendStream, mut recv: RecvStream, doc: Arc<Mutex<Option<Arc<LiveDoc>>>>) -> anyhow::Result<()> {
-    let hash = read_frame(&mut recv).await?.context("no hash")?;
+    let hash = read_frame(&mut recv, MAX_HASH_FRAME).await?.context("no hash")?;
     let hash = String::from_utf8(hash).context("hash not utf8")?;
     let doc = doc.lock().unwrap().clone();
     let bytes = match doc {
@@ -309,7 +326,7 @@ async fn fetch_blobs(conn: Connection, docs: Arc<DocRegistry>, doc: Arc<LiveDoc>
         if doc.store.has_blob(&hash) || !seen.insert(hash.clone()) {
             continue;
         }
-        match fetch_one(&conn, &hash).await {
+        match fetch_one(&conn, &hash, docs.max_blob_bytes).await {
             Ok(Some(bytes)) => {
                 if let Err(e) = doc.store.put_blob(&hash, &bytes) {
                     tracing::warn!(doc = %doc.label, "storing fetched blob failed: {e}");
@@ -331,12 +348,12 @@ async fn fetch_blobs(conn: Connection, docs: Arc<DocRegistry>, doc: Arc<LiveDoc>
     }
 }
 
-async fn fetch_one(conn: &Connection, hash: &str) -> anyhow::Result<Option<Vec<u8>>> {
+async fn fetch_one(conn: &Connection, hash: &str, max_blob: usize) -> anyhow::Result<Option<Vec<u8>>> {
     let (mut send, mut recv) = conn.open_bi().await.map_err(ae)?;
     send.write_all(&[STREAM_BLOB]).await.map_err(ae)?;
     write_frame(&mut send, hash.as_bytes()).await?;
     send.finish().map_err(ae)?;
-    let bytes = read_frame(&mut recv).await?.context("peer closed blob stream")?;
+    let bytes = read_frame(&mut recv, max_blob).await?.context("peer closed blob stream")?;
     if bytes.is_empty() {
         return Ok(None);
     }
@@ -363,6 +380,7 @@ impl ProtocolHandler for ShareProtocol {
         let peer = conn.remote_id().fmt_short().to_string();
         tracing::info!(peer = %peer, "p2p connection accepted");
         let session: Arc<Mutex<Option<Arc<LiveDoc>>>> = Default::default();
+        let slots = Arc::new(tokio::sync::Semaphore::new(MAX_STREAMS_PER_CONN));
         loop {
             let (send, recv) = match conn.accept_bi().await {
                 Ok(s) => s,
@@ -371,11 +389,16 @@ impl ProtocolHandler for ShareProtocol {
                     break;
                 }
             };
+            let Ok(permit) = slots.clone().try_acquire_owned() else {
+                tracing::warn!(peer = %peer, "too many open streams; refusing one");
+                continue;
+            };
             let docs = self.docs.clone();
             let session = session.clone();
             let conn2 = conn.clone();
             let peer2 = peer.clone();
             tokio::spawn(async move {
+                let _permit = permit;
                 if let Err(e) = owner_stream(docs, conn2, session, send, recv, &peer2).await {
                     tracing::debug!(peer = %peer2, "p2p stream ended: {e}");
                 }
@@ -398,12 +421,21 @@ async fn owner_stream(
     match kind[0] {
         STREAM_BLOB => serve_blob_request(send, recv, session).await,
         STREAM_CONTROL => {
-            let hello: Hello = postcard::from_bytes(&read_frame(&mut recv).await?.context("no hello")?).context("bad hello")?;
+            let hello: Hello = postcard::from_bytes(&read_frame(&mut recv, MAX_HELLO_FRAME).await?.context("no hello")?).context("bad hello")?;
+            if hello.version != PROTOCOL_VERSION {
+                tracing::warn!(peer = %peer, "p2p hello with protocol v{}, we speak v{PROTOCOL_VERSION}", hello.version);
+                let reply = postcard::to_stdvec(&HelloReply::VersionMismatch { expected: PROTOCOL_VERSION })?;
+                write_frame(&mut send, &reply).await?;
+                let _ = send.finish();
+                let _ = tokio::time::timeout(Duration::from_secs(3), send.stopped()).await;
+                conn.close(2u32.into(), b"version");
+                return Ok(());
+            }
             let reg = docs.storage().registry();
             let share = reg.share_by_id(&hello.share_id)?;
             let grant = match &share {
-                Some(s) if hello.version == PROTOCOL_VERSION => reg.check_grant(&s.id, &hello.secret)?,
-                _ => None,
+                Some(s) => reg.check_grant(&s.id, &hello.secret)?,
+                None => None,
             };
             let (share, (label, access)) = match (share, grant) {
                 (Some(s), Some(g)) => (s, g),
@@ -462,6 +494,9 @@ pub async fn probe(ep: &Endpoint, ticket: &Ticket) -> anyhow::Result<(String, St
     match reply? {
         HelloReply::Ok { access, name, only_file } => Ok((access, name, only_file)),
         HelloReply::Denied(msg) => anyhow::bail!("owner server refused the ticket: {msg}"),
+        HelloReply::VersionMismatch { expected } => {
+            anyhow::bail!("owner server speaks sharing protocol v{expected}, this server v{PROTOCOL_VERSION}; upgrade one of them")
+        }
     }
 }
 
@@ -469,7 +504,7 @@ async fn handshake(send: &mut SendStream, recv: &mut RecvStream, ticket: &Ticket
     send.write_all(&[STREAM_CONTROL]).await.map_err(ae)?;
     let hello = Hello { version: PROTOCOL_VERSION, share_id: ticket.share_id.clone(), secret: ticket.secret.clone() };
     write_frame(send, &postcard::to_stdvec(&hello)?).await?;
-    let reply = tokio::time::timeout(CONNECT_TIMEOUT, read_frame(recv))
+    let reply = tokio::time::timeout(CONNECT_TIMEOUT, read_frame(recv, MAX_HELLO_FRAME))
         .await
         .map_err(|_| anyhow::anyhow!("owner server did not answer the hello"))??
         .context("owner server closed the stream")?;
@@ -492,8 +527,10 @@ pub fn spawn_link(docs: Arc<DocRegistry>, mount: MountInfo, replica: Arc<LiveDoc
                 Err(LinkError::Denied(msg)) => {
                     tracing::warn!(mount = %mount.share_name, "owner server denied this mount: {msg}");
                     docs.set_link_status(&mount.id, &format!("revoked: {msg}"));
+                    // Persist first, then detach. We are the link task, so the bridge removal
+                    // must not abort us mid-cleanup (`detach_own_mount` only forgets the handle).
                     let _ = docs.storage().registry().revoke_mount(&mount.id);
-                    docs.remove_bridges_for_mounts(std::slice::from_ref(&mount.id));
+                    docs.detach_own_mount(&mount.id);
                     return;
                 }
                 Err(LinkError::Other(e)) => {
@@ -536,6 +573,11 @@ async fn run_link(ep: &Endpoint, docs: &Arc<DocRegistry>, mount: &MountInfo, rep
     let (mut send, mut recv) = conn.open_bi().await.map_err(ae)?;
     match handshake(&mut send, &mut recv, &ticket).await? {
         HelloReply::Denied(msg) => return Err(LinkError::Denied(msg)),
+        HelloReply::VersionMismatch { expected } => {
+            return Err(LinkError::Other(anyhow::anyhow!(
+                "owner speaks sharing protocol v{expected}, we speak v{PROTOCOL_VERSION}; upgrade one side"
+            )))
+        }
         HelloReply::Ok { access, .. } => {
             tracing::info!(mount = %mount.share_name, "p2p link up to {} ({access})", conn.remote_id().fmt_short());
         }

@@ -61,6 +61,8 @@ When a ticket from another server is mounted:
 
 Ticket secrets never leave the two servers; users still only talk to their own server with their own token. Mount status (`connected`, `reconnecting (…)`, `revoked: …`) is shown in the Sharing settings.
 
+Limits on the link (the node id is public, so everything before the hello must be cheap): a hello or hash frame is capped at 4 KB / 256 B before allocation, a blob frame at the server's `--max-blob-mb`, sync frames at 256 MB; at most 16 streams per connection are served at once. A hello with an unknown protocol version gets `VersionMismatch` and the mounting side keeps retrying with backoff (status says so); only a real grant denial revokes the mount.
+
 ## Semantics
 
 - Owner creates share → bridge created, share document filled from the vault subtree.

@@ -117,7 +117,7 @@ async fn serve(args: ServeArgs, storage: Storage) -> anyhow::Result<()> {
     };
 
     let max_blob = args.max_blob_mb * 1024 * 1024;
-    let docs = Arc::new(DocRegistry::new(storage.clone(), node_id, endpoint.clone()));
+    let docs = Arc::new(DocRegistry::new(storage.clone(), node_id, endpoint.clone(), max_blob));
     let router = endpoint.map(|ep| {
         iroh::protocol::Router::builder(ep)
             .accept(remote::ALPN, remote::ShareProtocol { docs: docs.clone() })
