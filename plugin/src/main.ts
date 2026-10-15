@@ -16,7 +16,6 @@ export default class ReplicaPlugin extends Plugin {
 
   /** Shared roots in this vault, kept fresh so folder moves can be followed and warned about. */
   private roots: SharedRoot[] = [];
-  private claimedRenames = new Set<string>();
 
   /** The home engine (own server). Guest engines are in `engines` under their mount id. */
   get engine(): SyncEngine | null {
@@ -174,63 +173,108 @@ export default class ReplicaPlugin extends Plugin {
     return null;
   }
 
-  /** Called by engines: true when this rename was a shared-root move the plugin took care of. */
+  /** Renames the engines must not replay: blocked moves, our reverts, explicit mount moves. */
+  private claims: Array<{ old: string; next: string; until: number }> = [];
+  /** A folder rename we started ourselves (an explicit Move… or a revert). */
+  private ownRenames = new Set<string>();
+  /** Explicit moves of a shared root (Move… dialog) that must be followed instead of blocked. */
+  private expectedRootMoves = new Set<string>();
+
+  private claim(oldPath: string, newPath: string): void {
+    this.claims.push({ old: oldPath, next: newPath, until: Date.now() + 15_000 });
+  }
+
+  /** Called by engines: true when this rename (or the folder rename it is a child of) is ours. */
   private claimRename(oldPath: string, newPath: string): boolean {
-    return this.claimedRenames.has(`${oldPath}\u0000${newPath}`);
+    const now = Date.now();
+    this.claims = this.claims.filter((c) => c.until > now);
+    return this.claims.some(
+      (c) =>
+        (c.old === oldPath && c.next === newPath) ||
+        (oldPath.startsWith(c.old + "/") && newPath.startsWith(c.next + "/") && oldPath.slice(c.old.length) === newPath.slice(c.next.length)),
+    );
+  }
+
+  /** True when `oldPath` is inside a folder whose rename we are already handling. */
+  private childOfHandled(oldPath: string, newPath: string): boolean {
+    return this.claimRename(oldPath, newPath) && !this.claims.some((c) => c.old === oldPath && c.next === newPath);
+  }
+
+  private async revert(f: TAbstractFile, oldPath: string): Promise<boolean> {
+    const key = `${f.path}\u0000${oldPath}`;
+    this.ownRenames.add(key);
+    this.claim(f.path, oldPath);
+    try {
+      await this.app.fileManager.renameFile(f, oldPath);
+      return true;
+    } catch (e) {
+      console.error("[replica] moving back failed", e);
+      return false;
+    } finally {
+      setTimeout(() => this.ownRenames.delete(key), 5000);
+    }
   }
 
   private async onRename(f: TAbstractFile, oldPath: string): Promise<void> {
     const newPath = f.path;
-    // 1. A shared root (or an ancestor folder of one) moved: follow it instead of replaying the
-    //    move as "delete everything" to the other side.
-    const moved = this.roots.filter((r) => r.path === oldPath || (f instanceof TFolder && r.path.startsWith(oldPath + "/")));
-    if (moved.length > 0) {
-      this.claimedRenames.add(`${oldPath}\u0000${newPath}`);
-      setTimeout(() => this.claimedRenames.delete(`${oldPath}\u0000${newPath}`), 5000);
-      const failures: string[] = [];
-      for (const r of moved) {
-        const target = newPath + r.path.slice(oldPath.length);
-        try {
-          await this.moveSharedRoot(r, target);
-        } catch (e) {
-          failures.push(`${r.name}: ${(e as Error).message}`);
+    const pair = `${oldPath}\u0000${newPath}`;
+    if (this.ownRenames.has(pair)) return; // our own revert or move
+    if (this.childOfHandled(oldPath, newPath)) return; // Obsidian also reports every child of a moved folder
+    if (this.roots.length === 0) return;
+
+    const name = newPath.split("/").pop();
+    const movedRoots = this.roots.filter((r) => r.path === oldPath || (f instanceof TFolder && r.path.startsWith(oldPath + "/")));
+
+    // 1. A shared root (or an ancestor folder of one) was moved.
+    if (movedRoots.length > 0) {
+      this.claim(oldPath, newPath);
+      if (this.expectedRootMoves.delete(pair)) {
+        // Move… dialog: follow it on the server / in settings.
+        const failures: string[] = [];
+        for (const r of movedRoots) {
+          try {
+            await this.moveSharedRoot(r, newPath + r.path.slice(oldPath.length));
+          } catch (e) {
+            failures.push(`${r.name}: ${(e as Error).message}`);
+          }
         }
-      }
-      if (failures.length === 0) {
-        new Notice(`Replica: ${moved.map((r) => `“${r.name}”`).join(", ")} moved; still shared.`, 6000);
-      } else {
-        // Put the folder back: leaving it there would make the next reconcile delete the
-        // shared files for everyone.
-        new Notice(`Replica: could not move the shared folder (${failures.join("; ")}). Moving it back.`, 12_000);
-        try {
-          await this.app.fileManager.renameFile(f, oldPath);
-        } catch (e) {
-          new Notice(`Replica: moving back failed too (${(e as Error).message}). Move “${oldPath}” back by hand before syncing continues.`, 0);
+        if (failures.length > 0) {
+          new Notice(`Replica: could not move ${movedRoots.map((r) => `“${r.name}”`).join(", ")} (${failures.join("; ")}). Moving it back.`, 12_000);
+          await this.revert(f, oldPath);
+        } else {
+          new Notice(`Replica: ${movedRoots.map((r) => `“${r.name}”`).join(", ")} moved; still shared.`, 6000);
         }
+        await this.refreshSharingRoots();
+        return;
       }
-      await this.refreshSharingRoots();
+      const ok = await this.revert(f, oldPath);
+      const names = movedRoots.map((r) => `“${r.name}”`).join(", ");
+      new Notice(
+        ok
+          ? `Replica: ${names} is shared with other people and cannot be moved here. Use Settings → Replica → Sharing → Move… to move it.`
+          : `Replica: ${names} is shared with other people and must not be moved; moving it back failed. Move “${newPath}” back to “${oldPath}” by hand.`,
+        ok ? 10_000 : 0,
+      );
       return;
     }
-    // 2. Something crossed a share boundary: say so, offer to undo.
+
+    // 2. Something crossed a share boundary: block it. Inside one share, moves are fine.
     const from = this.rootOf(oldPath);
     const to = this.rootOf(newPath);
     if (from === to) return;
+    this.claim(oldPath, newPath);
+    const ok = await this.revert(f, oldPath);
     const what = f instanceof TFolder ? "folder" : "note";
-    const frag = document.createDocumentFragment();
-    const p = frag.createDiv();
-    if (from && !to) {
-      p.setText(`Replica: you moved the ${what} “${oldPath.split("/").pop()}” out of the shared ${from.kind === "share" ? "folder" : "mount"} “${from.name}”. It disappears for the people you share it with.`);
-    } else if (!from && to) {
-      p.setText(`Replica: “${newPath.split("/").pop()}” is now inside “${to.name}” and is shared with the people who have access to it.`);
-    } else if (from && to) {
-      p.setText(`Replica: “${newPath.split("/").pop()}” moved from “${from.name}” to “${to.name}”: it disappears for the first group and appears for the second.`);
-    }
-    const btn = frag.createEl("button", { text: "Move back" });
-    btn.onclick = () => {
-      void this.app.fileManager.renameFile(f, oldPath);
-      notice.hide();
-    };
-    const notice = new Notice(frag, from ? 20_000 : 8000);
+    let why: string;
+    if (from && !to) why = `is in the shared ${from.kind === "share" ? "folder" : "mount"} “${from.name}”; moving it out would remove it for the people you share with`;
+    else if (!from && to) why = `cannot be moved into the shared ${to.kind === "share" ? "folder" : "mount"} “${to.name}” this way, since that shares it with other people`;
+    else why = `cannot be moved from “${from!.name}” to “${to!.name}” this way, since both are shared with other people`;
+    new Notice(
+      ok
+        ? `Replica: the ${what} “${name}” ${why}. Moved it back. Copy it instead if you want it in both places.`
+        : `Replica: the ${what} “${name}” ${why}; moving it back failed. Move it back by hand.`,
+      ok ? 10_000 : 0,
+    );
   }
 
   private async moveSharedRoot(r: SharedRoot, target: string): Promise<void> {
@@ -249,11 +293,12 @@ export default class ReplicaPlugin extends Plugin {
     else await api.moveShare(r.id, target);
   }
 
-  /** Move a mount (server or guest) to another folder from the UI: a plain folder rename,
-   *  which the rename handler then follows. */
+  /** Move a mount (server or guest) from the Move… dialog: an ordinary folder rename that the
+   *  rename handler is told to follow instead of block. */
   async moveMountFolder(r: SharedRoot, target: string): Promise<void> {
     target = target.replace(/^\/+|\/+$/g, "");
     if (!target) throw new Error("choose a folder");
+    if (target === r.path) return;
     const existing = this.app.vault.getAbstractFileByPath(target);
     if (existing && !(existing instanceof TFolder)) throw new Error(`${target} is a file`);
     if (existing instanceof TFolder && existing.children.length > 0) throw new Error(`${target} already contains files`);
@@ -262,6 +307,7 @@ export default class ReplicaPlugin extends Plugin {
       const parent = target.includes("/") ? target.slice(0, target.lastIndexOf("/")) : "";
       if (parent && !this.app.vault.getAbstractFileByPath(parent)) await this.app.vault.createFolder(parent);
       if (existing instanceof TFolder) await this.app.fileManager.trashFile(existing);
+      this.expectedRootMoves.add(`${r.path}\u0000${target}`);
       await this.app.fileManager.renameFile(folder, target);
     } else {
       // Nothing on disk yet (empty mount): just tell the server / settings.
@@ -269,12 +315,6 @@ export default class ReplicaPlugin extends Plugin {
       await this.refreshSharingRoots();
     }
   }
-
-  async onunload(): Promise<void> {
-    await this.stopEngine();
-  }
-
-  // ------------------------------------------------------------- engine control
 
   private persistence(scope: string): Persistence {
     return new Persistence(
