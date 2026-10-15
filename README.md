@@ -95,6 +95,10 @@ Press **Test connection** (checks server and token), then **Reconnect**. The **S
 
 Repeat on each device with the same server and vault ID. Easiest: Settings → Server → **Devices** → *Set up another device…* creates a token for that device and shows a QR code; scan it with the phone's camera and Obsidian connects (`obsidian://replica?op=setup&server=…&token=…&vid=…`). One token per device means a lost phone is one revoke. (No server of your own? You can still take part in folders others share with you: Sharing tab → *Add from ticket…*.)
 
+### Plugin settings between devices
+
+Settings → Server → **Plugin settings sync**: tick the community plugins whose settings (`data.json`) should be the same everywhere, e.g. Iconize's icons and colours, and optionally also their files so the plugin installs itself on a new device. Per plugin you can name the devices that take part (or “all”); the selection is shared, the on/off switch is per device. Last change wins (settings are never merged line by line). A device that receives new settings gets a notice with a **Reload** button, since plugins read their settings at load time.
+
 ## How it works
 
 The plugin caches the document and its sync bookkeeping in IndexedDB on the device (not in the vault folder), so typing costs one small write and a copied `.obsidian` never carries another device's state. See [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md#local-cache-on-the-device).

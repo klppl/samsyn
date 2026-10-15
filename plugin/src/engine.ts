@@ -281,6 +281,22 @@ export class SyncEngine {
     };
   }
 
+  getBlobClient(): BlobClient | null {
+    return this.blobClient;
+  }
+
+  /** Names of the other devices currently connected (from awareness). */
+  peerNames(): string[] {
+    const out: string[] = [];
+    if (!this.provider) return out;
+    for (const [id, st] of this.provider.awareness.getStates()) {
+      if (id === this.doc.clientID) continue;
+      const name = (st as { user?: { name?: string } })?.user?.name;
+      if (name && !out.includes(name)) out.push(name);
+    }
+    return out;
+  }
+
   /** Refresh the cache-size figures shown in the status section (cheap; doc size is cached). */
   async refreshStorage(): Promise<void> {
     this.storage = await this.persistence.storageInfo(this.doc, Object.keys(this.state.synced).length);

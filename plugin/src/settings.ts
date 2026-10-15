@@ -29,6 +29,8 @@ export interface ReplicaSettings {
   excludePaths: string;
   liveDebounceMs: number;
   guestMounts: GuestMount[];
+  /** Local switch: take part in plugin-settings sync on this device (selection is shared). */
+  configSync: { enabled: boolean };
 }
 
 export const DEFAULT_SETTINGS: ReplicaSettings = {
@@ -42,6 +44,7 @@ export const DEFAULT_SETTINGS: ReplicaSettings = {
   excludePaths: "",
   liveDebounceMs: 150,
   guestMounts: [],
+  configSync: { enabled: false },
 };
 
 export function slugify(name: string): string {
@@ -252,6 +255,8 @@ export class ReplicaSettingTab extends PluginSettingTab {
       void this.renderDevices(devicesEl);
     }
 
+    this.renderConfigSync(containerEl);
+
     new Setting(containerEl).setName("What to sync").setHeading();
 
     new Setting(containerEl)
@@ -283,6 +288,74 @@ export class ReplicaSettingTab extends PluginSettingTab {
           await this.plugin.saveSettings();
         }),
       );
+  }
+
+  /** Plugin settings sync: which plugins, which devices, with or without the plugin files. */
+  private renderConfigSync(containerEl: HTMLElement): void {
+    const s = this.plugin.settings;
+    new Setting(containerEl)
+      .setName("Plugin settings sync")
+      .setHeading()
+      .setDesc("Keep chosen plugins' settings (their data.json) the same on your devices, e.g. Iconize's icons and colours. Last change wins. The selection below is shared between devices; the switch is per device.");
+    new Setting(containerEl)
+      .setName("Sync plugin settings on this device")
+      .setDesc("Off: this device neither sends nor receives plugin settings.")
+      .addToggle((t) =>
+        t.setValue(s.configSync.enabled).onChange(async (v) => {
+          s.configSync.enabled = v;
+          await this.plugin.saveSettings();
+          await this.plugin.restartEngine();
+          this.display();
+        }),
+      );
+    const cs = this.plugin.configSync;
+    if (!cs) {
+      containerEl.createDiv({ cls: "replica-empty", text: "Connect to the server to choose plugins." });
+      return;
+    }
+    const devicesSeen = [s.deviceName, ...(this.plugin.engine?.peerNames() ?? [])];
+    containerEl.createDiv({ cls: "replica-muted replica-small", text: `Devices: this one is “${s.deviceName}”${devicesSeen.length > 1 ? `; also online: ${devicesSeen.slice(1).join(", ")}` : ""}. Use these names in the devices field, or “all”.` });
+
+    const manifests = (this.app as unknown as { plugins: { manifests: Record<string, { id: string; name: string }> } }).plugins?.manifests ?? {};
+    const ids = new Set<string>(Object.keys(manifests));
+    for (const [id] of cs.entries()) ids.add(id);
+    ids.delete(this.plugin.manifest.id);
+    if (ids.size === 0) containerEl.createDiv({ cls: "replica-empty", text: "No community plugins installed." });
+    for (const id of [...ids].sort()) {
+      const entry = cs.get(id);
+      const name = manifests[id]?.name ?? id;
+      const installed = !!manifests[id];
+      const row = new Setting(containerEl)
+        .setClass("replica-grant")
+        .setName(name + (installed ? "" : " (not installed here)"))
+        .setDesc(entry ? (entry.devices === "all" ? "all devices" : `devices: ${entry.devices.join(", ")}`) + (entry.code ? " · with plugin files" : "") : "not synced");
+      row.addToggle((t) =>
+        t.setValue(!!entry).onChange((v) => {
+          cs.set(id, v ? { devices: "all", code: false } : null);
+          this.display();
+        }),
+      );
+      if (entry) {
+        row.addText((t) =>
+          t
+            .setPlaceholder("all")
+            .setValue(entry.devices === "all" ? "all" : entry.devices.join(", "))
+            .onChange((v) => {
+              const list = v.split(",").map((x) => x.trim()).filter(Boolean);
+              cs.set(id, { ...entry, devices: list.length === 0 || list.includes("all") ? "all" : list });
+            }),
+        );
+        row.addExtraButton((b) =>
+          b
+            .setIcon(entry.code ? "package-check" : "package")
+            .setTooltip(entry.code ? "Plugin files are synced too (click to stop)" : "Also sync the plugin's files (main.js, manifest.json, styles.css) so it installs on other devices")
+            .onClick(() => {
+              cs.set(id, { ...entry, code: !entry.code });
+              this.display();
+            }),
+        );
+      }
+    }
   }
 
   private async renderDevices(el: HTMLElement): Promise<void> {

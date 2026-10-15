@@ -1,6 +1,7 @@
 import { Notice, Platform, Plugin, TAbstractFile, TFolder, setIcon } from "obsidian";
 import { ReplicaApi, SharingInfo, guestSession } from "./api";
 import { SetupConfirmModal } from "./device-modals";
+import { ConfigSync } from "./config-sync";
 import { BlobClient } from "./blobs";
 import { SyncEngine, EngineStatus, EngineTarget } from "./engine";
 import { Persistence, deviceInstallId } from "./persistence";
@@ -12,6 +13,8 @@ export default class ReplicaPlugin extends Plugin {
   /** Running engines: "home" (own server, whole vault) plus one per enabled guest mount. */
   engines = new Map<string, SyncEngine>();
   settingTab: ReplicaSettingTab | null = null;
+  /** Plugin-settings sync, alive while the home engine runs. */
+  configSync: ConfigSync | null = null;
   private statusEl!: HTMLElement;
   private restarting = false;
 
@@ -412,7 +415,17 @@ export default class ReplicaPlugin extends Plugin {
     }
     await this.refreshSharingRoots();
     const starts: Promise<void>[] = [];
-    if (home) starts.push(this.launch(home, this.settings.vaultId));
+    if (home) {
+      starts.push(
+        this.launch(home, this.settings.vaultId).then(() => {
+          const e = this.engines.get("home");
+          if (e && !this.configSync) {
+            this.configSync = new ConfigSync(this.app, this.settings, e);
+            this.configSync.start();
+          }
+        }),
+      );
+    }
     for (const m of guests) {
       const t = this.guestTarget(m);
       if (t) starts.push(this.launch(t, `guest:${m.shareId}`));
@@ -421,6 +434,8 @@ export default class ReplicaPlugin extends Plugin {
   }
 
   async stopEngine(): Promise<void> {
+    this.configSync?.stop();
+    this.configSync = null;
     const all = [...this.engines.values()];
     this.engines.clear();
     await Promise.all(all.map((e) => e.stop()));
