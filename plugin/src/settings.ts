@@ -1,6 +1,8 @@
 import { App, Notice, PluginSettingTab, Setting, requestUrl } from "obsidian";
 import type ReplicaPlugin from "./main";
 import { SharingSection } from "./sharing-ui";
+import { DeviceSetupModal } from "./device-modals";
+import { ReplicaApi } from "./api";
 
 /** A share mounted straight from the owner's server with a ticket (no server of our own). */
 export interface GuestMount {
@@ -240,6 +242,16 @@ export class ReplicaSettingTab extends PluginSettingTab {
           }),
       );
 
+    if (s.serverUrl && s.token) {
+      new Setting(containerEl)
+        .setName("Devices")
+        .setHeading()
+        .setDesc("Each device should have its own token, so one can be revoked without the others.")
+        .addButton((b) => b.setButtonText("Set up another device…").setCta().onClick(() => new DeviceSetupModal(this.plugin).open()));
+      const devicesEl = containerEl.createDiv();
+      void this.renderDevices(devicesEl);
+    }
+
     new Setting(containerEl).setName("What to sync").setHeading();
 
     new Setting(containerEl)
@@ -271,6 +283,33 @@ export class ReplicaSettingTab extends PluginSettingTab {
           await this.plugin.saveSettings();
         }),
       );
+  }
+
+  private async renderDevices(el: HTMLElement): Promise<void> {
+    el.empty();
+    try {
+      const r = await new ReplicaApi(this.plugin.settings).listTokens();
+      if (r.tokens.length === 0) el.createDiv({ cls: "replica-empty", text: "No tokens listed." });
+      for (const t of r.tokens) {
+        new Setting(el)
+          .setClass("replica-grant")
+          .setName(`token “${t.label}”`)
+          .setDesc(`issued ${t.created_at.slice(0, 10)}${t.last_used_at ? ` · last used ${t.last_used_at.slice(0, 16).replace("T", " ")}` : " · never used"}`)
+          .addButton((b) =>
+            b.setButtonText("Revoke").onClick(async () => {
+              try {
+                await new ReplicaApi(this.plugin.settings).revokeToken(t.label);
+                new Notice(`Replica: token “${t.label}” revoked. If that was this device's token, enter a new one.`);
+                await this.renderDevices(el);
+              } catch (e) {
+                new Notice(`Replica: ${(e as Error).message}`);
+              }
+            }),
+          );
+      }
+    } catch (e) {
+      el.createDiv({ cls: "replica-empty", text: `Cannot list tokens: ${(e as Error).message}` });
+    }
   }
 
   private renderStatus(el: HTMLElement): void {

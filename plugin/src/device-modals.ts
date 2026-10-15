@@ -1,0 +1,118 @@
+import { Modal, Notice, Setting } from "obsidian";
+import { ReplicaApi } from "./api";
+import type ReplicaPlugin from "./main";
+import { renderQr, setupLink } from "./qr";
+import { serverUrls, slugify } from "./settings";
+import { copyText } from "./sharing-modals";
+
+/** Issue a token for another device and show it as a QR code / deep link. */
+export class DeviceSetupModal extends Modal {
+  private label = "";
+
+  constructor(private plugin: ReplicaPlugin) {
+    super(plugin.app);
+  }
+
+  onOpen(): void {
+    const { contentEl } = this;
+    contentEl.addClass("replica-modal");
+    contentEl.createEl("h2", { text: "Set up another device" });
+    contentEl.createEl("p", {
+      cls: "replica-muted",
+      text: "Creates a token just for that device (revoke it later without touching this one) and shows a QR code. Scan it with the phone's camera: Obsidian opens and connects to the same server and vault.",
+    });
+    new Setting(contentEl)
+      .setName("Device name")
+      .setDesc("Used as the token's label, e.g. “iPhone”.")
+      .addText((t) => t.setPlaceholder("iPhone").onChange((v) => (this.label = v)));
+    const out = contentEl.createDiv();
+    const msg = contentEl.createDiv({ cls: "replica-error" });
+    new Setting(contentEl).addButton((b) =>
+      b
+        .setButtonText("Create token and QR")
+        .setCta()
+        .onClick(async () => {
+          b.setDisabled(true);
+          try {
+            const s = this.plugin.settings;
+            const r = await new ReplicaApi(s).createToken(this.label.trim() || "device");
+            const link = setupLink(s.serverUrl, r.token, s.vaultId, r.user);
+            out.empty();
+            renderQr(out, link, `Scan with the other device. Anyone who scans this gets access as “${r.user}”; revoke the token “${r.label}” under Devices if it leaks.`);
+            new Setting(out)
+              .addButton((x) => x.setButtonText("Copy link").onClick(() => void copyText(link, "Setup link")))
+              .addButton((x) => x.setButtonText("Copy token only").onClick(() => void copyText(r.token, "Token")));
+            if (!/^https:\/\//i.test(serverUrls(s.serverUrl)?.http ?? "")) {
+              out.createDiv({ cls: "replica-error", text: "Your server URL is not https; a phone will not be able to connect to it." });
+            }
+          } catch (e) {
+            msg.setText((e as Error).message);
+            b.setDisabled(false);
+          }
+        }),
+    );
+  }
+
+  onClose(): void {
+    this.contentEl.empty();
+  }
+}
+
+/** A setup deep link arrived (QR scanned): confirm before overwriting the connection settings. */
+export class SetupConfirmModal extends Modal {
+  constructor(
+    private plugin: ReplicaPlugin,
+    private params: { server: string; token: string; vault: string; user?: string },
+  ) {
+    super(plugin.app);
+  }
+
+  onOpen(): void {
+    const { contentEl } = this;
+    const { server, token, vault, user } = this.params;
+    const current = this.plugin.settings;
+    const replacing = !!current.serverUrl && (current.serverUrl !== server || current.vaultId !== vault);
+    contentEl.addClass("replica-modal");
+    contentEl.createEl("h2", { text: "Connect this device?" });
+    const row = (label: string, value: string) => {
+      const r = contentEl.createDiv({ cls: "replica-diag-row" });
+      r.createSpan({ cls: "replica-diag-label", text: label });
+      r.createSpan({ cls: "replica-diag-value", text: value });
+    };
+    row("Server", server);
+    row("Vault on server", vault);
+    if (user) row("User", user);
+    row("Token", token.slice(0, 6) + "…");
+    if (replacing) {
+      contentEl.createDiv({
+        cls: "replica-error",
+        text: `This replaces the current connection (${current.serverUrl}, vault “${current.vaultId}”). This vault's files will be merged with what is in “${vault}” on the new server.`,
+      });
+    }
+    const urls = serverUrls(server);
+    if (!urls) contentEl.createDiv({ cls: "replica-error", text: "The server URL in this link is not valid." });
+    new Setting(contentEl)
+      .addButton((b) => b.setButtonText("Cancel").onClick(() => this.close()))
+      .addButton((b) =>
+        b
+          .setButtonText("Connect")
+          .setCta()
+          .setDisabled(!urls)
+          .onClick(async () => {
+            current.serverUrl = server;
+            current.token = token;
+            current.vaultId = slugify(vault);
+            current.enabled = true;
+            await this.plugin.saveSettings();
+            await this.plugin.restartEngine();
+            new Notice(`Replica: connected to ${server}`);
+            this.close();
+            this.plugin.settingTab?.show("server");
+          }),
+      );
+  }
+
+  onClose(): void {
+    this.contentEl.empty();
+  }
+}

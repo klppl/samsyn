@@ -4,6 +4,7 @@
 //! name is scoped to that user and created on first use. Protocol = standard y-sync, so the
 //! Obsidian plugin uses `y-websocket` unchanged.
 
+mod account;
 mod blobs;
 mod bridge;
 mod cli;
@@ -43,6 +44,7 @@ pub struct AppState {
     pub storage: Storage,
     pub docs: Arc<DocRegistry>,
     pub guest_limiter: std::sync::Mutex<guest::GuestLimiter>,
+    pub guest_sessions: std::sync::Mutex<guest::GuestSessions>,
 }
 
 pub type SharedState = Arc<AppState>;
@@ -135,7 +137,7 @@ async fn serve(args: ServeArgs, storage: Storage) -> anyhow::Result<()> {
             .accept(remote::ALPN, remote::ShareProtocol { docs: docs.clone() })
             .spawn()
     });
-    let state: SharedState = Arc::new(AppState { docs, storage, serve: args, guest_limiter: Default::default() });
+    let state: SharedState = Arc::new(AppState { docs, storage, serve: args, guest_limiter: Default::default(), guest_sessions: Default::default() });
     match &state.serve.public_url {
         Some(u) => tracing::info!("guest mode on: tickets carry public URL {u}"),
         None => tracing::info!("guest mode off (set --public-url to let people without a server join shares)"),
@@ -158,6 +160,9 @@ async fn serve(args: ServeArgs, storage: Storage) -> anyhow::Result<()> {
         .route("/api/vaults/{vault}/mounts", post(sharing::create_mount))
         .route("/api/mounts/{id}", delete(sharing::delete_mount).patch(sharing::move_mount))
         .route("/api/tickets/inspect", post(sharing::inspect_ticket))
+        .route("/api/me/tokens", get(account::list_tokens).post(account::create_token))
+        .route("/api/me/tokens/{label}", delete(account::revoke_token))
+        .route("/guest/session/{id}", post(guest::session))
         .route("/guest/shares/{id}", get(guest::info))
         .route("/guest/ws/{id}", get(guest::ws))
         .route(

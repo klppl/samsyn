@@ -47,6 +47,12 @@ export interface EngineTarget {
   readOnly: boolean;
   /** Vault paths (with trailing slash) this engine must never touch: the guest mount roots. */
   excludeRoots: string[];
+  /**
+   * Guests: exchange the ticket secret for a session before connecting (and again when the
+   * connection keeps failing, e.g. after the session expired). Returns the WebSocket params
+   * and the blob client to use.
+   */
+  prepare?: () => Promise<{ params: Record<string, string>; blobClient: BlobClient }>;
 }
 
 export interface Diagnostics {
@@ -101,6 +107,8 @@ export class SyncEngine {
   private hint: string | null = null;
   private installId = "";
   private warnedReadOnly = false;
+  private closesSincePrepare = 0;
+  private lastPrepare = 0;
   /** Deletions from the shared vault that the mass-delete guard held back. */
   pendingDeletions: string[] = [];
 
@@ -142,6 +150,7 @@ export class SyncEngine {
     this.installObservers();
 
     if (this.target.wsBase && this.target.room) {
+      await this.prepare();
       this.connect();
       if (!hadDoc) {
         // First run on this device: wait for the server state before reconciling so that
@@ -170,6 +179,30 @@ export class SyncEngine {
 
   get isConnected(): boolean {
     return this.status === "connected";
+  }
+
+  /** Run the target's prepare step (guest session exchange). Errors are shown, not fatal. */
+  private async prepare(): Promise<void> {
+    if (!this.target.prepare) return;
+    this.lastPrepare = Date.now();
+    this.closesSincePrepare = 0;
+    try {
+      const r = await this.target.prepare();
+      this.target.params = r.params;
+      this.blobClient = r.blobClient;
+      this.lastError = null;
+    } catch (e) {
+      this.lastError = `${this.target.label}: ${(e as Error).message}`;
+      console.warn("[replica]", this.lastError);
+    }
+  }
+
+  private async reprepareAndReconnect(): Promise<void> {
+    if (this.stopped || !this.target.prepare) return;
+    this.provider?.destroy();
+    this.provider = null;
+    await this.prepare();
+    if (!this.stopped) this.connect();
   }
 
   private connect(): void {
@@ -216,6 +249,11 @@ export class SyncEngine {
       if (ev && ev.code !== 1000 && ev.code !== 1005) {
         this.lastError = `WebSocket closed: code ${ev.code}${ev.reason ? " " + ev.reason : ""}`;
         if (ev.code === 1006) this.lastError += " (server unreachable, TLS/certificate problem, or blocked insecure ws://)";
+      }
+      // A guest session can expire or be revoked; after a few failed attempts get a new one
+      // (at most every two minutes) instead of retrying the dead URL forever.
+      if (this.target.prepare && ++this.closesSincePrepare >= 4 && Date.now() - this.lastPrepare > 120_000) {
+        void this.reprepareAndReconnect();
       }
     });
     provider.awareness.on("change", () => this.setStatus(this.status));

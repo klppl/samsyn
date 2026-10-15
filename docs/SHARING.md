@@ -85,9 +85,12 @@ Guest routes, all authenticated by `(share id, secret)` given as `?secret=` or `
 
 | Method | Path | Notes |
 |---|---|---|
+| POST | `/guest/session/{id}` | secret → session id (7 days); every other guest route accepts `?session=` / Bearer session instead of the secret |
 | GET | `/guest/shares/{id}` | name, access, folder or note; validates the ticket |
 | GET | `/guest/ws/{id}` | y-sync WebSocket on the share document; read-only grants have their document updates dropped server-side |
-| GET/PUT | `/guest/blobs/{id}/{hash}` | share-scoped blobs; PUT only for read & write |
+| GET/PUT | `/guest/blobs/{id}/{hash}` | share-scoped blobs; PUT only for read & write and within `--max-share-mb` |
+
+Tickets travel as text, as a deep link (`obsidian://replica?op=mount&ticket=…`) or as a QR code of that link; scanning it opens Obsidian with the mount dialog filled in. Running a server on the public internet is covered in `PUBLIC-SERVER.md`.
 
 Hygiene on these public routes: unknown share and bad secret answer identically (403), more than 10 failures per IP in 10 minutes gives 429, and the request log carries the path only, never the query string. The owner re-checks the grant every 30 s on open guest sockets and closes them when the ticket is revoked or the share deleted; the headless client then exits with a clear message. Each guest connection stamps `last_seen_at` on its ticket, shown to the owner.
 

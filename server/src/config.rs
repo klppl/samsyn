@@ -114,6 +114,11 @@ pub struct ServeArgs {
     #[arg(long, env = "REPLICA_PUBLIC_URL")]
     pub public_url: Option<String>,
 
+    /// Upload quota per share for guests, in megabytes (0 = unlimited). Guests of a share may
+    /// not push blobs once the share's blob store is this large.
+    #[arg(long, env = "REPLICA_MAX_SHARE_MB", default_value_t = 2048)]
+    pub max_share_mb: u64,
+
     /// Disable the peer-to-peer endpoint entirely (tickets then only work on this server).
     #[arg(long, env = "REPLICA_NO_P2P", default_value_t = false)]
     pub no_p2p: bool,

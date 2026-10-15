@@ -2,6 +2,7 @@ import { AbstractInputSuggest, App, Modal, Notice, Setting, TAbstractFile, TFold
 import { ReplicaApi, ShareRow, TicketInfo } from "./api";
 import type ReplicaPlugin from "./main";
 import type { SharedRoot } from "./main";
+import { mountLink, renderQr } from "./qr";
 import { serverUrls } from "./settings";
 import { decodeTicket, Ticket } from "./ticket";
 
@@ -52,9 +53,12 @@ function renderTicket(el: HTMLElement, ticket: string, title: string, hint: stri
   ta.readOnly = true;
   ta.rows = 4;
   ta.onclick = () => ta.select();
+  const link = mountLink(ticket);
   new Setting(el)
     .addButton((b) => b.setButtonText("Copy ticket").setCta().onClick(() => void copyText(ticket)))
+    .addButton((b) => b.setButtonText("Copy link").onClick(() => void copyText(link, "Link")))
     .addButton((b) => b.setButtonText("Done").onClick(() => el.closest(".modal-container")?.querySelector<HTMLElement>(".modal-close-button")?.click()));
+  renderQr(el.createDiv(), link, "Scan with a phone: Obsidian opens with this ticket ready to mount. The link works on desktop too.");
 }
 
 /** Share a folder or a note: pick the path, get the first ticket. */
@@ -199,6 +203,7 @@ export class MountModal extends Modal {
   constructor(
     private plugin: ReplicaPlugin,
     private onDone?: () => void,
+    private initialTicket = "",
   ) {
     super(plugin.app);
     this.api = new ReplicaApi(plugin.settings);
@@ -330,7 +335,13 @@ export class MountModal extends Modal {
       if (this.inspectTimer) clearTimeout(this.inspectTimer);
       this.inspectTimer = setTimeout(() => void inspect(), 300);
     });
-    ta.focus();
+    if (this.initialTicket) {
+      ta.value = this.initialTicket;
+      this.ticket = this.initialTicket;
+      void inspect();
+    } else {
+      ta.focus();
+    }
   }
 
   private async mountAsGuest(): Promise<void> {

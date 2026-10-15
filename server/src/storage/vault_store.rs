@@ -178,6 +178,17 @@ impl VaultStore {
         }
     }
 
+    /// Total size of all blobs in this store.
+    pub fn blob_bytes(&self) -> anyhow::Result<u64> {
+        let mut total = 0u64;
+        for h in self.list_blob_hashes()? {
+            if let Ok(m) = std::fs::metadata(self.dir.join("blobs").join(&h[..2]).join(&h)) {
+                total += m.len();
+            }
+        }
+        Ok(total)
+    }
+
     pub fn list_blob_hashes(&self) -> anyhow::Result<Vec<String>> {
         let mut out = Vec::new();
         let root = self.dir.join("blobs");

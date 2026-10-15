@@ -111,10 +111,42 @@ export class ReplicaApi {
   moveShare(shareId: string, path: string): Promise<{ path: string }> {
     return this.call("PATCH", `/api/shares/${shareId}`, { path });
   }
+  listTokens(): Promise<{ user: string; tokens: Array<{ label: string; created_at: string; last_used_at: string | null }> }> {
+    return this.call("GET", `/api/me/tokens`);
+  }
+  createToken(label: string): Promise<{ token: string; label: string; user: string }> {
+    return this.call("POST", `/api/me/tokens`, { label });
+  }
+  revokeToken(label: string): Promise<void> {
+    return this.call("DELETE", `/api/me/tokens/${encodeURIComponent(label)}`);
+  }
   inspectTicket(ticket: string): Promise<TicketInfo> {
     return this.call("POST", `/api/tickets/inspect`, { ticket });
   }
   unmount(mountId: string): Promise<void> {
     return this.call("DELETE", `/api/mounts/${mountId}`);
   }
+}
+
+export interface GuestSession {
+  session: string;
+  expires_in: number;
+  share_id: string;
+  name: string;
+  access: string;
+  only_file: string | null;
+}
+
+/** Exchange a ticket secret for a session id on the owner's server (guest mode). */
+export async function guestSession(httpBase: string, shareId: string, secret: string): Promise<GuestSession> {
+  const res = await requestUrl({
+    url: `${httpBase}/guest/session/${encodeURIComponent(shareId)}`,
+    method: "POST",
+    headers: { Authorization: `Bearer ${secret}` },
+    throw: false,
+  });
+  if (res.status === 403) throw new Error("the ticket is invalid or has been revoked");
+  if (res.status === 429) throw new Error("too many failed attempts from this address; try again later");
+  if (res.status >= 400) throw new Error(`owner's server answered HTTP ${res.status}`);
+  return res.json as GuestSession;
 }

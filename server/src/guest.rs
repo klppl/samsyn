@@ -28,6 +28,47 @@ use crate::SharedState;
 
 const MAX_FAILURES: u32 = 10;
 const FAILURE_WINDOW: Duration = Duration::from_secs(600);
+/// Guest sessions live this long; the client exchanges the secret again afterwards.
+const SESSION_TTL: Duration = Duration::from_secs(7 * 24 * 3600);
+
+/// A short-lived stand-in for the ticket secret, so the secret itself never rides in a URL
+/// after the first exchange. Revocation still applies: every use re-checks the grant.
+pub struct GuestSession {
+    share_id: String,
+    secret: String,
+    expires: Instant,
+}
+
+#[derive(Default)]
+pub struct GuestSessions {
+    map: HashMap<String, GuestSession>,
+}
+
+impl GuestSessions {
+    fn create(&mut self, share_id: &str, secret: &str) -> String {
+        if self.map.len() > 50_000 {
+            self.map.retain(|_, s| s.expires > Instant::now());
+        }
+        let id = hex::encode({
+            let mut b = [0u8; 32];
+            rand::RngCore::fill_bytes(&mut rand::rng(), &mut b);
+            b
+        });
+        self.map.insert(id.clone(), GuestSession { share_id: share_id.into(), secret: secret.into(), expires: Instant::now() + SESSION_TTL });
+        id
+    }
+    /// The secret behind a session id, if it is valid for this share.
+    fn secret_for(&mut self, id: &str, share_id: &str) -> Option<String> {
+        match self.map.get(id) {
+            Some(s) if s.expires > Instant::now() && s.share_id == share_id => Some(s.secret.clone()),
+            Some(_) => {
+                self.map.remove(id);
+                None
+            }
+            None => None,
+        }
+    }
+}
 
 /// Failed guest authentications per client IP: (count, window start).
 #[derive(Default)]
@@ -84,7 +125,14 @@ fn authenticate(state: &SharedState, share_id: &str, headers: &HeaderMap, query:
     if state.guest_limiter.lock().unwrap().blocked(ip) {
         return Err((StatusCode::TOO_MANY_REQUESTS, "too many failed attempts; try again later").into_response());
     }
-    let secret = extract_token(headers, query.get("secret").map(String::as_str)).unwrap_or_default();
+    let presented = extract_token(headers, query.get("secret").or_else(|| query.get("session")).map(String::as_str)).unwrap_or_default();
+    // A session id stands in for the secret it was created with.
+    let secret = state
+        .guest_sessions
+        .lock()
+        .unwrap()
+        .secret_for(&presented, share_id)
+        .unwrap_or(presented);
     let reg = state.storage.registry();
     let found = match reg.share_by_id(share_id) {
         Ok(Some(s)) if secret.len() == 64 => match reg.check_grant(&s.id, &secret) {
@@ -111,6 +159,33 @@ fn share_doc(state: &SharedState, share: &ShareInfo) -> Result<Arc<LiveDoc>, Res
         tracing::error!(share = %share.name, "loading share for guest failed: {e:#}");
         (StatusCode::INTERNAL_SERVER_ERROR, "cannot load share").into_response()
     })
+}
+
+// ------------------------------------------------------------------ POST /guest/session/{id}
+
+/// Exchange the ticket secret for a session id. Clients then connect with `?session=` (or a
+/// Bearer of the session), keeping the secret out of URLs and server logs for good.
+pub async fn session(
+    Path(share_id): Path<String>,
+    Query(query): Query<HashMap<String, String>>,
+    headers: HeaderMap,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    State(state): State<SharedState>,
+) -> Response {
+    let g = match authenticate(&state, &share_id, &headers, &query, peer) {
+        Ok(g) => g,
+        Err(r) => return r,
+    };
+    let id = state.guest_sessions.lock().unwrap().create(&g.share.id, &g.secret);
+    Json(serde_json::json!({
+        "session": id,
+        "expires_in": SESSION_TTL.as_secs(),
+        "share_id": g.share.id,
+        "name": g.share.name,
+        "access": g.access,
+        "only_file": g.share.only_file,
+    }))
+    .into_response()
 }
 
 // ------------------------------------------------------------------ GET /guest/shares/{id}
@@ -222,6 +297,14 @@ pub async fn put_blob(
         Ok(d) => d,
         Err(r) => return r,
     };
+    let quota = state.serve.max_share_mb * 1024 * 1024;
+    if quota > 0 && !doc.store.has_blob(&actual) {
+        let used = doc.store.blob_bytes().unwrap_or(0);
+        if used + body.len() as u64 > quota {
+            tracing::warn!(share = %g.share.name, "guest upload refused: share quota of {} MB reached", state.serve.max_share_mb);
+            return (StatusCode::PAYLOAD_TOO_LARGE, Json(serde_json::json!({ "error": format!("this share's upload quota ({} MB) is full; ask the owner", state.serve.max_share_mb) }))).into_response();
+        }
+    }
     match doc.store.put_blob(&actual, &body) {
         Ok(()) => {
             // The owner's vault will reference this hash once the metadata arrives; copy the

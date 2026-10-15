@@ -143,3 +143,19 @@
   margin: 8px 0;
   font-size: var(--font-ui-small);
 }
+
+/* QR codes */
+.replica-qr {
+  margin: 12px 0 4px;
+  text-align: center;
+}
+.replica-qr-image svg {
+  width: min(260px, 80vw);
+  height: auto;
+  background: white;
+  padding: 8px;
+  border-radius: 8px;
+}
+.replica-small {
+  font-size: var(--font-ui-smaller);
+}

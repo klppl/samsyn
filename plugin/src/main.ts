@@ -1,5 +1,6 @@
 import { Notice, Platform, Plugin, TAbstractFile, TFolder, setIcon } from "obsidian";
-import { ReplicaApi, SharingInfo } from "./api";
+import { ReplicaApi, SharingInfo, guestSession } from "./api";
+import { SetupConfirmModal } from "./device-modals";
 import { BlobClient } from "./blobs";
 import { SyncEngine, EngineStatus, EngineTarget } from "./engine";
 import { Persistence, deviceInstallId } from "./persistence";
@@ -141,6 +142,18 @@ export default class ReplicaPlugin extends Plugin {
         );
       }),
     );
+
+    // Deep links: obsidian://replica?op=mount&ticket=…  and  obsidian://replica?op=setup&server=…&token=…&vault=…
+    this.registerObsidianProtocolHandler("replica", (params) => {
+      const op = params.op ?? (params.ticket ? "mount" : params.server ? "setup" : "");
+      if (op === "mount" && params.ticket) {
+        new MountModal(this, () => this.settingTab?.show("sharing"), params.ticket).open();
+      } else if (op === "setup" && params.server && params.token) {
+        new SetupConfirmModal(this, { server: params.server, token: params.token, vault: params.vault || slugify(this.app.vault.getName()), user: params.user }).open();
+      } else {
+        new Notice("Replica: this link is not understood (expected op=mount with a ticket, or op=setup with server and token).", 8000);
+      }
+    });
 
     // Registered before the engines start, so it runs first on every rename.
     this.registerEvent(this.app.vault.on("rename", (f, oldPath) => void this.onRename(f, oldPath)));
@@ -354,11 +367,16 @@ export default class ReplicaPlugin extends Plugin {
       label: `“${m.name}” (shared with you)`,
       wsBase: urls.ws.replace(/\/ws$/, "/guest/ws"),
       room: m.shareId,
-      params: { secret: m.secret },
-      blobClient: BlobClient.forShare(urls.http, m.shareId, m.secret),
+      // Placeholder until prepare() exchanges the secret for a session.
+      params: {},
+      blobClient: null,
       root: m.mountPath.replace(/\/+$/, "") + "/",
       readOnly: m.access === "ro",
       excludeRoots: [],
+      prepare: async () => {
+        const s = await guestSession(urls.http, m.shareId, m.secret);
+        return { params: { session: s.session }, blobClient: BlobClient.forShare(urls.http, m.shareId, s.session) };
+      },
     };
   }
 

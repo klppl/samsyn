@@ -36,7 +36,7 @@ docker compose up -d
 docker compose logs server | grep token
 ```
 
-Server flags worth knowing: `--public-url` (guest tickets), `--p2p-port`/`--relay`/`--no-p2p` (server-to-server), `--tls-cert`/`--tls-key`, `--max-blob-mb`, `--snapshot-hours`. `replica-server serve --help` lists them all.
+Running on the public internet? Read [docs/PUBLIC-SERVER.md](docs/PUBLIC-SERVER.md). Server flags worth knowing: `--public-url` (guest tickets), `--max-share-mb` (guest upload quota), `--p2p-port`/`--relay`/`--no-p2p` (server-to-server), `--tls-cert`/`--tls-key`, `--max-blob-mb`, `--snapshot-hours`. `replica-server serve --help` lists them all.
 
 Prebuilt images are published by CI (`.github/workflows`) to the
 the private tracker registry on every push to `main` and on tags:
@@ -93,7 +93,7 @@ Obsidian → Settings → Replica:
 
 Press **Test connection** (checks server and token), then **Reconnect**. The **Status** section at the top of the Server tab shows live state, last error and hints; on desktop the status bar shows it too. The command **Replica: Show sync status** works on every platform.
 
-Repeat on each device with the same server, token and vault ID. That is all. (No server of your own? You can still take part in folders others share with you: Sharing tab → *Add from ticket…*.)
+Repeat on each device with the same server and vault ID. Easiest: Settings → Server → **Devices** → *Set up another device…* creates a token for that device and shows a QR code; scan it with the phone's camera and Obsidian connects (`obsidian://replica?op=setup&…`). One token per device means a lost phone is one revoke. (No server of your own? You can still take part in folders others share with you: Sharing tab → *Add from ticket…*.)
 
 ## How it works
 
@@ -110,7 +110,7 @@ The plugin caches the document and its sync bookkeeping in IndexedDB on the devi
 Share part of a vault, not all of it, with live editing on both sides. The plugin stays a plain one-vault sync client; the server does the composition (see [docs/SHARING.md](docs/SHARING.md)).
 
 1. Owner: right-click a folder or note → **Replica: Share…** (or Settings → Replica → **Sharing** → *Share a folder or note…*). Pick read & write or read only, **Create share**, copy the ticket. One ticket = exactly that folder or note; issue one ticket per person so you can revoke them separately.
-2. Friend: Settings → Replica → **Sharing** → *Add from ticket…*: paste, see what it is (name, access, which server), choose where it goes (default `Shared/X`), **Mount**. The files appear and stay live in both directions.
+2. Friend: Settings → Replica → **Sharing** → *Add from ticket…*: paste, see what it is (name, access, which server), choose where it goes (default `Shared/X`), **Mount**. The files appear and stay live in both directions. Or skip the pasting: the ticket view also shows a **QR code** and a **link** (`obsidian://replica?op=mount&ticket=…`); scanning or opening it brings up the same dialog with the ticket filled in.
 3. Reorganise inside a shared folder as you like. The shared folder itself is moved with **Move…** in the Sharing tab; dragging it in the file explorer, or dragging notes out of or into it, is reverted with a notice, because that would delete or expose files for the other people. While both edit, each sees the other's presence inside the shared folder. Revoke a ticket, or unshare, at any time; the friend is told in their Sharing tab and keeps their copy as ordinary notes.
 
 The other person does not even need a server: start yours with `--public-url https://your.server` and the ticket lets them join straight from the plugin or with `replica-server sync --ticket … --dir …` (guest mode, see [docs/SHARING.md](docs/SHARING.md#guests-no-server-of-their-own)).

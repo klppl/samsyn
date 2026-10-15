@@ -11,7 +11,7 @@ fn guests_join_with_tickets_only() {
     let dir = tmp("guest");
     let port = free_port();
     let url = format!("http://127.0.0.1:{port}");
-    let mut server = Server::start_at(dir.join("data"), dir.join("server.log"), port, &["--no-p2p", "--public-url", &url]);
+    let mut server = Server::start_at(dir.join("data"), dir.join("server.log"), port, &["--no-p2p", "--public-url", &url, "--max-share-mb", "1"]);
     let owner = server.owner_token.clone();
 
     let o = Client::start(&server, &owner, "va", &dir.join("O"), "O");
@@ -41,7 +41,36 @@ fn guests_join_with_tickets_only() {
     assert_eq!(c3, 429);
     assert!(!server.proc.log_contains("secret="), "secret leaked into the log");
     // The limiter is per IP and the guests below come from loopback too: restart to clear it.
-    server.restart(&["--no-p2p", "--public-url", &url]);
+    server.restart(&["--no-p2p", "--public-url", &url, "--max-share-mb", "1"]);
+
+    // Session exchange: the secret is presented once, a session id works everywhere after.
+    let secret = {
+        let t = api_json(&server, &owner, "POST", "/api/tickets/inspect", Some(json!({"ticket": ticket})));
+        assert_eq!(t["valid"], true);
+        // The inspect route does not reveal the secret; decode the ticket like a client would.
+        ticket_secret(&ticket)
+    };
+    let (code, body) = api_raw(&server, &secret, "POST", &format!("/guest/session/{share_id}"), None);
+    assert_eq!(code, 200, "{body}");
+    let session = serde_json::from_str::<serde_json::Value>(&body).unwrap()["session"].as_str().unwrap().to_string();
+    let (code, body) = api_raw(&server, "", "GET", &format!("/guest/shares/{share_id}?session={session}"), None);
+    assert_eq!(code, 200, "session as query param: {body}");
+    let (code, _) = api_raw(&server, &session, "GET", &format!("/guest/shares/{share_id}"), None);
+    assert_eq!(code, 200, "session as bearer");
+    let (code, _) = api_raw(&server, "", "GET", &format!("/guest/shares/nope?session={session}"), None);
+    assert_eq!(code, 403, "session bound to its share");
+
+    // Per-device tokens: issue one, use it, revoke it.
+    let t = api_json(&server, &owner, "POST", "/api/me/tokens", Some(json!({"label": "phone"})));
+    let phone = t["token"].as_str().unwrap().to_string();
+    let (code, _) = api_raw(&server, &phone, "GET", "/me", None);
+    assert_eq!(code, 200);
+    let list = api_json(&server, &owner, "GET", "/api/me/tokens", None);
+    assert!(list["tokens"].as_array().unwrap().iter().any(|x| x["label"] == "phone"), "{list}");
+    let (code, _) = api_raw(&server, &owner, "DELETE", "/api/me/tokens/phone", None);
+    assert_eq!(code, 204);
+    let (code, _) = api_raw(&server, &phone, "GET", "/me", None);
+    assert_eq!(code, 401, "revoked device token still works");
 
     let g1 = Client::start_guest(&ticket, &dir.join("G1"), "G1");
     let g2 = Client::start_guest(&ro_ticket, &dir.join("G2"), "G2");
@@ -62,6 +91,12 @@ fn guests_join_with_tickets_only() {
     g1.write_bytes("guest.gif", b"GIF89a guest");
     eventually!(15, o.read("Projects/X/new.md") == "from guest\n" && o.same_bytes("Projects/X/guest.gif", &g1.path("guest.gif")), "owner gets guest's files", o.proc, server.proc);
     eventually!(10, g2.same_bytes("guest.gif", &g1.path("guest.gif")), "ro guest gets the blob", g2.proc);
+
+    // Upload quota: the share allows 1 MB of blobs; a 2 MB file from the rw guest is refused.
+    g1.write_bytes("big.bin", &vec![7u8; 2 * 1024 * 1024]);
+    eventually!(15, g1.proc.log_contains("413"), "quota refusal logged (HTTP 413)", g1.proc, server.proc);
+    sleep(2.0);
+    assert!(!o.exists("Projects/X/big.bin"), "quota-exceeding blob reached the owner");
 
     // Read-only guest.
     eventually!(30, std::fs::metadata(g2.path("a.md")).map(|m| m.permissions().readonly()).unwrap_or(false), "ro files read-only on disk", g2.proc);
@@ -86,4 +121,32 @@ fn guests_join_with_tickets_only() {
     assert!(!g2.contains("a.md", "after-revoke"));
 
     assert!(server.errors().is_empty(), "server errors: {:?}", server.errors());
+}
+
+/// Pull the secret out of a ticket the way the plugin does (base32, postcard: version byte, then
+/// length-prefixed strings share_id, name, node_id, secret).
+fn ticket_secret(ticket: &str) -> String {
+    let body = ticket.trim().strip_prefix("replica").unwrap().to_ascii_uppercase();
+    let bytes = data_encoding::BASE32_NOPAD.decode(body.as_bytes()).unwrap();
+    let mut pos = 1;
+    let mut read_str = || {
+        let mut len = 0usize;
+        let mut shift = 0;
+        loop {
+            let b = bytes[pos];
+            pos += 1;
+            len |= ((b & 0x7f) as usize) << shift;
+            if b & 0x80 == 0 {
+                break;
+            }
+            shift += 7;
+        }
+        let s = String::from_utf8(bytes[pos..pos + len].to_vec()).unwrap();
+        pos += len;
+        s
+    };
+    let _share = read_str();
+    let _name = read_str();
+    let _node = read_str();
+    read_str()
 }
