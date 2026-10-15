@@ -131,6 +131,7 @@ replica-server sync --server https://sync.example.com --token rp_... --vault not
 - `--once` connects, syncs, and exits when idle. Good for cron or a deploy step.
 - Same mass-delete guard as the plugin: removing most of the vault from the directory is held back unless `--allow-mass-delete` is set.
 - Folders mounted read-only from someone else's share are respected: edits there are not sent, the server's version is put back, new files move to `<mount> (read-only copy)/`, and the files are marked read-only on disk.
+- Shared folders (your shares, mounts) are protected like in the plugin: moving them on disk, or moving files out of or into them, is undone with a warning in the log; use the plugin's Move… to relocate a mount.
 - Guest mode, no account needed: `replica-server sync --ticket <ticket> --dir /srv/x` syncs one shared folder straight from the owner's server (the ticket must come from a server started with `--public-url`). A revoked ticket makes the client exit.
 
 All flags can be environment variables (`REPLICA_SERVER`, `REPLICA_TOKEN`, `REPLICA_VAULT`, `REPLICA_DIR`). A systemd unit:

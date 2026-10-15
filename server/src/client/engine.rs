@@ -50,6 +50,9 @@ pub struct Engine {
     pending_blobs: HashMap<String, (BlobMeta, Instant, u32)>,
     /// Mount prefixes ("Shared/X/") that are read-only for us; local edits there are not pushed.
     ro_prefixes: Vec<String>,
+    /// Everything shared with other people (our shares and our mounts): moving these, or moving
+    /// files across their boundary, is refused like the plugin does.
+    shared_roots: Vec<SharedRoot>,
     pub synced: bool,
     pub had_cached_doc: bool,
     pub pending_deletions: Vec<String>,
@@ -156,6 +159,7 @@ impl Engine {
             recent_deletes: VecDeque::new(),
             pending_blobs: HashMap::new(),
             ro_prefixes: Vec::new(),
+            shared_roots: Vec::new(),
             synced: false,
             had_cached_doc,
             pending_deletions: Vec::new(),
@@ -289,6 +293,32 @@ impl Engine {
             })
             .unwrap_or_default() };
         ro.sort();
+        if !self.args.is_guest() {
+            let mut roots: Vec<SharedRoot> = Vec::new();
+            for s in v["shares"].as_array().into_iter().flatten() {
+                if let Some(p) = s["path"].as_str() {
+                    let is_file = !s["only_file"].is_null();
+                    roots.push(SharedRoot {
+                        path: if is_file { p.to_string() } else { format!("{}/", p.trim_end_matches('/')) },
+                        is_file,
+                        name: s["name"].as_str().unwrap_or(p).to_string(),
+                    });
+                }
+            }
+            for m in v["mounts"].as_array().into_iter().flatten() {
+                if m["status"].as_str() == Some("revoked") {
+                    continue;
+                }
+                if let Some(p) = m["mount_path"].as_str() {
+                    roots.push(SharedRoot { path: format!("{}/", p.trim_end_matches('/')), is_file: false, name: m["name"].as_str().unwrap_or(p).to_string() });
+                }
+            }
+            if roots.iter().map(|r| &r.path).ne(self.shared_roots.iter().map(|r| &r.path)) {
+                let list: Vec<&str> = roots.iter().map(|r| r.path.as_str()).collect();
+                tracing::info!("shared with other people here: {list:?} (moving these on disk is undone)");
+            }
+            self.shared_roots = roots;
+        }
         if ro == self.ro_prefixes {
             return;
         }
@@ -318,6 +348,117 @@ impl Engine {
         } else {
             format!("{} (read-only copy)/", prefix.trim_end_matches('/'))
         }
+    }
+
+    fn shared_root_of(&self, rel: &str) -> Option<&SharedRoot> {
+        self.shared_roots.iter().find(|r| if r.is_file { rel == r.path } else { rel.starts_with(r.path.as_str()) })
+    }
+
+    fn keys_under(&self, root: &SharedRoot) -> Vec<String> {
+        let (t, b) = self.doc_keys();
+        t.into_iter().chain(b).filter(|k| if root.is_file { *k == root.path } else { k.starts_with(root.path.as_str()) }).collect()
+    }
+
+    /// Does the file at `abs` hold what the document has under `key`?
+    fn matches_doc(&self, key: &str, abs: &Path) -> bool {
+        if let Some(t) = self.text_of(key) {
+            return std::fs::read_to_string(abs).map(|s| s == t).unwrap_or(false);
+        }
+        if let Some(b) = self.blob_of(key) {
+            return std::fs::read(abs).map(|d| hash_bytes(&d) == b.hash).unwrap_or(false);
+        }
+        false
+    }
+
+    /// Shared folders must not be moved on disk (the other side would see a deletion), and files
+    /// must not cross a share boundary. Both are undone here. Returns the paths this batch must
+    /// skip, plus `true` when the whole batch is to be ignored (a root was moved or vanished).
+    fn guard_shared_moves(&mut self, rels: &[(String, PathBuf)]) -> (bool, HashSet<String>) {
+        let mut skip: HashSet<String> = HashSet::new();
+        if self.shared_roots.is_empty() {
+            return (false, skip);
+        }
+        // A. A shared root (folder or note) is gone from where it belongs.
+        for root in self.shared_roots.clone() {
+            let root_abs = self.abs(root.path.trim_end_matches('/'));
+            let gone = if root.is_file { !root_abs.is_file() } else { !root_abs.is_dir() };
+            if !gone {
+                continue;
+            }
+            let keys = self.keys_under(&root);
+            if keys.is_empty() {
+                continue;
+            }
+            let probe = if root.is_file { String::new() } else { keys[0][root.path.len()..].to_string() };
+            let dest = rels.iter().find(|(_, abs)| {
+                abs.exists()
+                    && if root.is_file { self.matches_doc(&root.path, abs) } else { abs.is_dir() && abs.join(&probe).exists() }
+            });
+            match dest {
+                Some((drel, dabs)) => {
+                    if let Some(parent) = root_abs.parent() {
+                        let _ = std::fs::create_dir_all(parent);
+                    }
+                    match std::fs::rename(dabs, &root_abs) {
+                        Ok(()) => tracing::warn!(
+                            "\"{}\" ({}) is shared with other people and must not be moved; moved it back from {drel}. Use the plugin's Sharing settings (Move…) to relocate a mount.",
+                            root.name,
+                            root.path.trim_end_matches('/')
+                        ),
+                        Err(e) => tracing::error!("\"{}\" was moved to {drel} and moving it back failed: {e}. Put it back by hand.", root.name),
+                    }
+                    return (true, skip);
+                }
+                None if !self.args.allow_mass_delete => {
+                    tracing::warn!(
+                        "\"{}\" ({}) is shared with other people and disappeared from disk; not deleting it for everyone. Put it back (it is restored on the next reconcile), or restart with --allow-mass-delete if you really want it removed for everyone.",
+                        root.name,
+                        root.path.trim_end_matches('/')
+                    );
+                    for k in keys {
+                        if !self.pending_deletions.contains(&k) {
+                            self.pending_deletions.push(k);
+                        }
+                    }
+                    return (true, skip);
+                }
+                None => {}
+            }
+        }
+        // B. A file left or entered a shared area: the same content vanished on one side of the
+        //    boundary and appeared on the other.
+        let removed: Vec<&(String, PathBuf)> = rels.iter().filter(|(r, abs)| !abs.exists() && self.should_sync(r) && (self.text_of(r).is_some() || self.blob_of(r).is_some())).collect();
+        let created: Vec<&(String, PathBuf)> = rels.iter().filter(|(r, abs)| abs.is_file() && self.should_sync(r) && !self.is_rescue_path(r)).collect();
+        for (r, r_abs) in removed {
+            let from = self.shared_root_of(r).map(|x| x.path.clone());
+            for (c, c_abs) in &created {
+                let to = self.shared_root_of(c).map(|x| x.path.clone());
+                if from == to || !self.matches_doc(r, c_abs) {
+                    continue;
+                }
+                if let Some(parent) = r_abs.parent() {
+                    let _ = std::fs::create_dir_all(parent);
+                }
+                let why = match (&from, &to) {
+                    (Some(f), None) => format!("out of the shared folder {f}; it would disappear for the people you share with"),
+                    (None, Some(t)) => format!("into the shared folder {t}; it would be shared with other people"),
+                    (Some(f), Some(t)) => format!("from the shared folder {f} to {t}; both are shared with other people"),
+                    (None, None) => continue,
+                };
+                match std::fs::rename(c_abs, r_abs) {
+                    Ok(()) => tracing::warn!("{r} was moved {why}. Moved it back to {r} (copy it instead)."),
+                    Err(e) => tracing::error!("{r} was moved {why} and moving it back failed: {e}"),
+                }
+                skip.insert(r.clone());
+                skip.insert(c.clone());
+                break;
+            }
+        }
+        (false, skip)
+    }
+
+    fn is_rescue_path(&self, rel: &str) -> bool {
+        self.ro_prefixes.iter().any(|p| rel.starts_with(Self::rescue_root(p).as_str()))
     }
 
     fn is_ro(&self, rel: &str) -> bool {
@@ -606,6 +747,12 @@ impl Engine {
         }
         self.root_missing = false;
 
+        let rels: Vec<(String, PathBuf)> = paths.iter().filter_map(|p| self.rel(p).map(|r| (r, p.clone()))).collect();
+        let (skip_all, skip) = self.guard_shared_moves(&rels);
+        if skip_all {
+            return true;
+        }
+
         let mut touched = false;
         let mut removed: Vec<String> = Vec::new();
         let mut changed: Vec<String> = Vec::new();
@@ -613,7 +760,7 @@ impl Engine {
         let mut seen = HashSet::new();
         for abs in paths {
             let Some(rel) = self.rel(abs) else { continue };
-            if !self.should_sync(&rel) || !seen.insert(rel.clone()) {
+            if !self.should_sync(&rel) || skip.contains(&rel) || !seen.insert(rel.clone()) {
                 continue;
             }
             touched = true;
@@ -1033,4 +1180,12 @@ fn set_readonly(path: &std::path::Path, ro: bool) {
         perm.set_readonly(ro);
         let _ = std::fs::set_permissions(path, perm);
     }
+}
+
+/// A folder (prefix with trailing slash) or single note shared with or by other people.
+#[derive(Debug, Clone)]
+struct SharedRoot {
+    path: String,
+    is_file: bool,
+    name: String,
 }

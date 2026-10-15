@@ -125,6 +125,20 @@ fn share_mount_edit_revoke_restart() {
     assert_eq!(code, 200, "moving to a folder that is only shared on the other side is fine on this side");
     eventually!(15, b.exists("Projects/a.md"), "moved again", b.proc);
 
+    // Moving the mount folder on disk is undone by the headless client (the plugin blocks it the
+    // same way); only the API/Move… dialog may relocate a mount. The client learns the current
+    // roots within 20 s of the remount.
+    eventually!(30, b.proc.log_contains("shared with other people here: [\"Projects/\"]"), "bob's client knows the new root", b.proc);
+    std::fs::rename(b.path("Projects"), b.path("Elsewhere")).unwrap();
+    eventually!(15, b.exists("Projects/a.md") && !b.exists("Elsewhere"), "mount folder moved back", b.proc);
+    assert!(b.proc.log_contains("must not be moved"), "no warning logged");
+    assert!(a.exists("Projects/X/a.md") && a.exists("Projects/X/new.md"), "owner lost files when bob moved the folder");
+    // Moving a note out of the mount is undone too.
+    std::fs::rename(b.path("Projects/new.md"), b.path("loose.md")).unwrap();
+    eventually!(15, b.exists("Projects/new.md") && !b.exists("loose.md"), "note moved back into the mount", b.proc);
+    assert!(a.exists("Projects/X/new.md"), "owner lost the note");
+    sleep(2.0);
+
     // Owner moves the shared folder itself: still shared, nothing deleted for bob.
     let (code, body) = api_raw(&server, &owner, "PATCH", &format!("/api/shares/{share_id}"), Some(json!({"path": "Work/X"})));
     assert_eq!(code, 200, "{body}");
