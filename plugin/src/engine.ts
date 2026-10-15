@@ -467,15 +467,29 @@ export class SyncEngine {
       }
     }
     if (!this.blobClient) return;
-    try {
-      const data = await this.blobClient.download(meta.hash);
-      if (!data) {
-        console.warn(`[replica] blob for ${path} not on server yet`);
+    // The metadata can arrive before the bytes (slow uploader, or a server-side bridge still
+    // copying), so a 404 is retried with backoff until the blob shows up or it is superseded.
+    const delays = [2000, 5000, 15000, 30000];
+    for (let attempt = 0; ; attempt++) {
+      const client = this.blobClient;
+      if (!client) return;
+      try {
+        const data = await client.download(meta.hash);
+        if (data) {
+          await this.writeBinaryToDisk(path, data, meta.hash);
+          return;
+        }
+      } catch (e) {
+        console.warn(`[replica] download of ${path} failed`, e);
         return;
       }
-      await this.writeBinaryToDisk(path, data, meta.hash);
-    } catch (e) {
-      console.warn(`[replica] download of ${path} failed`, e);
+      if (attempt >= delays.length) {
+        console.warn(`[replica] blob for ${path} never appeared on server, giving up`);
+        return;
+      }
+      console.warn(`[replica] blob for ${path} not on server yet, retrying in ${delays[attempt] / 1000}s`);
+      await new Promise((r) => setTimeout(r, delays[attempt]));
+      if (this.blobs.get(path)?.hash !== meta.hash) return; // superseded or removed meanwhile
     }
   }
 

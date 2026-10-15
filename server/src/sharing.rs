@@ -168,6 +168,8 @@ pub async fn create_share(
         Some(f) => format!("{prefix}{f}"),
         None => prefix.clone(),
     };
+    // Check + insert + attach under one lock, otherwise two concurrent creates could both pass.
+    let _admin = state.docs.share_admin.lock().unwrap();
     match taken_prefixes(&state, &info.id) {
         Ok(taken) => {
             if taken.iter().any(|t| overlaps(t, &full)) {
@@ -368,6 +370,7 @@ pub async fn create_mount(
     let mount_path = clean_path(&body.mount_path.unwrap_or_default());
     let mount_path = if mount_path.is_empty() { format!("Shared/{}", share.name) } else { mount_path };
     let prefix = format!("{mount_path}/");
+    let _admin = state.docs.share_admin.lock().unwrap();
     match taken_prefixes(&state, &info.id) {
         Ok(taken) => {
             if taken.iter().any(|t| overlaps(t, &prefix)) {

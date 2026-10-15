@@ -176,7 +176,7 @@ Leftover `sync` processes keep watching their directory. Kill them before deleti
 - Do not hold a `vaults`/`shares` map guard across a call that locks it again (`if let Some(x) = self.map.lock()...` keeps the guard for the whole `if let`).
 - All vaults that take part in a bridge are loaded at startup (`preload_bridged`), otherwise a share can advance while one end is unloaded and the later reconcile overwrites it.
 
-Scenario test (one server, three users, headless clients as plugins): `share-e2e.sh` in the session scratchpad; a copy belongs in `server/tests/` once it is turned into a Rust integration test.
+Scenario test (one server, three users, headless clients as plugins): `server/scripts/share-e2e.sh`. Needs a debug build (`cargo build` in `server/`), uses port 8798 and a temp dir (`REPLICA_E2E_DIR=… ` to keep it), kills every running `replica-server` first. Covers create, overlap race, mount, both-way and concurrent edits, blobs, read-only revert and rescue copy, revoke, restart, unmount. Turning it into a Rust integration test is still on the list.
 
 ## Tests
 

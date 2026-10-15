@@ -192,6 +192,9 @@ pub struct DocRegistry {
     shares: Mutex<HashMap<String, Arc<LiveDoc>>>,
     bridges: Mutex<Vec<Arc<Bridge>>>,
     pub apply_lock: Mutex<()>,
+    /// Serializes share/mount creation (overlap check + registry insert + bridge attach) so
+    /// two concurrent requests cannot both pass the overlap check. Taken before `apply_lock`.
+    pub share_admin: Mutex<()>,
 }
 
 impl DocRegistry {
@@ -203,6 +206,7 @@ impl DocRegistry {
             shares: Mutex::new(HashMap::new()),
             bridges: Mutex::new(Vec::new()),
             apply_lock: Mutex::new(()),
+            share_admin: Mutex::new(()),
         }
     }
 

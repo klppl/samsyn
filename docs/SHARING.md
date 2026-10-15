@@ -54,7 +54,9 @@ Blobs: when a blob entry crosses a bridge the bytes are copied (hard-linked when
 - Friend mounts → share subtree copied into their vault at the mount prefix; their plugin sees new files arrive like any other remote change.
 - Edits on either side: client → its vault doc → bridge → share doc → bridge → other vault doc → other client. All live.
 - Rename across the boundary: delete on one side, create on the other (as renames already work).
-- Read-only mount: the friend's edits under the mount prefix are reverted by the server to the share's content, so the friend's document stays equal to the share.
+- Read-only mount: the friend's edits under the mount prefix are reverted by the server to the share's content, so the friend's document stays equal to the share. A file the friend creates under the mount (one the share does not have) is not thrown away: before the revert the server copies it to a sibling folder outside the mount, `<mount> (read-only copy)/<same relative path>`, and logs a warning. The same happens if the owner deletes a file while the friend has local content for it.
+- Blobs: when a bridge replays a binary file it copies the bytes into the target store *before* inserting the metadata, so a client that fetches the moment the metadata arrives finds the bytes. The plugin additionally retries a missing blob with backoff (2 s, 5 s, 15 s, 30 s) in case an uploader is slow.
+- Share and mount creation run under one server-wide lock (overlap check, registry insert, bridge attach), so two concurrent requests cannot both pass the overlap check.
 - Revoke grant: mounts made with that ticket stop bridging. Files stay in the friend's vault as ordinary files.
 - Unshare: bridge removed, share document deleted, owner's files untouched; all mounts of it go inert.
 - Unmount: bridge removed, friend's files stay.

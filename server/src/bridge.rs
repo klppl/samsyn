@@ -100,17 +100,76 @@ impl Bridge {
             // Read-only mount: undo the vault-side edits by re-asserting the share's content.
             tracing::info!(mount = ?self.mount_id, "reverting edits on read-only mount");
             let keys: Vec<String> = mapped.iter().map(|(k, _)| k.clone()).collect();
+            self.rescue_unshared(&keys);
             self.assert_keys(&self.share, &self.vault, &keys, false);
             return Some(self.vault.clone());
         }
 
-        apply_changes(target, &source.id, &mapped);
+        // Blob bytes go first: the metadata insert below is broadcast to clients at once and
+        // they fetch immediately, so the target store must already hold the bytes.
         for (k, c) in &mapped {
             if let ChangeKind::BlobSet(a) = &c.kind {
                 copy_blob(source, target, a, k);
             }
         }
+        apply_changes(target, &source.id, &mapped);
         Some(target.clone())
+    }
+
+    /// On a read-only mount, a key (in share terms) that the share does not have but the vault
+    /// does is content the friend created locally. Reverting would silently delete it, so copy
+    /// it first to a sibling folder outside the mount: `<mount> (read-only copy)/<rest>`.
+    fn rescue_unshared(&self, share_keys: &[String]) {
+        let missing: Vec<String> = {
+            let aw = self.share.awareness.lock().unwrap();
+            let txn = aw.doc().transact();
+            let texts = txn.get_map("texts");
+            let blobs = txn.get_map("blobs");
+            share_keys
+                .iter()
+                .filter(|k| {
+                    let in_texts = texts.as_ref().map(|m| m.contains_key(&txn, k)).unwrap_or(false);
+                    let in_blobs = blobs.as_ref().map(|m| m.contains_key(&txn, k)).unwrap_or(false);
+                    !in_texts && !in_blobs
+                })
+                .cloned()
+                .collect()
+        };
+        if missing.is_empty() {
+            return;
+        }
+        let rescue_root = format!("{} (read-only copy)/", self.vault_prefix.trim_end_matches('/'));
+        let mut changes: Vec<(String, Change)> = Vec::new();
+        {
+            let aw = self.vault.awareness.lock().unwrap();
+            let txn = aw.doc().transact();
+            let texts = txn.get_map("texts");
+            let blobs = txn.get_map("blobs");
+            for k in &missing {
+                let Some(vk) = self.share_to_vault_key(k) else { continue };
+                let text = texts.as_ref().and_then(|m| match m.get(&txn, &vk) {
+                    Some(Out::YText(t)) => Some(t.get_string(&txn)),
+                    _ => None,
+                });
+                let blob = blobs.as_ref().and_then(|m| match m.get(&txn, &vk) {
+                    Some(Out::Any(a)) => Some(a),
+                    _ => None,
+                });
+                let kind = match (text, blob) {
+                    (Some(t), _) => ChangeKind::TextSet(t),
+                    (None, Some(b)) => ChangeKind::BlobSet(b),
+                    (None, None) => continue,
+                };
+                let rk = format!("{rescue_root}{k}");
+                tracing::warn!(mount = ?self.mount_id, "read-only mount: keeping new file {vk} as {rk}");
+                changes.push((rk.clone(), Change { key: rk, kind, from: None }));
+            }
+        }
+        if changes.is_empty() {
+            return;
+        }
+        let refs: Vec<(String, &Change)> = changes.iter().map(|(k, c)| (k.clone(), c)).collect();
+        apply_changes(&self.vault, &self.share.id, &refs);
     }
 
     /// Make the non-truth side equal to the truth side for the whole bridged subtree.
@@ -192,12 +251,12 @@ impl Bridge {
             })
             .collect();
         let refs: Vec<(String, &Change)> = changes.iter().map(|(k, c)| (k.clone(), c)).collect();
-        apply_changes(dst, &src.id, &refs);
         for (k, c) in &refs {
             if let ChangeKind::BlobSet(a) = &c.kind {
                 copy_blob(src, dst, a, k);
             }
         }
+        apply_changes(dst, &src.id, &refs);
     }
 }
 
