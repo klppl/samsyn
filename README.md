@@ -107,9 +107,9 @@ The plugin caches the document and its sync bookkeeping in IndexedDB on the devi
 
 Share part of a vault, not all of it, with live editing on both sides. The plugin stays a plain one-vault sync client; the server does the composition (see [docs/SHARING.md](docs/SHARING.md)).
 
-1. Owner: Settings → Replica → **Sharing** → *Share a folder or note*: enter `Projects/X` (or right-click a folder or note → **Replica: Share…**) → **Create**. Copy the ticket. One ticket = exactly that folder or note; make a new share for anything else.
-2. Friend: Settings → Replica → **Sharing** → *Add from ticket*: paste, choose a mount path (default `Shared/X`), **Mount**. The files appear and stay live in both directions.
-3. Tickets can be read-only. Revoke a ticket, or unshare, at any time; the friend keeps their copy as ordinary notes.
+1. Owner: right-click a folder or note → **Replica: Share…** (or Settings → Replica → **Sharing** → *Share a folder or note…*). Pick read & write or read only, **Create share**, copy the ticket. One ticket = exactly that folder or note; issue one ticket per person so you can revoke them separately.
+2. Friend: Settings → Replica → **Sharing** → *Add from ticket…*: paste, see what it is (name, access, which server), choose where it goes (default `Shared/X`), **Mount**. The files appear and stay live in both directions.
+3. While both edit, each sees the other's presence inside the shared folder. Revoke a ticket, or unshare, at any time; the friend is told in their Sharing tab and keeps their copy as ordinary notes.
 
 The two users can be on the same server or on different ones. Between servers the share travels over an encrypted [iroh](https://iroh.computer) connection: no open ports, no public address, NAT traversal through a relay (public n0 relays by default, `--relay <url>` for your own, `--relay none` for LAN only). The ticket carries the owner server's node id and addresses; the friend's server verifies the ticket with the owner before mounting, then keeps a local replica in sync. `--p2p-port` (UDP, default 8788) is worth keeping fixed; forwarding it is optional. `--no-p2p` turns all of this off.
 

@@ -12,7 +12,7 @@ bad() { echo "FAIL $1"; FAIL=1; }
 check() { if eval "$2"; then ok "$1"; else bad "$1"; fi }
 pkill -f "replica-server" ; sleep 0.5
 rm -rf "${S:?}/sdata" "${S:?}/A" "${S:?}/B" "${S:?}/C"; mkdir -p $S/A/Projects/X/sub $S/B $S/C
-($BIN --data-dir $S/sdata serve --bind 127.0.0.1:$PORT > $S/share-server.log 2>&1 &); sleep 1.5
+($BIN --data-dir $S/sdata serve --bind 127.0.0.1:$PORT --no-p2p > $S/share-server.log 2>&1 &); sleep 1.5
 OWNER=$(grep -o 'rp_[0-9a-f]*' $S/share-server.log | head -1)
 BOB=$($BIN --data-dir $S/sdata user add bob | grep -o 'rp_[0-9a-f]*')
 CAROL=$($BIN --data-dir $S/sdata user add carol | grep -o 'rp_[0-9a-f]*')
@@ -69,6 +69,10 @@ check "carol got blob" 'cmp -s $S/A/Projects/X/pic.png $S/C/Shared/X/pic.png'
 echo "carol-edit" >> $S/C/Shared/X/a.md; sleep 3
 check "carol edit not in owner" '! grep -q carol-edit $S/A/Projects/X/a.md'
 check "carol edit reverted locally" '! grep -q carol-edit $S/C/Shared/X/a.md'
+# the headless client refreshes its read-only list every 20 s
+n=50; while [ $n -gt 0 ] && [ -w $S/C/Shared/X/a.md ]; do sleep 0.5; n=$((n-1)); done
+check "carol's files are read-only on disk" '[ ! -w $S/C/Shared/X/a.md ]'
+check "headless client logged the read-only share" 'grep -q "read-only share" $S/sC.log'
 echo "== carol creates a file on the ro mount: kept as read-only copy"
 echo "carol-new" > $S/C/Shared/X/carol.md; printf 'BM carol' > $S/C/Shared/X/carol.bmp; sleep 4
 check "carol.md removed from mount" '[ ! -f $S/C/Shared/X/carol.md ]'
@@ -82,7 +86,7 @@ echo "after-revoke" >> $S/A/Projects/X/a.md; sleep 2
 check "bob still receives after carol revoke" 'grep -q after-revoke $S/B/Shared/X/a.md'
 check "carol stopped receiving" '! grep -q after-revoke $S/C/Shared/X/a.md'
 echo "== restart server, bridges reattach"; pkill -f "replica-server --data-dir"; sleep 1
-($BIN --data-dir $S/sdata serve --bind 127.0.0.1:$PORT >> $S/share-server.log 2>&1 &); sleep 4
+($BIN --data-dir $S/sdata serve --bind 127.0.0.1:$PORT --no-p2p >> $S/share-server.log 2>&1 &); sleep 4
 echo "after-restart" >> $S/B/Shared/X/a.md; sleep 3
 check "edit flows after restart" 'grep -q after-restart $S/A/Projects/X/a.md'
 echo "== unmount bob (files stay)"; MID=$(api $BOB $U/api/vaults/vb/sharing | j 'print(d["mounts"][0]["id"])'); api $BOB -X DELETE $U/api/mounts/$MID -o /dev/null -w "unmount -> %{http_code}\n"

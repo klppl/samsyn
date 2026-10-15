@@ -6,6 +6,7 @@ export interface Grant {
   access: string;
   created_at: string;
   revoked_at: string | null;
+  mounted_by: number;
 }
 export interface ShareRow {
   id: string;
@@ -23,6 +24,18 @@ export interface MountRow {
   mount_path: string;
   access: string;
   status: string;
+}
+export interface TicketInfo {
+  share_id: string;
+  name: string;
+  access: string;
+  node_id: string;
+  same_server: boolean;
+  p2p_available: boolean;
+  /** true/false for shares on this server; null when the owner is another server. */
+  valid: boolean | null;
+  /** Set when the ticket points at a share from one of your own vaults. */
+  from_own_vault: string | null;
 }
 export interface SharingInfo {
   node_id: string;
@@ -82,6 +95,9 @@ export class ReplicaApi {
   }
   mount(ticket: string, mountPath: string): Promise<{ mount_path: string; access: string }> {
     return this.call("POST", `/api/vaults/${this.vault()}/mounts`, { ticket, mount_path: mountPath || undefined });
+  }
+  inspectTicket(ticket: string): Promise<TicketInfo> {
+    return this.call("POST", `/api/tickets/inspect`, { ticket });
   }
   unmount(mountId: string): Promise<void> {
     return this.call("DELETE", `/api/mounts/${mountId}`);

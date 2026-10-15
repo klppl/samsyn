@@ -48,6 +48,8 @@ pub struct Engine {
     recent_deletes: VecDeque<(Instant, usize)>,
     /// Blobs the document references but the server did not have yet: (meta, retry at, attempts).
     pending_blobs: HashMap<String, (BlobMeta, Instant, u32)>,
+    /// Mount prefixes ("Shared/X/") that are read-only for us; local edits there are not pushed.
+    ro_prefixes: Vec<String>,
     pub synced: bool,
     pub had_cached_doc: bool,
     pub pending_deletions: Vec<String>,
@@ -153,6 +155,7 @@ impl Engine {
             root_missing: false,
             recent_deletes: VecDeque::new(),
             pending_blobs: HashMap::new(),
+            ro_prefixes: Vec::new(),
             synced: false,
             had_cached_doc,
             pending_deletions: Vec::new(),
@@ -253,6 +256,87 @@ impl Engine {
         let _ = tx.send(enc.to_vec());
         *self.conn.lock().unwrap() = Some(tx);
         tracing::info!("connected");
+    }
+
+    /// Ask the server which mounts in this vault are read-only, so edits under them are not
+    /// pushed (the server would revert them anyway) and the files are marked read-only on disk.
+    pub async fn refresh_sharing(&mut self) {
+        let url = format!("{}/api/vaults/{}/sharing", self.args.http_base(), self.args.vault);
+        let res = match self.http.get(&url).bearer_auth(&self.args.token).send().await {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::debug!("sharing info unavailable: {e}");
+                return;
+            }
+        };
+        let Ok(body) = res.bytes().await else { return };
+        let Ok(v) = serde_json::from_slice::<serde_json::Value>(&body) else { return };
+        let mut ro: Vec<String> = v["mounts"]
+            .as_array()
+            .map(|ms| {
+                ms.iter()
+                    .filter(|m| m["access"].as_str() == Some("ro") && m["status"].as_str() != Some("revoked"))
+                    .filter_map(|m| m["mount_path"].as_str().map(|p| format!("{}/", p.trim_end_matches('/'))))
+                    .collect()
+            })
+            .unwrap_or_default();
+        ro.sort();
+        if ro == self.ro_prefixes {
+            return;
+        }
+        let was = std::mem::replace(&mut self.ro_prefixes, ro);
+        for p in &self.ro_prefixes {
+            tracing::info!("{p} is a read-only share: edits there are not synced and are restored from the server");
+        }
+        // Flip permissions on disk for prefixes that changed state.
+        for p in was.iter().chain(self.ro_prefixes.iter()) {
+            let now_ro = self.ro_prefixes.contains(p);
+            for e in walkdir::WalkDir::new(self.abs(p.trim_end_matches('/'))).into_iter().flatten() {
+                if e.file_type().is_file() {
+                    set_readonly(e.path(), now_ro);
+                }
+            }
+        }
+    }
+
+    fn is_ro(&self, rel: &str) -> bool {
+        self.ro_prefixes.iter().any(|p| rel.starts_with(p.as_str()))
+    }
+
+    fn protect_if_ro(&self, rel: &str) {
+        if self.is_ro(rel) {
+            set_readonly(&self.abs(rel), true);
+        }
+    }
+
+    /// A local change under a read-only mount: put the server's version back. A file the
+    /// share does not have is moved to `<mount> (read-only copy)/…`, like the server does for
+    /// plugin clients, so nothing the user wrote is lost.
+    async fn undo_ro_edit(&mut self, rel: &str) {
+        let prefix = self.ro_prefixes.iter().find(|p| rel.starts_with(p.as_str())).cloned().unwrap_or_default();
+        let in_doc = {
+            let txn = self.doc().transact();
+            self.texts.contains_key(&txn, rel) || self.blobs.contains_key(&txn, rel)
+        };
+        let abs = self.abs(rel);
+        if in_doc {
+            tracing::warn!("{rel} is in a read-only share; restoring the server's version");
+            self.base.remove(rel);
+            if let Err(e) = self.apply_remote(rel).await {
+                tracing::warn!("restoring {rel} failed: {e}");
+            }
+        } else if abs.is_file() {
+            let rest = rel.strip_prefix(prefix.as_str()).unwrap_or(rel);
+            let rescue = format!("{} (read-only copy)/{rest}", prefix.trim_end_matches('/'));
+            let dst = self.abs(&rescue);
+            tracing::warn!("{rel} is in a read-only share; keeping it as {rescue}");
+            if let Some(parent) = dst.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            if let Err(e) = std::fs::rename(&abs, &dst) {
+                tracing::warn!("moving {rel} aside failed: {e}");
+            }
+        }
     }
 
     pub fn on_disconnected(&mut self) {
@@ -396,6 +480,7 @@ impl Engine {
         self.mark_synced(rel, hash_bytes(content.as_bytes()));
         self.base.insert(rel.to_string(), content.to_string());
         write_atomic(&self.abs(rel), content.as_bytes())?;
+        self.protect_if_ro(rel);
         tracing::info!("wrote {rel}");
         Ok(())
     }
@@ -454,6 +539,7 @@ impl Engine {
         let bytes = res.error_for_status()?.bytes().await?;
         self.mark_synced(rel, meta.hash.clone());
         write_atomic(&abs, &bytes)?;
+        self.protect_if_ro(rel);
         tracing::info!("downloaded {rel} ({} bytes)", bytes.len());
         Ok(())
     }
@@ -492,6 +578,7 @@ impl Engine {
         let mut touched = false;
         let mut removed: Vec<String> = Vec::new();
         let mut changed: Vec<String> = Vec::new();
+        let mut ro_touched: Vec<String> = Vec::new();
         let mut seen = HashSet::new();
         for abs in paths {
             let Some(rel) = self.rel(abs) else { continue };
@@ -499,6 +586,10 @@ impl Engine {
                 continue;
             }
             touched = true;
+            if self.is_ro(&rel) {
+                ro_touched.push(rel);
+                continue;
+            }
             if abs.exists() {
                 changed.push(rel);
             } else {
@@ -543,6 +634,9 @@ impl Engine {
             if let Err(e) = self.push_local(&rel).await {
                 tracing::warn!("pushing {rel} failed: {e}");
             }
+        }
+        for rel in ro_touched {
+            self.undo_ro_edit(&rel).await;
         }
         touched
     }
@@ -899,5 +993,13 @@ impl BlobMeta {
         m.insert("size".to_string(), Any::Number(yrs::Number::from(self.size as f64)));
         m.insert("mtime".to_string(), Any::Number(yrs::Number::from(self.mtime)));
         Any::Map(Arc::new(m))
+    }
+}
+
+fn set_readonly(path: &std::path::Path, ro: bool) {
+    if let Ok(meta) = std::fs::metadata(path) {
+        let mut perm = meta.permissions();
+        perm.set_readonly(ro);
+        let _ = std::fs::set_permissions(path, perm);
     }
 }

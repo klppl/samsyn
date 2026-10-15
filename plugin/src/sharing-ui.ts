@@ -1,65 +1,90 @@
 import { Notice, Setting } from "obsidian";
 import { ReplicaApi, SharingInfo } from "./api";
 import type ReplicaPlugin from "./main";
+import { ConfirmModal, MountModal, NewTicketModal, ShareModal } from "./sharing-modals";
 
-async function copy(text: string, what = "Ticket"): Promise<void> {
-  try {
-    await navigator.clipboard.writeText(text);
-    new Notice(`${what} copied to clipboard`);
-  } catch {
-    new Notice(`Could not access the clipboard; select and copy the ${what.toLowerCase()} manually`);
-  }
+const accessText = (a: string) => (a === "ro" ? "read only" : "read & write");
+
+function describeStatus(status: string): string {
+  if (status === "active") return "live, same server";
+  if (status === "remote: connected") return "live over the server link";
+  if (status.startsWith("remote: connecting") || status.startsWith("remote: starting")) return "connecting to the owner's server…";
+  if (status.startsWith("remote: reconnecting")) return `owner's server unreachable, retrying (${status.slice("remote: reconnecting".length).trim()})`;
+  if (status.startsWith("remote: offline")) return "offline: p2p is disabled on this server";
+  return status;
 }
 
-function showTicket(container: HTMLElement, ticket: string, label: string): void {
-  container.empty();
-  const box = container.createDiv({ cls: "replica-ticket" });
-  box.createDiv({ cls: "replica-ticket-label", text: `Ticket "${label}" (shown once; copy it now)` });
-  const ta = box.createEl("textarea", { cls: "replica-ticket-text" });
-  ta.value = ticket;
-  ta.readOnly = true;
-  ta.rows = 3;
-  ta.onclick = () => ta.select();
-  new Setting(box).addButton((b) => b.setButtonText("Copy ticket").setCta().onClick(() => void copy(ticket)));
-}
-
-/** Renders the Sharing section of the settings tab. Pure UI over the server API. */
+/**
+ * The Sharing tab: what I share (with its tickets) and what others share with me. Every action
+ * that produces a ticket or needs confirmation opens a modal, so the list can refresh underneath
+ * without losing what the user is looking at.
+ */
 export class SharingSection {
   private api: ReplicaApi;
   private info: SharingInfo | null = null;
   private error: string | null = null;
+  private timer: ReturnType<typeof setInterval> | null = null;
 
-  constructor(private plugin: ReplicaPlugin, private root: HTMLElement) {
+  constructor(
+    private plugin: ReplicaPlugin,
+    private root: HTMLElement,
+  ) {
     this.api = new ReplicaApi(plugin.settings);
   }
 
-  async load(): Promise<void> {
-    this.error = null;
+  /** Poll while the tab is open so link status and revocations show up on their own. */
+  start(): void {
+    this.stop();
+    this.timer = setInterval(() => void this.load(true), 10_000);
+  }
+
+  stop(): void {
+    if (this.timer) clearInterval(this.timer);
+    this.timer = null;
+  }
+
+  async load(quiet = false): Promise<void> {
+    const before = this.info;
     try {
-      this.info = await this.api.sharing();
+      const next = await this.api.sharing();
+      this.error = null;
+      if (before) this.announceChanges(before, next);
+      if (quiet && JSON.stringify(before) === JSON.stringify(next)) return;
+      this.info = next;
     } catch (e) {
+      if (quiet) return;
       this.info = null;
       this.error = (e as Error).message;
     }
     this.render();
   }
 
-  private async act(label: string, fn: () => Promise<unknown>): Promise<void> {
-    try {
+  private announceChanges(before: SharingInfo, after: SharingInfo): void {
+    for (const m of after.mounts) {
+      const old = before.mounts.find((x) => x.id === m.id);
+      if (old && old.status !== m.status && m.status.startsWith("revoked")) {
+        new Notice(`Replica: access to "${m.name}" (${m.mount_path}) was revoked by the owner. Your copy stays as ordinary notes.`, 10000);
+      }
+    }
+    for (const s of after.shares) {
+      const old = before.shares.find((x) => x.id === s.id);
+      if (old && s.mounted_by > old.mounted_by) new Notice(`Replica: someone mounted "${s.name}"`);
+    }
+  }
+
+  private confirm(title: string, body: string, button: string, fn: () => Promise<void>): void {
+    new ConfirmModal(this.plugin.app, title, body, button, async () => {
       await fn();
       await this.load();
-    } catch (e) {
-      new Notice(`Replica: ${label} failed: ${(e as Error).message}`, 8000);
-    }
+    }).open();
   }
 
   render(): void {
     const el = this.root;
     el.empty();
-    new Setting(el).setName("Sharing").setHeading();
 
     if (this.error) {
-      el.createDiv({ cls: "replica-diag", text: `Cannot reach the sharing API: ${this.error}` });
+      el.createDiv({ cls: "replica-diag replica-error", text: `Cannot reach the sharing API: ${this.error}` });
       new Setting(el).addButton((b) => b.setButtonText("Retry").onClick(() => void this.load()));
       return;
     }
@@ -68,85 +93,60 @@ export class SharingSection {
       return;
     }
     const info = this.info;
+    const reload = () => void this.load();
 
     // ---------------------------------------------------------- shared by me
-    new Setting(el).setName("Shared by me").setDesc("Folders or notes from this vault that others can edit live with you.");
-    const ticketOut = el.createDiv();
-
-    let path = this.plugin.pendingSharePath ?? "";
-    this.plugin.pendingSharePath = null;
-    let name = "";
-    let access = "rw";
-    const create = new Setting(el)
-      .setName("Share a folder or note")
-      .setDesc("Path inside the vault, e.g. Projects/X or Notes/plan.md. One ticket covers exactly this path.");
-    create.addText((t) => {
-      t.setPlaceholder("Projects/X").setValue(path).onChange((v) => (path = v));
-      t.inputEl.addClass("replica-wide");
-    });
-    create.addText((t) => t.setPlaceholder("name (optional)").onChange((v) => (name = v)));
-    create.addDropdown((d) => d.addOptions({ rw: "read & write", ro: "read only" }).setValue(access).onChange((v) => (access = v)));
-    create.addButton((b) =>
-      b
-        .setButtonText("Create")
-        .setCta()
-        .onClick(() =>
-          this.act("create share", async () => {
-            if (!path.trim()) throw new Error("enter a path");
-            const r = await this.api.createShare(path.trim(), name.trim(), access);
-            showTicket(ticketOut, r.ticket, r.label);
-            new Notice(`Replica: sharing ${r.share.path}`);
-          }),
-        ),
-    );
+    new Setting(el)
+      .setName("Shared by me")
+      .setHeading()
+      .setDesc("Folders or notes from this vault that other people edit live with you. Each person gets their own ticket.")
+      .addButton((b) =>
+        b
+          .setButtonText("Share a folder or note…")
+          .setCta()
+          .onClick(() => new ShareModal(this.plugin, "", reload).open()),
+      );
 
     if (info.shares.length === 0) {
-      el.createDiv({ cls: "replica-diag", text: "Nothing shared yet." });
+      el.createDiv({ cls: "replica-empty", text: "Nothing shared yet. Right-click a folder or note and choose “Replica: Share…”, or use the button above." });
     }
     for (const s of info.shares) {
+      const card = el.createDiv({ cls: "replica-card" });
       const active = s.grants.filter((g) => !g.revoked_at);
-      const row = new Setting(el)
-        .setName(`${s.name}  ·  ${s.path}`)
-        .setDesc(`${active.length} active ticket${active.length === 1 ? "" : "s"}, mounted by ${s.mounted_by}`);
-      row.addButton((b) =>
-        b.setButtonText("New ticket").onClick(() =>
-          this.act("new ticket", async () => {
-            const r = await this.api.newTicket(s.id, "rw");
-            showTicket(ticketOut, r.ticket, r.label);
-          }),
-        ),
-      );
-      row.addButton((b) =>
-        b.setButtonText("New read-only ticket").onClick(() =>
-          this.act("new ticket", async () => {
-            const r = await this.api.newTicket(s.id, "ro");
-            showTicket(ticketOut, r.ticket, r.label);
-          }),
-        ),
-      );
-      row.addButton((b) =>
-        b
-          .setButtonText("Unshare")
-          .setWarning()
-          .onClick(() =>
-            this.act("unshare", async () => {
-              await this.api.unshare(s.id);
-              new Notice(`Replica: ${s.name} is no longer shared. Your files are untouched.`);
-            }),
-          ),
-      );
+      new Setting(card)
+        .setName(s.name)
+        .setDesc(`${s.path} · ${active.length} active ticket${active.length === 1 ? "" : "s"} · mounted by ${s.mounted_by}`)
+        .setClass("replica-card-head")
+        .addButton((b) => b.setButtonText("New ticket…").onClick(() => new NewTicketModal(this.plugin, s, reload).open()))
+        .addButton((b) =>
+          b
+            .setButtonText("Unshare")
+            .setWarning()
+            .onClick(() =>
+              this.confirm(
+                `Stop sharing ${s.name}?`,
+                `Everyone who mounted ${s.path} stops receiving changes. They keep their copy as ordinary notes; your files are untouched.`,
+                "Unshare",
+                () => this.api.unshare(s.id),
+              ),
+            ),
+        );
       for (const g of s.grants) {
-        const gr = new Setting(el)
+        const uses = g.mounted_by ? ` · mounted by ${g.mounted_by}` : "";
+        const row = new Setting(card)
           .setClass("replica-grant")
-          .setName(`ticket "${g.label}" · ${g.access === "ro" ? "read only" : "read & write"}`)
-          .setDesc(g.revoked_at ? `revoked ${g.revoked_at.slice(0, 10)}` : `issued ${g.created_at.slice(0, 10)}`);
-        if (!g.revoked_at) {
-          gr.addButton((b) =>
+          .setName(`ticket “${g.label}”`)
+          .setDesc(g.revoked_at ? `${accessText(g.access)} · revoked ${g.revoked_at.slice(0, 10)}` : `${accessText(g.access)} · issued ${g.created_at.slice(0, 10)}${uses}`);
+        if (g.revoked_at) row.setClass("replica-revoked");
+        else {
+          row.addButton((b) =>
             b.setButtonText("Revoke").onClick(() =>
-              this.act("revoke", async () => {
-                await this.api.revoke(s.id, g.label);
-                new Notice(`Replica: ticket "${g.label}" revoked`);
-              }),
+              this.confirm(
+                `Revoke ticket “${g.label}”?`,
+                `Anyone who mounted ${s.name} with this ticket stops receiving changes and can no longer push edits. Other tickets keep working.`,
+                "Revoke",
+                () => this.api.revoke(s.id, g.label),
+              ),
             ),
           );
         }
@@ -154,41 +154,33 @@ export class SharingSection {
     }
 
     // ---------------------------------------------------------- shared with me
-    new Setting(el).setName("Shared with me").setDesc("Paste a ticket from someone else to get their folder or note in this vault.");
-    let ticket = "";
-    let mountPath = "";
-    const add = new Setting(el).setName("Add from ticket").setDesc("Mount path defaults to Shared/<name>. It must be an empty or new folder.");
-    add.addTextArea((t) => {
-      t.setPlaceholder("replica…").onChange((v) => (ticket = v));
-      t.inputEl.rows = 2;
-      t.inputEl.addClass("replica-wide");
-    });
-    add.addText((t) => t.setPlaceholder("Shared/Name").onChange((v) => (mountPath = v)));
-    add.addButton((b) =>
-      b
-        .setButtonText("Mount")
-        .setCta()
-        .onClick(() =>
-          this.act("mount", async () => {
-            if (!ticket.trim()) throw new Error("paste a ticket first");
-            const r = await this.api.mount(ticket.trim(), mountPath.trim());
-            new Notice(`Replica: mounted at ${r.mount_path} (${r.access === "ro" ? "read only" : "read & write"}). Files arrive shortly.`);
-          }),
-        ),
-    );
+    new Setting(el)
+      .setName("Shared with me")
+      .setHeading()
+      .setDesc("Folders or notes other people share with you. They live in a folder of your choice and sync live.")
+      .addButton((b) =>
+        b
+          .setButtonText("Add from ticket…")
+          .setCta()
+          .onClick(() => new MountModal(this.plugin, reload).open()),
+      );
     if (info.mounts.length === 0) {
-      el.createDiv({ cls: "replica-diag", text: "Nothing mounted." });
+      el.createDiv({ cls: "replica-empty", text: "Nothing mounted. Paste a ticket someone sent you with the button above." });
     }
     for (const m of info.mounts) {
-      const row = new Setting(el)
-        .setName(`${m.name}  ·  ${m.mount_path}`)
-        .setDesc(`${m.access === "ro" ? "read only" : "read & write"} · ${m.status}`);
+      const revoked = m.status.startsWith("revoked");
+      const card = el.createDiv({ cls: "replica-card" + (revoked ? " replica-revoked" : "") });
+      const row = new Setting(card).setName(m.name).setClass("replica-card-head");
+      if (revoked) row.setDesc(`${m.mount_path} · access revoked by the owner · no longer syncing · your copy stays as ordinary notes`);
+      else row.setDesc(`${m.mount_path} · ${accessText(m.access)} · ${describeStatus(m.status)}`);
       row.addButton((b) =>
-        b.setButtonText("Unmount").onClick(() =>
-          this.act("unmount", async () => {
-            await this.api.unmount(m.id);
-            new Notice(`Replica: unmounted ${m.mount_path}. The files stay in your vault as ordinary notes.`);
-          }),
+        b.setButtonText(revoked ? "Remove" : "Unmount").onClick(() =>
+          this.confirm(
+            revoked ? `Remove ${m.name} from the list?` : `Unmount ${m.name}?`,
+            `The files under ${m.mount_path} stay in your vault as ordinary notes; they just stop syncing with the owner.`,
+            revoked ? "Remove" : "Unmount",
+            () => this.api.unmount(m.id),
+          ),
         ),
       );
     }

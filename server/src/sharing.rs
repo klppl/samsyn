@@ -77,7 +77,20 @@ pub async fn get_sharing(
     let mut shares_json = Vec::new();
     for s in shares {
         let grants = reg.grants_for_share(&s.id).unwrap_or_default();
-        let mounts = reg.mounts_for_share(&s.id).map(|m| m.iter().filter(|m| m.revoked_at.is_none()).count()).unwrap_or(0);
+        let all_mounts = reg.mounts_for_share(&s.id).unwrap_or_default();
+        let mounts = all_mounts.iter().filter(|m| m.revoked_at.is_none()).count();
+        // Local mounts carry the ticket secret, so they can be attributed to a ticket.
+        let grants: Vec<serde_json::Value> = grants
+            .iter()
+            .map(|g| {
+                let hash = reg.grant_secret_hash(&s.id, &g.label).ok().flatten();
+                let mounted_by = all_mounts
+                    .iter()
+                    .filter(|m| m.revoked_at.is_none() && hash.as_deref() == Some(crate::ids::token_hash(&m.secret).as_str()))
+                    .count();
+                serde_json::json!({ "label": g.label, "access": g.access, "created_at": g.created_at, "revoked_at": g.revoked_at, "mounted_by": mounted_by })
+            })
+            .collect();
         shares_json.push(serde_json::json!({
             "id": s.id, "name": s.name, "prefix": s.prefix, "only_file": s.only_file,
             "path": match &s.only_file { Some(f) => format!("{}{}", s.prefix, f), None => s.prefix.trim_end_matches('/').to_string() },
@@ -412,6 +425,60 @@ pub async fn create_mount(
     }
     tracing::info!(user = %user.name, share = %share_name, remote, "mounted at {prefix} via {label} ({access})");
     Json(serde_json::json!({ "mount": mount, "mount_path": mount_path, "access": access })).into_response()
+}
+
+// ------------------------------------------------------------------ POST /api/tickets/inspect
+
+#[derive(Deserialize)]
+pub struct InspectTicket {
+    pub ticket: String,
+}
+
+/// Tell the UI what a pasted ticket is before mounting it: name, access, which server it
+/// belongs to and, for shares on this server, whether it is still valid.
+pub async fn inspect_ticket(
+    Query(query): Query<HashMap<String, String>>,
+    headers: HeaderMap,
+    State(state): State<SharedState>,
+    Json(body): Json<InspectTicket>,
+) -> Response {
+    if let Err(r) = authenticate(&state, &headers, &query) {
+        return r;
+    }
+    let ticket = match Ticket::decode(&body.ticket) {
+        Ok(t) => t,
+        Err(e) => return err(StatusCode::BAD_REQUEST, format!("bad ticket: {e}")),
+    };
+    let same_server = ticket.node_id == state.docs.node_id;
+    let (valid, access, own) = if same_server {
+        let reg = state.storage.registry();
+        match reg.share_by_id(&ticket.share_id) {
+            Ok(Some(s)) => match reg.check_grant(&s.id, &ticket.secret) {
+                Ok(Some((_, grant_access))) => {
+                    let a = if grant_access == "ro" || ticket.access == "ro" { "ro" } else { "rw" };
+                    (Some(true), a.to_string(), Some(s.vault_id))
+                }
+                _ => (Some(false), ticket.access.clone(), None),
+            },
+            _ => (Some(false), ticket.access.clone(), None),
+        }
+    } else {
+        (None, ticket.access.clone(), None)
+    };
+    let own_vault = own
+        .and_then(|vid| state.storage.registry().vault_by_id(&vid).ok().flatten())
+        .map(|v| v.name);
+    Json(serde_json::json!({
+        "share_id": ticket.share_id,
+        "name": ticket.name,
+        "access": access,
+        "node_id": ticket.node_id,
+        "same_server": same_server,
+        "p2p_available": state.docs.endpoint.is_some(),
+        "valid": valid,
+        "from_own_vault": own_vault,
+    }))
+    .into_response()
 }
 
 // ------------------------------------------------------------------ DELETE /api/mounts/{id}

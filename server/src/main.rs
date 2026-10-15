@@ -10,6 +10,7 @@ mod cli;
 mod client;
 mod config;
 mod ids;
+mod presence;
 mod remote;
 mod sharing;
 mod storage;
@@ -100,20 +101,29 @@ async fn serve(args: ServeArgs, storage: Storage) -> anyhow::Result<()> {
         tracing::info!("p2p disabled; tickets only work between vaults on this server");
         None
     } else {
-        let ep = remote::bind_endpoint(identity, &args.relay, args.p2p_port).await?;
-        let relays_off = args.relay.iter().any(|r| r.trim() == "none");
-        tracing::info!("p2p endpoint bound ({})", if relays_off { "direct only, no relay" } else { "relay + direct" });
-        {
-            // Relay registration can take a few seconds; do not hold up HTTP for it.
-            let ep = ep.clone();
-            tokio::spawn(async move {
-                if !relays_off && tokio::time::timeout(Duration::from_secs(20), ep.online()).await.is_err() {
-                    tracing::warn!("p2p endpoint not online after 20 s (relay unreachable?); direct connections may still work");
+        match remote::bind_endpoint(identity, &args.relay, args.p2p_port).await {
+            Ok(ep) => {
+                let relays_off = args.relay.iter().any(|r| r.trim() == "none");
+                tracing::info!("p2p endpoint bound ({})", if relays_off { "direct only, no relay" } else { "relay + direct" });
+                {
+                    // Relay registration can take a few seconds; do not hold up HTTP for it.
+                    let ep = ep.clone();
+                    tokio::spawn(async move {
+                        if !relays_off && tokio::time::timeout(Duration::from_secs(20), ep.online()).await.is_err() {
+                            tracing::warn!("p2p endpoint not online after 20 s (relay unreachable?); direct connections may still work");
+                        }
+                        tracing::info!("p2p addresses: {:?}", remote::addr_strings(&ep));
+                    });
                 }
-                tracing::info!("p2p addresses: {:?}", remote::addr_strings(&ep));
-            });
+                Some(ep)
+            }
+            Err(e) => {
+                // A busy UDP port must not take the sync server down; only server-to-server
+                // shares are affected.
+                tracing::error!("p2p endpoint unavailable (port {} busy?): {e:#}; continuing without server-to-server sharing", args.p2p_port);
+                None
+            }
         }
-        Some(ep)
     };
 
     let max_blob = args.max_blob_mb * 1024 * 1024;
@@ -125,6 +135,7 @@ async fn serve(args: ServeArgs, storage: Storage) -> anyhow::Result<()> {
     });
     let state: SharedState = Arc::new(AppState { docs, storage, serve: args });
 
+    state.docs.start_presence_mirror();
     state.docs.preload_bridged();
 
     let app = Router::new()
@@ -139,6 +150,7 @@ async fn serve(args: ServeArgs, storage: Storage) -> anyhow::Result<()> {
         .route("/api/shares/{id}/grants/{label}", delete(sharing::revoke_ticket))
         .route("/api/vaults/{vault}/mounts", post(sharing::create_mount))
         .route("/api/mounts/{id}", delete(sharing::delete_mount))
+        .route("/api/tickets/inspect", post(sharing::inspect_ticket))
         .route(
             "/blobs/{vault}/{hash}",
             put(blobs::put_blob).get(blobs::get_blob).layer(DefaultBodyLimit::max(max_blob)),

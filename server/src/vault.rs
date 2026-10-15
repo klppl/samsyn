@@ -12,6 +12,7 @@ use yrs::updates::encoder::{Encode, Encoder, EncoderV1};
 use yrs::{Any, DeepObservable, GetString, Map, Observable, Out, ReadTxn, StateVector, Transact};
 
 use crate::bridge::{Bridge, Change, ChangeKind, OwnedDelta, Side};
+use crate::presence::{PresenceEvent, PresenceSender};
 use crate::storage::{MountInfo, ShareInfo, Storage, User, VaultInfo, VaultStore};
 
 const BROADCAST_CAPACITY: usize = 4096;
@@ -36,7 +37,7 @@ pub struct LiveDoc {
 }
 
 impl LiveDoc {
-    fn load(id: String, label: String, kind: DocKind, store: VaultStore) -> anyhow::Result<Arc<Self>> {
+    fn load(id: String, label: String, kind: DocKind, store: VaultStore, presence: Option<PresenceSender>) -> anyhow::Result<Arc<Self>> {
         let (doc, n) = store.load_doc()?;
         if store.needs_compaction() {
             let full = doc.transact().encode_state_as_update_v1(&StateVector::default());
@@ -126,8 +127,12 @@ impl LiveDoc {
         let mut awareness = Awareness::new(doc);
         {
             let tx = tx.clone();
+            let doc_id = id.clone();
             awareness.on_update("replica", move |aw, event, _origin| {
                 if let Ok(update) = aw.update_with_clients(event.all_changes()) {
+                    if let Some(p) = &presence {
+                        let _ = p.send((doc_id.clone(), update.clone()));
+                    }
                     let _ = tx.send(encode_message(&Message::Awareness(update)));
                 }
             });
@@ -201,6 +206,9 @@ pub struct DocRegistry {
     pub endpoint: Option<iroh::Endpoint>,
     /// Largest blob we accept over a p2p link (same limit as the HTTP blob route).
     pub max_blob_bytes: usize,
+    /// Awareness changes of every loaded document, consumed by the presence mirror task.
+    presence_tx: PresenceSender,
+    presence_rx: Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<PresenceEvent>>>,
     /// Running link tasks for remote mounts, by mount id.
     links: Mutex<HashMap<String, tokio::task::JoinHandle<()>>>,
     link_status: Mutex<HashMap<String, String>>,
@@ -208,7 +216,10 @@ pub struct DocRegistry {
 
 impl DocRegistry {
     pub fn new(storage: Storage, node_id: String, endpoint: Option<iroh::Endpoint>, max_blob_bytes: usize) -> Self {
+        let (presence_tx, presence_rx) = tokio::sync::mpsc::unbounded_channel();
         Self {
+            presence_tx,
+            presence_rx: Mutex::new(Some(presence_rx)),
             storage,
             node_id,
             vaults: Mutex::new(HashMap::new()),
@@ -221,6 +232,20 @@ impl DocRegistry {
             links: Mutex::new(HashMap::new()),
             link_status: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Start mirroring presence across bridges. Call once, inside the tokio runtime.
+    pub fn start_presence_mirror(self: &Arc<Self>) {
+        if let Some(rx) = self.presence_rx.lock().unwrap().take() {
+            crate::presence::spawn(self.clone(), rx);
+        }
+    }
+
+    pub fn doc_by_id(&self, id: &str) -> Option<Arc<LiveDoc>> {
+        if let Some(v) = self.vaults.lock().unwrap().get(id).cloned() {
+            return Some(v);
+        }
+        self.shares.lock().unwrap().get(id).cloned()
     }
 
     pub fn set_link_status(&self, mount_id: &str, status: &str) {
@@ -276,7 +301,7 @@ impl DocRegistry {
         if let Some(v) = existing {
             return Ok(v);
         }
-        let doc = LiveDoc::load(info.id.clone(), format!("{}/{}", user.name, info.name), DocKind::Vault(info.clone()), store)?;
+        let doc = LiveDoc::load(info.id.clone(), format!("{}/{}", user.name, info.name), DocKind::Vault(info.clone()), store, Some(self.presence_tx.clone()))?;
         self.vaults.lock().unwrap().insert(info.id.clone(), doc.clone());
         self.attach_vault_bridges(&doc, &info);
         Ok(doc)
@@ -292,7 +317,7 @@ impl DocRegistry {
             return Ok(s);
         }
         let store = self.storage.share_store(info)?;
-        let doc = LiveDoc::load(info.id.clone(), format!("share:{}", info.name), DocKind::Share(info.clone()), store)?;
+        let doc = LiveDoc::load(info.id.clone(), format!("share:{}", info.name), DocKind::Share(info.clone()), store, Some(self.presence_tx.clone()))?;
         self.shares.lock().unwrap().insert(info.id.clone(), doc.clone());
         Ok(doc)
     }
@@ -384,7 +409,7 @@ impl DocRegistry {
             return Ok(s);
         }
         let store = self.storage.mount_store(mount)?;
-        let doc = LiveDoc::load(mount.id.clone(), format!("remote:{}", mount.share_name), DocKind::Remote(mount.clone()), store)?;
+        let doc = LiveDoc::load(mount.id.clone(), format!("remote:{}", mount.share_name), DocKind::Remote(mount.clone()), store, Some(self.presence_tx.clone()))?;
         self.shares.lock().unwrap().insert(mount.id.clone(), doc.clone());
         Ok(doc)
     }
@@ -466,7 +491,7 @@ impl DocRegistry {
         self.get_or_load(&user, &info.name)
     }
 
-    fn bridges_for(&self, doc_id: &str) -> Vec<Arc<Bridge>> {
+    pub fn bridges_for(&self, doc_id: &str) -> Vec<Arc<Bridge>> {
         self.bridges
             .lock()
             .unwrap()

@@ -109,13 +109,18 @@ pub async fn run(args: SyncArgs) -> anyhow::Result<()> {
     }
 
     let mut save_tick = tokio::time::interval(Duration::from_secs(2));
+    let mut sharing_tick = tokio::time::interval(Duration::from_secs(20));
+    sharing_tick.tick().await; // first refresh happens on connect
     let mut idle_since: Option<tokio::time::Instant> = None;
     tracing::info!("syncing {} <-> {}/{}", args.dir.display(), args.http_base(), args.vault);
 
     loop {
         tokio::select! {
             ev = ws_rx.recv() => match ev {
-                Some(WsEvent::Connected(tx)) => engine.on_connected(tx),
+                Some(WsEvent::Connected(tx)) => {
+                    engine.on_connected(tx);
+                    engine.refresh_sharing().await;
+                }
                 Some(WsEvent::Message(bytes)) => {
                     engine.on_message(&bytes).await;
                     if !reconciled && engine.synced {
@@ -130,6 +135,11 @@ pub async fn run(args: SyncArgs) -> anyhow::Result<()> {
             Some(paths) = fs_rx.recv() => {
                 if engine.on_fs_batch(&paths).await {
                     idle_since = Some(tokio::time::Instant::now());
+                }
+            }
+            _ = sharing_tick.tick() => {
+                if engine.synced {
+                    engine.refresh_sharing().await;
                 }
             }
             _ = save_tick.tick() => {

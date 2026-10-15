@@ -87,6 +87,7 @@ Limits on the link (the node id is public, so everything before the hello must b
 | DELETE | `/api/shares/{id}` | unshare |
 | POST | `/api/vaults/{vault}/mounts` | `{ticket, mount_path}` → mount |
 | DELETE | `/api/mounts/{id}` | unmount |
+| POST | `/api/tickets/inspect` | `{ticket}` → name, access, same_server, valid (local tickets), from_own_vault |
 
 ## Plugin UI
 
@@ -96,4 +97,4 @@ Settings → **Sharing**: *Shared by me* (create from folder/note path, list wit
 
 1. **One server** (done). Share docs, bridges, reconcile, API, tickets with local `node_id`, plugin Sharing UI. Two users on the same server collaborate on a folder.
 2. **iroh** (done). Endpoint, accept loop, `replica/share/1` protocol (y-sync framed over a QUIC stream + blob fetch), remote mounts with local replicas, reconnect, relay config. Scenario: `server/scripts/remote-e2e.sh`.
-3. **Polish.** Presence across the bridge, headless client awareness of read-only, revocation UX, docs for self-hosted relay.
+3. **Polish** (done except the relay guide). Presence across the bridge (`server/src/presence.rs`: awareness states of clients inside a shared subtree are mirrored into the share and every mounting vault under a synthetic client id with the path remapped and a `_via` marker; scenario `server/scripts/presence-e2e.sh`), headless client refuses edits under read-only mounts and marks those files read-only on disk, sharing UI reworked (tabs, modals, ticket inspection via `POST /api/tickets/inspect`, revocation notices).

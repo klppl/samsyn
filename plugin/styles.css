@@ -75,3 +75,71 @@
 .replica-muted {
   color: var(--text-faint);
 }
+
+.replica-revoked .setting-item-name {
+  color: var(--text-error);
+}
+
+/* Settings tabs */
+.replica-tabs {
+  display: flex;
+  gap: 4px;
+  border-bottom: 1px solid var(--background-modifier-border);
+  margin-bottom: 12px;
+}
+.replica-tab {
+  background: none;
+  box-shadow: none;
+  border: none;
+  border-bottom: 2px solid transparent;
+  border-radius: 0;
+  padding: 6px 12px;
+  color: var(--text-muted);
+  cursor: pointer;
+}
+.replica-tab.is-active {
+  color: var(--text-normal);
+  border-bottom-color: var(--interactive-accent);
+}
+.replica-tab:hover {
+  color: var(--text-normal);
+}
+
+/* Sharing cards */
+.replica-card {
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 8px;
+  padding: 4px 12px;
+  margin: 8px 0;
+}
+.replica-card .setting-item {
+  border-top: none;
+}
+.replica-card-head .setting-item-name {
+  font-weight: 600;
+}
+.replica-empty {
+  color: var(--text-muted);
+  font-size: var(--font-ui-small);
+  padding: 8px 0 12px;
+}
+.replica-error:not(:empty) {
+  color: var(--text-error);
+  font-size: var(--font-ui-small);
+  padding: 4px 0;
+}
+.replica-modal .setting-item {
+  border-top: none;
+  padding: 8px 0;
+}
+.replica-modal textarea.replica-ticket-text {
+  width: 100%;
+  margin: 4px 0 8px;
+}
+.replica-ticket-info:not(:empty) {
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 6px;
+  padding: 8px 12px;
+  margin: 8px 0;
+  font-size: var(--font-ui-small);
+}

@@ -56,70 +56,84 @@ export function serverUrls(raw: string): { http: string; ws: string } | null {
   return { http, ws: ws + "/ws" };
 }
 
+export type SettingsTabName = "server" | "sharing" | "advanced";
+
+const TABS: Array<{ id: SettingsTabName; label: string }> = [
+  { id: "server", label: "Server" },
+  { id: "sharing", label: "Sharing" },
+  { id: "advanced", label: "Advanced" },
+];
+
 export class ReplicaSettingTab extends PluginSettingTab {
   private statusTimer: ReturnType<typeof setInterval> | null = null;
+  private sharing: SharingSection | null = null;
+  private active: SettingsTabName = "server";
 
-  constructor(app: App, private plugin: ReplicaPlugin) {
+  constructor(
+    app: App,
+    private plugin: ReplicaPlugin,
+  ) {
     super(app, plugin);
   }
 
-  hide(): void {
-    if (this.statusTimer) clearInterval(this.statusTimer);
-    this.statusTimer = null;
+  /** Open the settings on a given tab (used by commands and the file menu). */
+  show(tab: SettingsTabName): void {
+    this.active = tab;
+    // @ts-expect-error setting API is not typed but exists on all platforms
+    this.app.setting.open();
+    // @ts-expect-error same as above
+    this.app.setting.openTabById(this.plugin.manifest.id);
   }
 
-  private renderStatus(el: HTMLElement): void {
-    el.empty();
-    const d = this.plugin.engine?.getDiagnostics();
-    if (!d) {
-      el.createDiv({ text: this.plugin.settings.enabled ? "Not running. Set a server URL and press Reconnect." : "Sync is disabled." });
-      return;
-    }
-    const line = (label: string, value: string, cls?: string) => {
-      const row = el.createDiv({ cls: "replica-diag-row" });
-      row.createSpan({ cls: "replica-diag-label", text: label });
-      row.createSpan({ cls: "replica-diag-value" + (cls ? " " + cls : ""), text: value });
-    };
-    const statusText: Record<string, string> = {
-      connected: "Connected, live",
-      connecting: "Connecting…",
-      offline: "Offline (changes queued locally)",
-      disabled: "Disabled / not configured",
-    };
-    line("Status", statusText[d.status] ?? d.status, d.status === "connected" ? "is-ok" : d.status === "offline" ? "is-bad" : "");
-    line("Initial sync", d.synced ? "done" : "pending");
-    line("Other devices", String(d.peers));
-    line("Synced files", `${d.textFiles} text, ${d.blobFiles} other`);
-    line("WebSocket", d.wsUrl || "–");
-    if (d.lastConnectedAt) line("Last connected", new Date(d.lastConnectedAt).toLocaleTimeString());
-    if (d.lastError) line("Last error", d.lastError, "is-bad");
-    if (d.hint) line("Hint", d.hint, "is-warn");
-    if (d.pendingDeletions > 0) line("Held back", `${d.pendingDeletions} deletions (see command "Apply held-back deletions")`, "is-warn");
-    line("Install id", d.installId);
-    void this.plugin.engine?.refreshStorage();
-    if (d.storage) {
-      const mb = (n: number) => `${(n / 1_048_576).toFixed(n < 10_485_760 ? 1 : 0)} MB`;
-      const where = d.storage.backend === "indexeddb" ? "IndexedDB" : "files in plugin folder";
-      let txt = `${where} · document ${mb(d.storage.docBytes)} · ${d.storage.syncedEntries} entries`;
-      if (d.storage.usageBytes !== null && d.storage.quotaBytes) {
-        txt += ` · ${mb(d.storage.usageBytes)} of ${mb(d.storage.quotaBytes)} used`;
-      }
-      line("Local cache", txt, d.storage.docBytes > 100 * 1_048_576 ? "is-warn" : "");
-    }
+  hide(): void {
+    this.clearTimers();
+  }
+
+  private clearTimers(): void {
+    if (this.statusTimer) clearInterval(this.statusTimer);
+    this.statusTimer = null;
+    this.sharing?.stop();
+    this.sharing = null;
   }
 
   display(): void {
     const { containerEl } = this;
     containerEl.empty();
+    this.clearTimers();
+
+    const bar = containerEl.createDiv({ cls: "replica-tabs" });
+    for (const t of TABS) {
+      const btn = bar.createEl("button", { text: t.label, cls: "replica-tab" + (t.id === this.active ? " is-active" : "") });
+      btn.onclick = () => {
+        this.active = t.id;
+        this.display();
+      };
+    }
+    const body = containerEl.createDiv({ cls: "replica-tab-body" });
+    switch (this.active) {
+      case "server":
+        this.renderServerTab(body);
+        break;
+      case "sharing":
+        this.renderSharingTab(body);
+        break;
+      case "advanced":
+        this.renderAdvancedTab(body);
+        break;
+    }
+  }
+
+  // ------------------------------------------------------------------ server tab
+
+  private renderServerTab(containerEl: HTMLElement): void {
     const s = this.plugin.settings;
 
     new Setting(containerEl).setName("Status").setHeading();
     const statusEl = containerEl.createDiv({ cls: "replica-diag" });
     this.renderStatus(statusEl);
-    if (this.statusTimer) clearInterval(this.statusTimer);
     this.statusTimer = setInterval(() => this.renderStatus(statusEl), 2000);
 
-    new Setting(containerEl).setName("Server").setHeading();
+    new Setting(containerEl).setName("Connection").setHeading();
 
     new Setting(containerEl)
       .setName("Enable sync")
@@ -210,13 +224,6 @@ export class ReplicaSettingTab extends PluginSettingTab {
           }),
       );
 
-    if (s.serverUrl && s.token) {
-      const sharingEl = containerEl.createDiv();
-      const section = new SharingSection(this.plugin, sharingEl);
-      section.render();
-      void section.load();
-    }
-
     new Setting(containerEl).setName("What to sync").setHeading();
 
     new Setting(containerEl)
@@ -248,8 +255,72 @@ export class ReplicaSettingTab extends PluginSettingTab {
           await this.plugin.saveSettings();
         }),
       );
+  }
 
-    new Setting(containerEl).setName("Advanced").setHeading();
+  private renderStatus(el: HTMLElement): void {
+    el.empty();
+    const d = this.plugin.engine?.getDiagnostics();
+    if (!d) {
+      el.createDiv({ text: this.plugin.settings.enabled ? "Not running. Set a server URL and press Reconnect." : "Sync is disabled." });
+      return;
+    }
+    const line = (label: string, value: string, cls?: string) => {
+      const row = el.createDiv({ cls: "replica-diag-row" });
+      row.createSpan({ cls: "replica-diag-label", text: label });
+      row.createSpan({ cls: "replica-diag-value" + (cls ? " " + cls : ""), text: value });
+    };
+    const statusText: Record<string, string> = {
+      connected: "Connected, live",
+      connecting: "Connecting…",
+      offline: "Offline (changes queued locally)",
+      disabled: "Disabled / not configured",
+    };
+    line("Status", statusText[d.status] ?? d.status, d.status === "connected" ? "is-ok" : d.status === "offline" ? "is-bad" : "");
+    line("Initial sync", d.synced ? "done" : "pending");
+    line("Other devices", String(d.peers));
+    line("Synced files", `${d.textFiles} text, ${d.blobFiles} other`);
+    line("WebSocket", d.wsUrl || "–");
+    if (d.lastConnectedAt) line("Last connected", new Date(d.lastConnectedAt).toLocaleTimeString());
+    if (d.lastError) line("Last error", d.lastError, "is-bad");
+    if (d.hint) line("Hint", d.hint, "is-warn");
+    if (d.pendingDeletions > 0) line("Held back", `${d.pendingDeletions} deletions (see command "Apply held-back deletions")`, "is-warn");
+    line("Install id", d.installId);
+    void this.plugin.engine?.refreshStorage();
+    if (d.storage) {
+      const mb = (n: number) => `${(n / 1_048_576).toFixed(n < 10_485_760 ? 1 : 0)} MB`;
+      const where = d.storage.backend === "indexeddb" ? "IndexedDB" : "files in plugin folder";
+      let txt = `${where} · document ${mb(d.storage.docBytes)} · ${d.storage.syncedEntries} entries`;
+      if (d.storage.usageBytes !== null && d.storage.quotaBytes) {
+        txt += ` · ${mb(d.storage.usageBytes)} of ${mb(d.storage.quotaBytes)} used`;
+      }
+      line("Local cache", txt, d.storage.docBytes > 100 * 1_048_576 ? "is-warn" : "");
+    }
+  }
+
+  // ------------------------------------------------------------------ sharing tab
+
+  private renderSharingTab(containerEl: HTMLElement): void {
+    const s = this.plugin.settings;
+    if (!s.serverUrl || !s.token) {
+      containerEl.createDiv({ cls: "replica-empty", text: "Sharing needs a server connection. Set the server URL and token on the Server tab first." });
+      return;
+    }
+    containerEl.createEl("p", {
+      cls: "replica-muted",
+      text: "Share one folder or note, not the whole vault. The other person pastes a ticket and gets the same folder in their vault, live in both directions. Tickets can be read-only and can be revoked at any time.",
+    });
+    const sharingEl = containerEl.createDiv();
+    const section = new SharingSection(this.plugin, sharingEl);
+    this.sharing = section;
+    section.render();
+    void section.load();
+    section.start();
+  }
+
+  // ------------------------------------------------------------------ advanced tab
+
+  private renderAdvancedTab(containerEl: HTMLElement): void {
+    const s = this.plugin.settings;
 
     new Setting(containerEl)
       .setName("Live typing delay (ms)")

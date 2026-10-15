@@ -1,13 +1,14 @@
 import { Notice, Platform, Plugin, setIcon } from "obsidian";
 import { SyncEngine, EngineStatus } from "./engine";
 import { Persistence, deviceInstallId } from "./persistence";
+import { MountModal, ShareModal } from "./sharing-modals";
 import { DEFAULT_SETTINGS, ReplicaSettingTab, ReplicaSettings, randomSuffix, slugify } from "./settings";
 
 export default class ReplicaPlugin extends Plugin {
   settings!: ReplicaSettings;
   engine: SyncEngine | null = null;
   /** Path pre-filled in the Sharing section when opened from the file menu. */
-  pendingSharePath: string | null = null;
+  settingTab: ReplicaSettingTab | null = null;
   private statusEl!: HTMLElement;
   private restarting = false;
 
@@ -24,7 +25,34 @@ export default class ReplicaPlugin extends Plugin {
     });
     this.renderStatus("offline", 0);
 
-    this.addSettingTab(new ReplicaSettingTab(this.app, this));
+    this.settingTab = new ReplicaSettingTab(this.app, this);
+    this.addSettingTab(this.settingTab);
+
+    this.addCommand({
+      id: "share-current",
+      name: "Share the current note or folder…",
+      checkCallback: (checking) => {
+        if (!this.settings.serverUrl) return false;
+        const f = this.app.workspace.getActiveFile();
+        if (!f) return false;
+        if (!checking) new ShareModal(this, f.path).open();
+        return true;
+      },
+    });
+    this.addCommand({
+      id: "mount-ticket",
+      name: "Add a shared folder from a ticket…",
+      checkCallback: (checking) => {
+        if (!this.settings.serverUrl) return false;
+        if (!checking) new MountModal(this).open();
+        return true;
+      },
+    });
+    this.addCommand({
+      id: "open-sharing",
+      name: "Open sharing settings",
+      callback: () => this.settingTab?.show("sharing"),
+    });
 
     this.addCommand({
       id: "reconnect",
@@ -94,13 +122,7 @@ export default class ReplicaPlugin extends Plugin {
           item
             .setTitle("Replica: Share…")
             .setIcon("share-2")
-            .onClick(() => {
-              this.pendingSharePath = file.path;
-              // @ts-expect-error setting API is not typed
-              this.app.setting.open();
-              // @ts-expect-error setting API is not typed
-              this.app.setting.openTabById(this.manifest.id);
-            }),
+            .onClick(() => new ShareModal(this, file.path).open()),
         );
       }),
     );
