@@ -1,4 +1,4 @@
-import { App, Notice } from "obsidian";
+import { App, Notice, Platform } from "obsidian";
 import * as Y from "yjs";
 import type { BlobMeta, SyncEngine } from "./engine";
 import { sha256Hex } from "./hash";
@@ -14,7 +14,15 @@ export interface ConfigEntry {
   code: boolean;
 }
 
+/** A device that has synced this vault; registered by each device itself, keyed by install id. */
+export interface DeviceInfo {
+  name: string;
+  platform: "desktop" | "mobile";
+  lastSeen: number;
+}
+
 const SETTINGS_FILE = "data.json";
+const HEARTBEAT_MS = 5 * 60_000;
 const CODE_FILES = ["manifest.json", "main.js", "styles.css"];
 const POLL_MS = 10_000;
 
@@ -27,7 +35,9 @@ const POLL_MS = 10_000;
  */
 export class ConfigSync {
   private config: Y.Map<ConfigEntry>;
+  private devices: Y.Map<DeviceInfo>;
   private timer: ReturnType<typeof setInterval> | null = null;
+  private heartbeat: ReturnType<typeof setInterval> | null = null;
   private unsubscribers: Array<() => void> = [];
   private seen = new Map<string, { mtime: number; hash: string }>();
   private busy = false;
@@ -40,6 +50,46 @@ export class ConfigSync {
     private engine: SyncEngine,
   ) {
     this.config = engine.doc.getMap<ConfigEntry>("config");
+    this.devices = engine.doc.getMap<DeviceInfo>("devices");
+  }
+
+  // ------------------------------------------------------------------ devices
+
+  get installId(): string {
+    return this.engine.deviceInstallId;
+  }
+
+  /** Every device that has synced this vault, this one first, then by name. */
+  knownDevices(): Array<{ id: string; info: DeviceInfo; online: boolean; self: boolean }> {
+    const online = new Set(this.engine.peerInstallIds());
+    const out = [...this.devices.entries()].map(([id, info]) => ({ id, info, online: online.has(id), self: id === this.installId }));
+    out.sort((a, b) => (a.self ? -1 : b.self ? 1 : a.info.name.localeCompare(b.info.name)));
+    return out;
+  }
+
+  /** Register / refresh this device in the shared registry. */
+  touchSelf(): void {
+    const info: DeviceInfo = { name: this.settings.deviceName, platform: Platform.isMobile ? "mobile" : "desktop", lastSeen: Date.now() };
+    const cur = this.devices.get(this.installId);
+    if (cur && cur.name === info.name && cur.platform === info.platform && Date.now() - cur.lastSeen < HEARTBEAT_MS / 2) return;
+    this.engine.doc.transact(() => this.devices.set(this.installId, info), this.origin);
+  }
+
+  /** Drop a device that is gone for good (e.g. a wiped phone). It re-registers if it comes back. */
+  forgetDevice(id: string): void {
+    this.engine.doc.transact(() => {
+      this.devices.delete(id);
+      for (const [pid, e] of this.config.entries()) {
+        if (e.devices !== "all" && e.devices.includes(id)) this.config.set(pid, { ...e, devices: e.devices.filter((d) => d !== id) });
+      }
+    }, this.origin);
+  }
+
+  /** Human-readable summary of an entry's device selection. */
+  describeDevices(e: ConfigEntry): string {
+    if (e.devices === "all") return "all devices";
+    const names = e.devices.map((d) => this.devices.get(d)?.name ?? d);
+    return names.length === 0 ? "no devices" : names.join(", ");
   }
 
   // ------------------------------------------------------------------ selection
@@ -63,12 +113,13 @@ export class ConfigSync {
     return this.settings.deviceName;
   }
 
-  /** Does this device take part in syncing plugin `id`? */
+  /** Does this device take part in syncing plugin `id`? (Entries made before the device
+   *  registry existed may hold device names; those still match.) */
   participating(id: string): boolean {
     if (!this.settings.configSync.enabled) return false;
     const e = this.config.get(id);
     if (!e) return false;
-    return e.devices === "all" || e.devices.includes(this.deviceName);
+    return e.devices === "all" || e.devices.includes(this.installId) || e.devices.includes(this.deviceName);
   }
 
   private filesFor(id: string): string[] {
@@ -126,6 +177,8 @@ export class ConfigSync {
     }
 
     this.timer = setInterval(() => void this.scanLocal(), POLL_MS);
+    this.touchSelf();
+    this.heartbeat = setInterval(() => this.touchSelf(), HEARTBEAT_MS);
     void this.reconcileAll();
   }
 
@@ -133,6 +186,8 @@ export class ConfigSync {
     this.stopped = true;
     if (this.timer) clearInterval(this.timer);
     this.timer = null;
+    if (this.heartbeat) clearInterval(this.heartbeat);
+    this.heartbeat = null;
     for (const u of this.unsubscribers) u();
     this.unsubscribers = [];
   }

@@ -159,3 +159,8 @@
 .replica-small {
   font-size: var(--font-ui-smaller);
 }
+
+.replica-online .setting-item-name::before {
+  content: "● ";
+  color: var(--color-green);
+}

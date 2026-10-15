@@ -2,6 +2,7 @@ import { App, Notice, PluginSettingTab, Setting, requestUrl } from "obsidian";
 import type ReplicaPlugin from "./main";
 import { SharingSection } from "./sharing-ui";
 import { DeviceSetupModal } from "./device-modals";
+import { DevicePickerModal } from "./device-picker";
 import { ReplicaApi } from "./api";
 
 /** A share mounted straight from the owner's server with a ticket (no server of our own). */
@@ -77,11 +78,12 @@ export function serverUrls(raw: string): { http: string; ws: string } | null {
   return { http, ws: ws + "/ws" };
 }
 
-export type SettingsTabName = "server" | "sharing" | "advanced";
+export type SettingsTabName = "server" | "sharing" | "plugins" | "advanced";
 
 const TABS: Array<{ id: SettingsTabName; label: string }> = [
   { id: "server", label: "Server" },
   { id: "sharing", label: "Sharing" },
+  { id: "plugins", label: "Plugins" },
   { id: "advanced", label: "Advanced" },
 ];
 
@@ -137,6 +139,9 @@ export class ReplicaSettingTab extends PluginSettingTab {
         break;
       case "sharing":
         this.renderSharingTab(body);
+        break;
+      case "plugins":
+        this.renderConfigSync(body);
         break;
       case "advanced":
         this.renderAdvancedTab(body);
@@ -247,15 +252,13 @@ export class ReplicaSettingTab extends PluginSettingTab {
 
     if (s.serverUrl && s.token) {
       new Setting(containerEl)
-        .setName("Devices")
+        .setName("Device tokens")
         .setHeading()
         .setDesc("Each device should have its own token, so one can be revoked without the others.")
         .addButton((b) => b.setButtonText("Set up another device…").setCta().onClick(() => new DeviceSetupModal(this.plugin).open()));
       const devicesEl = containerEl.createDiv();
       void this.renderDevices(devicesEl);
     }
-
-    this.renderConfigSync(containerEl);
 
     new Setting(containerEl).setName("What to sync").setHeading();
 
@@ -293,10 +296,14 @@ export class ReplicaSettingTab extends PluginSettingTab {
   /** Plugin settings sync: which plugins, which devices, with or without the plugin files. */
   private renderConfigSync(containerEl: HTMLElement): void {
     const s = this.plugin.settings;
-    new Setting(containerEl)
-      .setName("Plugin settings sync")
-      .setHeading()
-      .setDesc("Keep chosen plugins' settings (their data.json) the same on your devices, e.g. Iconize's icons and colours. Last change wins. The selection below is shared between devices; the switch is per device.");
+    containerEl.createEl("p", {
+      cls: "replica-muted",
+      text: "Keep chosen plugins' settings (their data.json) the same on your devices, e.g. Iconize's icons and colours. Optionally the plugin's files too, so it installs itself on a new device. Last change wins. The selection and the device list are shared between devices; the switch below is per device.",
+    });
+    if (!s.serverUrl || !s.token) {
+      containerEl.createDiv({ cls: "replica-empty", text: "Needs a server connection (Server tab)." });
+      return;
+    }
     new Setting(containerEl)
       .setName("Sync plugin settings on this device")
       .setDesc("Off: this device neither sends nor receives plugin settings.")
@@ -313,8 +320,11 @@ export class ReplicaSettingTab extends PluginSettingTab {
       containerEl.createDiv({ cls: "replica-empty", text: "Connect to the server to choose plugins." });
       return;
     }
-    const devicesSeen = [s.deviceName, ...(this.plugin.engine?.peerNames() ?? [])];
-    containerEl.createDiv({ cls: "replica-muted replica-small", text: `Devices: this one is “${s.deviceName}”${devicesSeen.length > 1 ? `; also online: ${devicesSeen.slice(1).join(", ")}` : ""}. Use these names in the devices field, or “all”.` });
+    const known = cs.knownDevices();
+    containerEl.createDiv({
+      cls: "replica-muted replica-small",
+      text: `Known devices: ${known.map((d) => `${d.info.name}${d.online ? " (online)" : ""}`).join(", ") || "none yet"}. This device is “${s.deviceName}” (rename it under Connection).`,
+    });
 
     const manifests = (this.app as unknown as { plugins: { manifests: Record<string, { id: string; name: string }> } }).plugins?.manifests ?? {};
     const ids = new Set<string>(Object.keys(manifests));
@@ -325,10 +335,15 @@ export class ReplicaSettingTab extends PluginSettingTab {
       const entry = cs.get(id);
       const name = manifests[id]?.name ?? id;
       const installed = !!manifests[id];
+      const mine = entry ? cs.participating(id) : false;
       const row = new Setting(containerEl)
         .setClass("replica-grant")
         .setName(name + (installed ? "" : " (not installed here)"))
-        .setDesc(entry ? (entry.devices === "all" ? "all devices" : `devices: ${entry.devices.join(", ")}`) + (entry.code ? " · with plugin files" : "") : "not synced");
+        .setDesc(
+          entry
+            ? `${cs.describeDevices(entry)}${entry.code ? " · with plugin files" : ""}${s.configSync.enabled ? (mine ? " · this device takes part" : " · not this device") : ""}`
+            : "not synced",
+        );
       row.addToggle((t) =>
         t.setValue(!!entry).onChange((v) => {
           cs.set(id, v ? { devices: "all", code: false } : null);
@@ -336,14 +351,8 @@ export class ReplicaSettingTab extends PluginSettingTab {
         }),
       );
       if (entry) {
-        row.addText((t) =>
-          t
-            .setPlaceholder("all")
-            .setValue(entry.devices === "all" ? "all" : entry.devices.join(", "))
-            .onChange((v) => {
-              const list = v.split(",").map((x) => x.trim()).filter(Boolean);
-              cs.set(id, { ...entry, devices: list.length === 0 || list.includes("all") ? "all" : list });
-            }),
+        row.addButton((b) =>
+          b.setButtonText("Devices…").onClick(() => new DevicePickerModal(this.plugin, cs, id, name, entry, () => this.display()).open()),
         );
         row.addExtraButton((b) =>
           b

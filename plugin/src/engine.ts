@@ -231,7 +231,7 @@ export class SyncEngine {
       this.setStatus("offline");
       return;
     }
-    provider.awareness.setLocalStateField("user", { name: this.settings.deviceName });
+    provider.awareness.setLocalStateField("user", { name: this.settings.deviceName, installId: this.installId });
     provider.on("status", ({ status }: { status: string }) => {
       if (status === "connected") {
         this.lastError = null;
@@ -283,6 +283,22 @@ export class SyncEngine {
 
   getBlobClient(): BlobClient | null {
     return this.blobClient;
+  }
+
+  get deviceInstallId(): string {
+    return this.installId;
+  }
+
+  /** Install ids of the other devices currently connected (from awareness). */
+  peerInstallIds(): string[] {
+    const out: string[] = [];
+    if (!this.provider) return out;
+    for (const [id, st] of this.provider.awareness.getStates()) {
+      if (id === this.doc.clientID) continue;
+      const iid = (st as { user?: { installId?: string } })?.user?.installId;
+      if (iid && !out.includes(iid)) out.push(iid);
+    }
+    return out;
   }
 
   /** Names of the other devices currently connected (from awareness). */

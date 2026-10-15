@@ -97,7 +97,7 @@ Repeat on each device with the same server and vault ID. Easiest: Settings → S
 
 ### Plugin settings between devices
 
-Settings → Server → **Plugin settings sync**: tick the community plugins whose settings (`data.json`) should be the same everywhere, e.g. Iconize's icons and colours, and optionally also their files so the plugin installs itself on a new device. Per plugin you can name the devices that take part (or “all”); the selection is shared, the on/off switch is per device. Last change wins (settings are never merged line by line). A device that receives new settings gets a notice with a **Reload** button, since plugins read their settings at load time.
+Settings → Replica → **Plugins** tab: tick the community plugins whose settings (`data.json`) should be the same everywhere, e.g. Iconize's icons and colours, and optionally also their files so the plugin installs itself on a new device. Per plugin, **Devices…** opens a list of every device that has synced the vault (online status, last seen) with checkboxes, or “all devices”; the selection is shared, the on/off switch is per device. Last change wins (settings are never merged line by line). A device that receives new settings gets a notice with a **Reload** button, since plugins read their settings at load time.
 
 ## How it works
 
