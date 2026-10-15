@@ -1,6 +1,7 @@
 import { AbstractInputSuggest, App, Modal, Notice, Setting, TAbstractFile, TFolder } from "obsidian";
 import { ReplicaApi, ShareRow, TicketInfo } from "./api";
 import type ReplicaPlugin from "./main";
+import type { SharedRoot } from "./main";
 import { serverUrls } from "./settings";
 import { decodeTicket, Ticket } from "./ticket";
 
@@ -364,6 +365,57 @@ export class MountModal extends Modal {
 
   onClose(): void {
     if (this.inspectTimer) clearTimeout(this.inspectTimer);
+    this.contentEl.empty();
+  }
+}
+
+/** Move a mounted share to another folder. Done as an ordinary folder move, which the plugin
+ *  follows (server mount: the server moves the keys; guest: the mount path is updated). */
+export class MoveMountModal extends Modal {
+  private target: string;
+
+  constructor(
+    private plugin: ReplicaPlugin,
+    private root: SharedRoot,
+    private onDone?: () => void,
+  ) {
+    super(plugin.app);
+    this.target = root.path;
+  }
+
+  onOpen(): void {
+    const { contentEl } = this;
+    contentEl.addClass("replica-modal");
+    contentEl.createEl("h2", { text: `Move “${this.root.name}”` });
+    contentEl.createEl("p", {
+      cls: "replica-muted",
+      text: `Currently at ${this.root.path}. The files move with it and stay shared. You can also just drag the folder in the file explorer; Replica follows.`,
+    });
+    new Setting(contentEl).setName("New folder").addText((t) => {
+      t.setValue(this.target).onChange((v) => (this.target = v));
+      t.inputEl.addClass("replica-wide");
+      new PathSuggest(this.app, t.inputEl);
+    });
+    const msg = contentEl.createDiv({ cls: "replica-error" });
+    new Setting(contentEl).addButton((b) =>
+      b
+        .setButtonText("Move")
+        .setCta()
+        .onClick(async () => {
+          b.setDisabled(true);
+          try {
+            await this.plugin.moveMountFolder(this.root, this.target.trim());
+            this.onDone?.();
+            this.close();
+          } catch (e) {
+            msg.setText((e as Error).message);
+            b.setDisabled(false);
+          }
+        }),
+    );
+  }
+
+  onClose(): void {
     this.contentEl.empty();
   }
 }

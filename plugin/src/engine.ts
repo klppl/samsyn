@@ -17,6 +17,11 @@ export type EngineStatus = "disabled" | "offline" | "connecting" | "connected";
 
 export interface EngineEvents {
   onStatus(status: EngineStatus, peers: number): void;
+  /**
+   * Called first on every rename. Return true when the plugin handled it (a shared root was
+   * moved and the server moved the keys), so the engine must not replay it as delete + create.
+   */
+  claimRename?(oldPath: string, newPath: string): boolean;
 }
 
 /**
@@ -721,12 +726,8 @@ export class SyncEngine {
 
   private onLocalRenamed(f: TAbstractFile, oldPath: string): void {
     if (this.stopped) return;
+    if (this.events.claimRename?.(oldPath, f.path)) return;
     if (f instanceof TFolder) {
-      const { root } = this.target;
-      if (root && root.startsWith(oldPath + "/") && !(f.path + "/" === root || root.startsWith(f.path + "/"))) {
-        new Notice(`Replica: the folder of shared ${this.target.label} was moved. Unmount it and mount again at the new place.`, 10_000);
-        return;
-      }
       const oldPrefix = this.keyPrefixOf(oldPath);
       const newPrefix = this.keyPrefixOf(f.path);
       if (oldPrefix !== null && newPrefix !== null) {

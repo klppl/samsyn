@@ -9,7 +9,7 @@ use tokio::sync::broadcast;
 use yrs::sync::{Awareness, Message, SyncMessage};
 use yrs::types::{EntryChange, Event, PathSegment};
 use yrs::updates::encoder::{Encode, Encoder, EncoderV1};
-use yrs::{Any, DeepObservable, GetString, Map, Observable, Out, ReadTxn, StateVector, Transact};
+use yrs::{Any, DeepObservable, GetString, Map, Observable, Origin, Out, ReadTxn, StateVector, Transact, WriteTxn};
 
 use crate::bridge::{Bridge, Change, ChangeKind, OwnedDelta, Side};
 use crate::presence::{PresenceEvent, PresenceSender};
@@ -425,6 +425,76 @@ impl DocRegistry {
         let _g = self.apply_lock.lock().unwrap();
         let vault = self.loaded_vault(&mount.vault_id).ok_or_else(|| anyhow::anyhow!("vault not loaded"))?;
         self.attach_mount_bridge_locked(&vault, mount)
+    }
+
+    /// Move a share or a mount to another place in its vault without anything looking like a
+    /// deletion to the other side: detach the bridge, rename the keys inside the vault document,
+    /// store the new prefix, attach again. Returns the updated row(s) for the API.
+    /// `only_file` is `Some` for single-note shares (the note may be renamed too).
+    pub fn move_prefix(
+        self: &Arc<Self>,
+        vault_id: &str,
+        share_id: &str,
+        mount_id: Option<&str>,
+        old_prefix: &str,
+        new_prefix: &str,
+        old_file: Option<&str>,
+        new_file: Option<&str>,
+    ) -> anyhow::Result<()> {
+        let vault = self.load_vault_by_id(vault_id)?;
+        let _g = self.apply_lock.lock().unwrap();
+        // Detach only this bridge; the share document and any link task stay as they are.
+        self.bridges.lock().unwrap().retain(|b| !(b.share_id == share_id && b.mount_id.as_deref() == mount_id));
+
+        let (old_root, new_root) = match (old_file, new_file) {
+            (Some(of), Some(nf)) => (format!("{old_prefix}{of}"), format!("{new_prefix}{nf}")),
+            _ => (old_prefix.to_string(), new_prefix.to_string()),
+        };
+        let moved = {
+            let aw = vault.awareness.lock().unwrap();
+            let doc = aw.doc().clone();
+            let mut txn = doc.transact_mut_with(Origin::from(b"bridge:move".as_slice()));
+            let texts = txn.get_or_insert_map("texts");
+            let blobs = txn.get_or_insert_map("blobs");
+            let keys: Vec<String> = texts
+                .keys(&txn)
+                .chain(blobs.keys(&txn))
+                .filter(|k| if old_file.is_some() { *k == old_root } else { k.starts_with(&old_root) })
+                .map(str::to_string)
+                .collect();
+            for k in &keys {
+                let nk = format!("{new_root}{}", &k[old_root.len()..]);
+                if let Some(Out::YText(t)) = texts.get(&txn, k) {
+                    let s = t.get_string(&txn);
+                    texts.remove(&mut txn, k);
+                    texts.insert(&mut txn, nk.as_str(), yrs::TextPrelim::new(s.as_str()));
+                }
+                if let Some(Out::Any(a)) = blobs.get(&txn, k) {
+                    blobs.remove(&mut txn, k);
+                    blobs.insert(&mut txn, nk.as_str(), a);
+                }
+            }
+            keys.len()
+        };
+        // The bridge is detached, so nothing from this transaction reaches the share. Drop the
+        // recorded changes rather than letting the next propagate replay them anywhere.
+        vault.changes.lock().unwrap().clear();
+
+        let reg = self.storage.registry();
+        if let Some(mid) = mount_id {
+            reg.update_mount_prefix(mid, new_prefix)?;
+            let mount = reg.mount_by_id(mid)?.ok_or_else(|| anyhow::anyhow!("mount vanished"))?;
+            // Re-attach with the new prefix (for remote mounts this restarts the link; the
+            // replica document is untouched so nothing is re-downloaded).
+            self.attach_mount_bridge_locked(&vault, &mount)?;
+        } else {
+            reg.update_share_path(share_id, new_prefix, new_file)?;
+            let share = reg.share_by_id(share_id)?.ok_or_else(|| anyhow::anyhow!("share vanished"))?;
+            self.attach_owner_bridge_locked(&vault, &share)?;
+            // Mount bridges on this server keep working: they only reference the share document.
+        }
+        tracing::info!(share = %share_id, mount = ?mount_id, "moved {moved} keys from {old_root} to {new_root}");
+        Ok(())
     }
 
     pub fn remove_bridges_for_share(&self, share_id: &str) {

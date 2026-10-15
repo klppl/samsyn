@@ -1,4 +1,5 @@
-import { Notice, Platform, Plugin, setIcon } from "obsidian";
+import { Notice, Platform, Plugin, TAbstractFile, TFolder, setIcon } from "obsidian";
+import { ReplicaApi, SharingInfo } from "./api";
 import { BlobClient } from "./blobs";
 import { SyncEngine, EngineStatus, EngineTarget } from "./engine";
 import { Persistence, deviceInstallId } from "./persistence";
@@ -12,6 +13,10 @@ export default class ReplicaPlugin extends Plugin {
   settingTab: ReplicaSettingTab | null = null;
   private statusEl!: HTMLElement;
   private restarting = false;
+
+  /** Shared roots in this vault, kept fresh so folder moves can be followed and warned about. */
+  private roots: SharedRoot[] = [];
+  private claimedRenames = new Set<string>();
 
   /** The home engine (own server). Guest engines are in `engines` under their mount id. */
   get engine(): SyncEngine | null {
@@ -138,8 +143,131 @@ export default class ReplicaPlugin extends Plugin {
       }),
     );
 
+    // Registered before the engines start, so it runs first on every rename.
+    this.registerEvent(this.app.vault.on("rename", (f, oldPath) => void this.onRename(f, oldPath)));
+
     // Wait for the vault index so we do not get a 'create' event for every existing file.
     this.app.workspace.onLayoutReady(() => void this.startEngine());
+  }
+
+  // ------------------------------------------------------------- shared roots
+
+  /** Re-read which folders/notes are shared or mounted (server side) plus guest mounts. */
+  async refreshSharingRoots(info?: SharingInfo): Promise<void> {
+    const roots: SharedRoot[] = this.settings.guestMounts.map((m) => ({ kind: "guest", id: m.id, name: m.name, path: m.mountPath, isFile: false }));
+    if (this.settings.serverUrl && this.settings.token) {
+      try {
+        const data = info ?? (await new ReplicaApi(this.settings).sharing());
+        for (const s of data.shares) roots.push({ kind: "share", id: s.id, name: s.name, path: s.path, isFile: s.only_file !== null });
+        for (const m of data.mounts) if (!m.status.startsWith("revoked")) roots.push({ kind: "mount", id: m.id, name: m.name, path: m.mount_path, isFile: false });
+      } catch (e) {
+        console.warn("[replica] could not load shared roots", e);
+      }
+    }
+    this.roots = roots;
+  }
+
+  private rootOf(path: string): SharedRoot | null {
+    for (const r of this.roots) {
+      if (path === r.path || (!r.isFile && path.startsWith(r.path + "/"))) return r;
+    }
+    return null;
+  }
+
+  /** Called by engines: true when this rename was a shared-root move the plugin took care of. */
+  private claimRename(oldPath: string, newPath: string): boolean {
+    return this.claimedRenames.has(`${oldPath}\u0000${newPath}`);
+  }
+
+  private async onRename(f: TAbstractFile, oldPath: string): Promise<void> {
+    const newPath = f.path;
+    // 1. A shared root (or an ancestor folder of one) moved: follow it instead of replaying the
+    //    move as "delete everything" to the other side.
+    const moved = this.roots.filter((r) => r.path === oldPath || (f instanceof TFolder && r.path.startsWith(oldPath + "/")));
+    if (moved.length > 0) {
+      this.claimedRenames.add(`${oldPath}\u0000${newPath}`);
+      setTimeout(() => this.claimedRenames.delete(`${oldPath}\u0000${newPath}`), 5000);
+      const failures: string[] = [];
+      for (const r of moved) {
+        const target = newPath + r.path.slice(oldPath.length);
+        try {
+          await this.moveSharedRoot(r, target);
+        } catch (e) {
+          failures.push(`${r.name}: ${(e as Error).message}`);
+        }
+      }
+      if (failures.length === 0) {
+        new Notice(`Replica: ${moved.map((r) => `“${r.name}”`).join(", ")} moved; still shared.`, 6000);
+      } else {
+        // Put the folder back: leaving it there would make the next reconcile delete the
+        // shared files for everyone.
+        new Notice(`Replica: could not move the shared folder (${failures.join("; ")}). Moving it back.`, 12_000);
+        try {
+          await this.app.fileManager.renameFile(f, oldPath);
+        } catch (e) {
+          new Notice(`Replica: moving back failed too (${(e as Error).message}). Move “${oldPath}” back by hand before syncing continues.`, 0);
+        }
+      }
+      await this.refreshSharingRoots();
+      return;
+    }
+    // 2. Something crossed a share boundary: say so, offer to undo.
+    const from = this.rootOf(oldPath);
+    const to = this.rootOf(newPath);
+    if (from === to) return;
+    const what = f instanceof TFolder ? "folder" : "note";
+    const frag = document.createDocumentFragment();
+    const p = frag.createDiv();
+    if (from && !to) {
+      p.setText(`Replica: you moved the ${what} “${oldPath.split("/").pop()}” out of the shared ${from.kind === "share" ? "folder" : "mount"} “${from.name}”. It disappears for the people you share it with.`);
+    } else if (!from && to) {
+      p.setText(`Replica: “${newPath.split("/").pop()}” is now inside “${to.name}” and is shared with the people who have access to it.`);
+    } else if (from && to) {
+      p.setText(`Replica: “${newPath.split("/").pop()}” moved from “${from.name}” to “${to.name}”: it disappears for the first group and appears for the second.`);
+    }
+    const btn = frag.createEl("button", { text: "Move back" });
+    btn.onclick = () => {
+      void this.app.fileManager.renameFile(f, oldPath);
+      notice.hide();
+    };
+    const notice = new Notice(frag, from ? 20_000 : 8000);
+  }
+
+  private async moveSharedRoot(r: SharedRoot, target: string): Promise<void> {
+    if (r.kind === "guest") {
+      const m = this.settings.guestMounts.find((x) => x.id === r.id);
+      if (!m) return;
+      m.mountPath = target;
+      await this.saveSettings();
+      // The guest engine's keys do not change, only where they live; restart it and the home
+      // engine (whose exclude list changed).
+      await this.restartEngine();
+      return;
+    }
+    const api = new ReplicaApi(this.settings);
+    if (r.kind === "mount") await api.moveMount(r.id, target);
+    else await api.moveShare(r.id, target);
+  }
+
+  /** Move a mount (server or guest) to another folder from the UI: a plain folder rename,
+   *  which the rename handler then follows. */
+  async moveMountFolder(r: SharedRoot, target: string): Promise<void> {
+    target = target.replace(/^\/+|\/+$/g, "");
+    if (!target) throw new Error("choose a folder");
+    const existing = this.app.vault.getAbstractFileByPath(target);
+    if (existing && !(existing instanceof TFolder)) throw new Error(`${target} is a file`);
+    if (existing instanceof TFolder && existing.children.length > 0) throw new Error(`${target} already contains files`);
+    const folder = this.app.vault.getAbstractFileByPath(r.path);
+    if (folder instanceof TFolder) {
+      const parent = target.includes("/") ? target.slice(0, target.lastIndexOf("/")) : "";
+      if (parent && !this.app.vault.getAbstractFileByPath(parent)) await this.app.vault.createFolder(parent);
+      if (existing instanceof TFolder) await this.app.fileManager.trashFile(existing);
+      await this.app.fileManager.renameFile(folder, target);
+    } else {
+      // Nothing on disk yet (empty mount): just tell the server / settings.
+      await this.moveSharedRoot(r, target);
+      await this.refreshSharingRoots();
+    }
   }
 
   async onunload(): Promise<void> {
@@ -198,6 +326,7 @@ export default class ReplicaPlugin extends Plugin {
     if (this.engines.has(target.id)) return;
     const engine = new SyncEngine(this.app, this.settings, this.persistence(scope), target, {
       onStatus: () => this.renderAggregateStatus(),
+      claimRename: (o, n) => this.claimRename(o, n),
     });
     this.engines.set(target.id, engine);
     try {
@@ -221,6 +350,7 @@ export default class ReplicaPlugin extends Plugin {
       new Notice("Replica: set a server URL in settings, or add a shared folder from a ticket, to start syncing");
       return;
     }
+    await this.refreshSharingRoots();
     const starts: Promise<void>[] = [];
     if (home) starts.push(this.launch(home, this.settings.vaultId));
     for (const m of guests) {
@@ -346,4 +476,13 @@ export default class ReplicaPlugin extends Plugin {
         break;
     }
   }
+}
+
+export interface SharedRoot {
+  kind: "share" | "mount" | "guest";
+  id: string;
+  name: string;
+  /** Folder without trailing slash, or the note path for single-note shares. */
+  path: string;
+  isFile: boolean;
 }

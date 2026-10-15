@@ -99,17 +99,40 @@ fn share_mount_edit_revoke_restart() {
     assert!(!c.contains("Shared/X/a.md", "after-revoke"), "carol still receives after revoke");
     assert!(c.exists("Shared/X/a.md"), "carol keeps files");
 
+    // Bob moves his mount to another folder: nothing is deleted for the owner, bob's files move.
+    let info = api_json(&server, &bob_tok, "GET", "/api/vaults/vb/sharing", None);
+    let mid = info["mounts"][0]["id"].as_str().unwrap().to_string();
+    let (code, body) = api_raw(&server, &bob_tok, "PATCH", &format!("/api/mounts/{mid}"), Some(json!({"path": "Team/X"})));
+    assert_eq!(code, 200, "{body}");
+    eventually!(15, b.exists("Team/X/a.md") && !b.exists("Shared/X/a.md") && b.same_bytes("Team/X/pic.png", &a.path("Projects/X/pic.png")), "bob's files moved", b.proc, server.proc);
+    assert!(a.exists("Projects/X/a.md") && a.exists("Projects/X/new.md"), "owner lost files on remount");
+    b.append("Team/X/a.md", "after-remount");
+    eventually!(10, a.contains("Projects/X/a.md", "after-remount"), "edits flow after remount", a.proc, server.proc);
+    let (code, _) = api_raw(&server, &bob_tok, "PATCH", &format!("/api/mounts/{mid}"), Some(json!({"path": "Projects"})));
+    assert_eq!(code, 200, "moving to a folder that is only shared on the other side is fine on this side");
+    eventually!(15, b.exists("Projects/a.md"), "moved again", b.proc);
+
+    // Owner moves the shared folder itself: still shared, nothing deleted for bob.
+    let (code, body) = api_raw(&server, &owner, "PATCH", &format!("/api/shares/{share_id}"), Some(json!({"path": "Work/X"})));
+    assert_eq!(code, 200, "{body}");
+    eventually!(15, a.exists("Work/X/a.md") && !a.exists("Projects/X/a.md"), "owner's files moved", a.proc, server.proc);
+    assert!(b.exists("Projects/a.md") && b.exists("Projects/new.md"), "bob lost files on share move");
+    a.append("Work/X/a.md", "after-share-move");
+    eventually!(10, b.contains("Projects/a.md", "after-share-move"), "edits flow after share move", b.proc, server.proc);
+    let info = api_json(&server, &owner, "GET", "/api/vaults/va/sharing", None);
+    assert_eq!(info["shares"][0]["path"], "Work/X");
+
     // Restart: bridges reattach.
     server.restart(&[]);
-    b.append("Shared/X/a.md", "after-restart");
-    eventually!(30, a.contains("Projects/X/a.md", "after-restart"), "edit flows after restart", a.proc, server.proc);
+    b.append("Projects/a.md", "after-restart");
+    eventually!(30, a.contains("Work/X/a.md", "after-restart"), "edit flows after restart", a.proc, server.proc);
 
     // Unmount keeps files.
     let info = api_json(&server, &bob_tok, "GET", "/api/vaults/vb/sharing", None);
     let mid = info["mounts"][0]["id"].as_str().unwrap().to_string();
     let (code, _) = api_raw(&server, &bob_tok, "DELETE", &format!("/api/mounts/{mid}"), None);
     assert_eq!(code, 204);
-    assert!(b.exists("Shared/X/a.md"));
+    assert!(b.exists("Projects/a.md"));
 
     assert!(server.errors().is_empty(), "server errors: {:?}", server.errors());
 }

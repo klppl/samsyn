@@ -72,6 +72,7 @@ Limits on the link (the node id is public, so everything before the hello must b
 - Read-only mount: the friend's edits under the mount prefix are reverted by the server to the share's content, so the friend's document stays equal to the share. A file the friend creates under the mount (one the share does not have) is not thrown away: before the revert the server copies it to a sibling folder outside the mount, `<mount> (read-only copy)/<same relative path>`, and logs a warning. The same happens if the owner deletes a file while the friend has local content for it.
 - Blobs: when a bridge replays a binary file it copies the bytes into the target store *before* inserting the metadata, so a client that fetches the moment the metadata arrives finds the bytes. The plugin additionally retries a missing blob with backoff (2 s, 5 s, 15 s, 30 s) in case an uploader is slow.
 - Share and mount creation run under one server-wide lock (overlap check, registry insert, bridge attach), so two concurrent requests cannot both pass the overlap check.
+- Moving things around: a mount (and a share) can be moved to another folder. The plugin treats a move of the mount folder, or of an ancestor of it, as a *move*, not as "delete everything": it calls `PATCH /api/mounts/{id}` (or `/api/shares/{id}` for the owner's own shared folder), and the server detaches the bridge, renames the keys inside the vault document and re-attaches with the new prefix, so the other side never sees a deletion. Guest mounts just update their mount path. If the server cannot be reached the plugin moves the folder back, because leaving it would delete the share's content for everyone on the next reconcile. Moving a note or folder *out of* a shared area (or into one, or between two) is allowed but announced with a notice that offers **Move back**, since it disappears for (or appears to) the other people. The headless client has no such protection: moving a mount folder there is a delete plus a create.
 - Revoke grant: mounts made with that ticket stop bridging. Files stay in the friend's vault as ordinary files.
 - Unshare: bridge removed, share document deleted, owner's files untouched; all mounts of it go inert.
 - Unmount: bridge removed, friend's files stay.
@@ -100,6 +101,8 @@ Hygiene on these public routes: unknown share and bad secret answer identically 
 | DELETE | `/api/shares/{id}/grants/{label}` | revoke |
 | DELETE | `/api/shares/{id}` | unshare |
 | POST | `/api/vaults/{vault}/mounts` | `{ticket, mount_path}` → mount |
+| PATCH | `/api/mounts/{id}` | `{path}` → move the mount to another folder (keys renamed server-side, nothing deleted) |
+| PATCH | `/api/shares/{id}` | `{path}` → move the shared folder or note within the owner's vault |
 | DELETE | `/api/mounts/{id}` | unmount |
 | POST | `/api/tickets/inspect` | `{ticket}` → name, access, same_server, valid (local tickets), from_own_vault |
 

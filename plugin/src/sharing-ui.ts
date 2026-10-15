@@ -1,7 +1,7 @@
 import { Notice, Setting } from "obsidian";
 import { ReplicaApi, SharingInfo } from "./api";
 import type ReplicaPlugin from "./main";
-import { ConfirmModal, MountModal, NewTicketModal, ShareModal } from "./sharing-modals";
+import { ConfirmModal, MountModal, MoveMountModal, NewTicketModal, ShareModal } from "./sharing-modals";
 
 const accessText = (a: string) => (a === "ro" ? "read only" : "read & write");
 
@@ -57,6 +57,7 @@ export class SharingSection {
       const next = await this.api.sharing();
       this.error = null;
       if (before) this.announceChanges(before, next);
+      void this.plugin.refreshSharingRoots(next);
       if (quiet && JSON.stringify(before) === JSON.stringify(next)) return;
       this.info = next;
     } catch (e) {
@@ -186,7 +187,14 @@ export class SharingSection {
       const card = el.createDiv({ cls: "replica-card" + (revoked ? " replica-revoked" : "") });
       const row = new Setting(card).setName(m.name).setClass("replica-card-head");
       if (revoked) row.setDesc(`${m.mount_path} · access revoked by the owner · no longer syncing · your copy stays as ordinary notes`);
-      else row.setDesc(`${m.mount_path} · ${accessText(m.access)} · ${describeStatus(m.status)}`);
+      else {
+        row.setDesc(`${m.mount_path} · ${accessText(m.access)} · ${describeStatus(m.status)}`);
+        row.addButton((b) =>
+          b.setButtonText("Move…").onClick(() =>
+            new MoveMountModal(this.plugin, { kind: "mount", id: m.id, name: m.name, path: m.mount_path, isFile: false }, reload).open(),
+          ),
+        );
+      }
       row.addButton((b) =>
         b.setButtonText(revoked ? "Remove" : "Unmount").onClick(() =>
           this.confirm(
@@ -237,6 +245,11 @@ export class SharingSection {
         .setName(m.name)
         .setClass("replica-card-head")
         .setDesc(`${m.mountPath} · ${accessText(m.access)} · guest of ${m.url.replace(/^https?:\/\//, "")} · ${status}`)
+        .addButton((b) =>
+          b.setButtonText("Move…").onClick(() =>
+            new MoveMountModal(this.plugin, { kind: "guest", id: m.id, name: m.name, path: m.mountPath, isFile: false }, () => this.render()).open(),
+          ),
+        )
         .addButton((b) =>
           b.setButtonText("Unmount").onClick(() =>
             this.confirm(

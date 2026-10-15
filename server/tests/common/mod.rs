@@ -164,6 +164,7 @@ pub fn api_raw(server: &Server, token: &str, method: &str, path: &str, body: Opt
         "POST" => client.post(&url),
         "DELETE" => client.delete(&url),
         "PUT" => client.put(&url),
+        "PATCH" => client.patch(&url),
         m => panic!("method {m}"),
     };
     if !token.is_empty() {

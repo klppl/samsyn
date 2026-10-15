@@ -11,6 +11,7 @@ export interface Grant {
 export interface ShareRow {
   id: string;
   name: string;
+  /** Folder (no trailing slash) or note path. */
   path: string;
   prefix: string;
   only_file: string | null;
@@ -95,6 +96,12 @@ export class ReplicaApi {
   }
   mount(ticket: string, mountPath: string): Promise<{ mount_path: string; access: string }> {
     return this.call("POST", `/api/vaults/${this.vault()}/mounts`, { ticket, mount_path: mountPath || undefined });
+  }
+  moveMount(mountId: string, path: string): Promise<{ mount_path: string }> {
+    return this.call("PATCH", `/api/mounts/${mountId}`, { path });
+  }
+  moveShare(shareId: string, path: string): Promise<{ path: string }> {
+    return this.call("PATCH", `/api/shares/${shareId}`, { path });
   }
   inspectTicket(ticket: string): Promise<TicketInfo> {
     return this.call("POST", `/api/tickets/inspect`, { ticket });

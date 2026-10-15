@@ -373,6 +373,12 @@ impl Registry {
         Ok(rows.collect::<Result<_, _>>()?)
     }
 
+    /// Move a share to another folder or note in the same vault (the share itself is unchanged).
+    pub fn update_share_path(&self, id: &str, prefix: &str, only_file: Option<&str>) -> anyhow::Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        Ok(conn.execute("UPDATE shares SET prefix = ?1, only_file = ?2 WHERE id = ?3", params![prefix, only_file, id])? > 0)
+    }
+
     pub fn delete_share(&self, id: &str) -> anyhow::Result<bool> {
         let conn = self.conn.lock().unwrap();
         Ok(conn.execute("DELETE FROM shares WHERE id = ?1", params![id])? > 0)
@@ -516,6 +522,11 @@ impl Registry {
         let mut stmt = conn.prepare(&format!("{MOUNT_COLS} WHERE share_id = ?1"))?;
         let rows = stmt.query_map(params![share_id], row_to_mount)?;
         Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    pub fn update_mount_prefix(&self, id: &str, prefix: &str) -> anyhow::Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        Ok(conn.execute("UPDATE mounts SET mount_prefix = ?1 WHERE id = ?2", params![prefix, id])? > 0)
     }
 
     pub fn delete_mount(&self, id: &str) -> anyhow::Result<bool> {

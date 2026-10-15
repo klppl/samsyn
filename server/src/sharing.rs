@@ -428,6 +428,155 @@ pub async fn create_mount(
     Json(serde_json::json!({ "mount": mount, "mount_path": mount_path, "access": access })).into_response()
 }
 
+// ------------------------------------------------------------------ PATCH /api/mounts/{id}, PATCH /api/shares/{id}
+
+#[derive(Deserialize)]
+pub struct MovePath {
+    /// Mounts: the new folder. Shares: the new folder or note path.
+    #[serde(alias = "mount_path")]
+    pub path: String,
+}
+
+/// Overlap check for a new prefix, ignoring the row being moved.
+fn prefix_taken(state: &SharedState, vault_id: &str, skip_share: Option<&str>, skip_mount: Option<&str>, full: &str) -> anyhow::Result<bool> {
+    let reg = state.storage.registry();
+    for s in reg.shares_for_vault(vault_id)? {
+        if Some(s.id.as_str()) == skip_share {
+            continue;
+        }
+        let t = match &s.only_file { Some(f) => format!("{}{}", s.prefix, f), None => s.prefix.clone() };
+        if overlaps(&t, full) {
+            return Ok(true);
+        }
+    }
+    for m in reg.mounts_for_vault(vault_id)? {
+        if m.revoked_at.is_some() || Some(m.id.as_str()) == skip_mount {
+            continue;
+        }
+        if overlaps(&m.mount_prefix, full) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// Move a mount to another folder. Used by the plugin when the user moves the folder in
+/// Obsidian (so the move never looks like a deletion to the owner) and by the Move… dialog.
+pub async fn move_mount(
+    Path(id): Path<String>,
+    Query(query): Query<HashMap<String, String>>,
+    headers: HeaderMap,
+    State(state): State<SharedState>,
+    Json(body): Json<MovePath>,
+) -> Response {
+    let user = match authenticate(&state, &headers, &query) {
+        Ok(u) => u,
+        Err(r) => return r,
+    };
+    let reg = state.storage.registry();
+    let mount = match reg.mount_by_id(&id) {
+        Ok(Some(m)) if m.user_id == user.id => m,
+        Ok(_) => return err(StatusCode::NOT_FOUND, "no such mount"),
+        Err(e) => return internal(e),
+    };
+    if mount.revoked_at.is_some() {
+        return err(StatusCode::CONFLICT, "this mount was revoked; remove it instead");
+    }
+    let new_path = clean_path(&body.path);
+    if new_path.is_empty() {
+        return err(StatusCode::BAD_REQUEST, "path is required");
+    }
+    let new_prefix = format!("{new_path}/");
+    if new_prefix == mount.mount_prefix {
+        return Json(serde_json::json!({ "mount_path": new_path })).into_response();
+    }
+    let _admin = state.docs.share_admin.lock().unwrap();
+    match prefix_taken(&state, &mount.vault_id, None, Some(&mount.id), &new_prefix) {
+        Ok(true) => return err(StatusCode::CONFLICT, "the new folder overlaps another share or mount"),
+        Ok(false) => {}
+        Err(e) => return internal(e),
+    }
+    let doc = match state.docs.load_vault_by_id(&mount.vault_id) {
+        Ok(d) => d,
+        Err(e) => return internal(e),
+    };
+    // The target may already hold exactly the moved files (Obsidian moved them before telling
+    // us), but never unrelated ones.
+    let old_keys: Vec<String> = doc.keys().into_iter().filter(|k| k.starts_with(&mount.mount_prefix)).collect();
+    let stray = doc.keys().into_iter().any(|k| {
+        k.starts_with(&new_prefix) && !old_keys.iter().any(|o| format!("{new_prefix}{}", &o[mount.mount_prefix.len()..]) == k)
+    });
+    if stray {
+        return err(StatusCode::CONFLICT, format!("'{new_path}' already contains other files; choose an empty or new folder"));
+    }
+    if let Err(e) = state.docs.move_prefix(&mount.vault_id, &mount.share_id, Some(&mount.id), &mount.mount_prefix, &new_prefix, None, None) {
+        return internal(e);
+    }
+    tracing::info!(user = %user.name, "moved mount {} -> {}", mount.mount_prefix, new_prefix);
+    Json(serde_json::json!({ "mount_path": new_path })).into_response()
+}
+
+/// Move a share's folder or note within the owner's vault. What is shared does not change.
+pub async fn move_share(
+    Path(id): Path<String>,
+    Query(query): Query<HashMap<String, String>>,
+    headers: HeaderMap,
+    State(state): State<SharedState>,
+    Json(body): Json<MovePath>,
+) -> Response {
+    let user = match authenticate(&state, &headers, &query) {
+        Ok(u) => u,
+        Err(r) => return r,
+    };
+    let share = match owned_share(&state, &user, &id) {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    let new_path = clean_path(&body.path);
+    if new_path.is_empty() {
+        return err(StatusCode::BAD_REQUEST, "path is required");
+    }
+    let (new_prefix, new_file) = if share.only_file.is_some() {
+        match new_path.rsplit_once('/') {
+            Some((dir, file)) => (format!("{dir}/"), Some(file.to_string())),
+            None => (String::new(), Some(new_path.clone())),
+        }
+    } else {
+        (format!("{new_path}/"), None)
+    };
+    let full = match &new_file { Some(f) => format!("{new_prefix}{f}"), None => new_prefix.clone() };
+    let old_full = match &share.only_file { Some(f) => format!("{}{}", share.prefix, f), None => share.prefix.clone() };
+    if full == old_full {
+        return Json(serde_json::json!({ "path": new_path })).into_response();
+    }
+    let _admin = state.docs.share_admin.lock().unwrap();
+    match prefix_taken(&state, &share.vault_id, Some(&share.id), None, &full) {
+        Ok(true) => return err(StatusCode::CONFLICT, "the new path overlaps another share or mount"),
+        Ok(false) => {}
+        Err(e) => return internal(e),
+    }
+    let doc = match state.docs.load_vault_by_id(&share.vault_id) {
+        Ok(d) => d,
+        Err(e) => return internal(e),
+    };
+    let keys = doc.keys();
+    let stray = keys.iter().any(|k| {
+        let under_new = if new_file.is_some() { *k == full } else { k.starts_with(&new_prefix) };
+        under_new && !keys.iter().any(|o| {
+            let under_old = if share.only_file.is_some() { *o == old_full } else { o.starts_with(&share.prefix) };
+            under_old && format!("{full}{}", &o[old_full.len()..]) == *k
+        })
+    });
+    if stray {
+        return err(StatusCode::CONFLICT, format!("'{new_path}' already contains other files"));
+    }
+    if let Err(e) = state.docs.move_prefix(&share.vault_id, &share.id, None, &share.prefix, &new_prefix, share.only_file.as_deref(), new_file.as_deref()) {
+        return internal(e);
+    }
+    tracing::info!(user = %user.name, share = %share.name, "moved share {old_full} -> {full}");
+    Json(serde_json::json!({ "path": new_path })).into_response()
+}
+
 // ------------------------------------------------------------------ POST /api/tickets/inspect
 
 #[derive(Deserialize)]
