@@ -153,15 +153,19 @@ Why not files in `.obsidian/plugins/replica/`: the previous `doc.bin`/`state.jso
 
 ### Size limits, and what actually bounds a vault on a phone
 
-APFS has no 4 GB file limit (that is FAT32); IndexedDB stores are split into many records anyway. What bounds a vault on iOS is **RAM**: Yjs keeps the whole document in memory with per-insert bookkeeping, roughly 2–5× the text size, and iOS kills an app that goes past about 1–1.5 GB. Rules of thumb:
+APFS has no 4 GB file limit (that is FAT32); IndexedDB stores are split into many records anyway. What bounds a vault on iOS is **RAM**: Yjs keeps the whole document in memory, and iOS kills an app that goes past about 1–1.5 GB. Measured with `yjs` 13.6 in Node (heap growth per byte of text):
 
-| Text in vault (all `.md`) | Doc in RAM | Verdict on a phone |
-|---|---|---|
-| ≤ 20 MB | ≤ 100 MB | fine |
-| 20–100 MB | 0.1–0.5 GB | works, slower start |
-| > 100 MB | > 0.5 GB | not safe; needs the partial-document design below |
+| How the text got into the document | Heap per byte of text |
+|---|---|
+| Inserted whole (first sync, files written outside the editor) | ≈ 1× |
+| Typed live, word by word, in the current session | ≈ 10× |
+| Typed live, character by character, in the current session | ≈ 32× |
+| Any of the above after a reload (items merge on load) | ≈ 1× |
+| 20 % of the text deleted (tombstones remain) | ≈ 2× |
 
-Binary files never enter the document (only `{hash, size, mtime}`), so attachments do not count. Mitigations, in order: the Status section warns above 100 MB of document; next step if a user hits it is splitting the vault document into per-folder subdocuments loaded on demand (Yjs subdocs, server keeps the same per-vault store), which is a protocol change on both sides and is not started.
+So at startup a vault costs about its text size, plus tombstones; live typing only inflates what was typed since the last start. Loading a 50 MB document takes ~20 ms and encoding it ~40 ms (what `y-indexeddb` does every 500 updates). Rules of thumb for a phone: up to ~200 MB of Markdown is fine, 200–500 MB works with slow first sync, beyond that the single-document model needs the partial-loading design below. Binary files never enter the document (only `{hash, size, mtime}`), so attachments do not count.
+
+What still costs at the high end: the first sync sends the whole state as one WebSocket message (a buffer the size of the vault, decoded on the phone), and the server holds every loaded vault in RAM too. The Status section warns above 100 MB of document. If a user hits the limit the fix is per-file documents loaded on demand behind a small index document (Yjs subdocs over a multiplexed stream); it is a protocol change on both sides and is not started.
 
 ## Safety behaviour worth knowing while testing
 
