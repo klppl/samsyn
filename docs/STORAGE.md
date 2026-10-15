@@ -44,6 +44,19 @@ One Yjs document per vault, two top-level maps:
 
 Delete = remove the key. Rename = new key with a copy + remove old key. The server never interprets the content; it only stores and relays updates, so the schema can evolve on the plugin side.
 
+## Schema migrations
+
+`registry.db` carries its schema version in SQLite's `PRAGMA user_version` (`REGISTRY_SCHEMA_VERSION` in `server/src/storage/registry.rs`, currently 2). On every open the server first creates any *missing* tables in their current shape, then runs the numbered steps in `migrate()` from the stored version up to the current one and records the new version. A database written by a newer server is refused with a clear error instead of being touched.
+
+Rules for changing the schema:
+
+1. Never edit an existing `CREATE TABLE` and hope `IF NOT EXISTS` applies it: it does not. Add a numbered step.
+2. Steps are additive and idempotent (`ADD COLUMN` guarded by a column check, new tables, new indexes). A table that must change shape and may hold data is renamed to `<name>_legacy_vN`, never dropped.
+3. Bump `REGISTRY_SCHEMA_VERSION` with the step, add a test in `migration_tests` that opens a database of the old shape, and note the change here.
+4. Document data (`doc.db`, blobs, snapshots) has no schema beyond the Yjs update log; it is versioned by `server.json`'s `schema_version` and would get the same treatment.
+
+History: v1 replaced the empty, reserved `mounts` table from the first scaffold with the sharing model (renamed to `mounts_legacy_v0` if it ever had rows); v2 added `home_addrs` and `only_file` for server-to-server mounts.
+
 ## Durability
 
 - Every update a client sends is appended to `doc.db` **before** it is broadcast (the persistence callback runs inside the commit). SQLite runs in WAL mode with `synchronous=NORMAL`: durable across process crashes, and across power loss except for the last few milliseconds.

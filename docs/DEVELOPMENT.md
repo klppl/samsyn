@@ -189,6 +189,10 @@ Scenario test (one server, three users, headless clients as plugins): `server/sc
 
 Scenario test: `server/scripts/remote-e2e.sh` (two servers, ports 8798/8799 + p2p 9798/9799, `REPLICA_E2E_RELAY=none|default|<url>`). Covers probe of a bad ticket, mount over p2p, blobs both ways, concurrent edits, read-only, revoke → mount revoked on the other server, restart of either server, unmount. It takes 3–4 minutes.
 
+## Changing the registry schema
+
+Numbered migrations in `server/src/storage/registry.rs` (`migrate()`, `REGISTRY_SCHEMA_VERSION`, `PRAGMA user_version`). Add a step, bump the version, add a `migration_tests` case that opens the old shape. `CREATE TABLE IF NOT EXISTS` never changes an existing table, which is exactly how the first scaffold's reserved `mounts` table survived into a running server and broke it. See docs/STORAGE.md "Schema migrations".
+
 ## Tests
 
 ```sh

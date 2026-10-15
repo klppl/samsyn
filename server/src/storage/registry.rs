@@ -139,19 +139,7 @@ impl Registry {
             CREATE INDEX IF NOT EXISTS mounts_share ON mounts(share_id);
             "#,
         )?;
-        // Additive migrations (schema v1 -> v1.1): remote mounts need the owner's addresses
-        // and the single-note flag locally, since the share row lives on another server.
-        let cols: Vec<String> = {
-            let mut stmt = conn.prepare("PRAGMA table_info(mounts)")?;
-            let rows = stmt.query_map([], |r| r.get::<_, String>(1))?;
-            rows.collect::<Result<_, _>>()?
-        };
-        if !cols.iter().any(|c| c == "home_addrs") {
-            conn.execute_batch("ALTER TABLE mounts ADD COLUMN home_addrs TEXT NOT NULL DEFAULT ''")?;
-        }
-        if !cols.iter().any(|c| c == "only_file") {
-            conn.execute_batch("ALTER TABLE mounts ADD COLUMN only_file TEXT")?;
-        }
+        migrate(&conn)?;
         Ok(Self { conn: Arc::new(Mutex::new(conn)) })
     }
 
@@ -539,6 +527,86 @@ impl Registry {
     }
 }
 
+// ---------------------------------------------------------------------- schema migrations
+//
+// The CREATE TABLE IF NOT EXISTS block above describes the *current* shape and only ever
+// creates missing tables. Anything that changes an existing table lives here as a numbered
+// step, tracked in SQLite's `PRAGMA user_version`. Rules: steps are additive and idempotent,
+// never drop a table that could hold user data (rename it `<name>_legacy_vN` instead), and
+// bump REGISTRY_SCHEMA_VERSION together with the new step. See docs/STORAGE.md.
+
+/// Current registry schema version (`PRAGMA user_version` after all steps ran).
+pub const REGISTRY_SCHEMA_VERSION: u32 = 2;
+
+fn migrate(conn: &Connection) -> anyhow::Result<()> {
+    let mut version: u32 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+    let start = version;
+
+    if version < 1 {
+        // v1: the sharing model. Databases from the first scaffold carry an empty, reserved
+        // `mounts` table with a different shape (vault_id, mount_path, share_id, remote_server).
+        if !has_column(conn, "mounts", "user_id")? {
+            let rows: i64 = conn.query_row("SELECT count(*) FROM mounts", [], |r| r.get(0))?;
+            if rows > 0 {
+                tracing::warn!("registry: keeping {rows} rows of the pre-sharing mounts table as mounts_legacy_v0");
+                conn.execute_batch("ALTER TABLE mounts RENAME TO mounts_legacy_v0")?;
+            } else {
+                conn.execute_batch("DROP TABLE mounts")?;
+            }
+            conn.execute_batch(
+                r#"
+                CREATE TABLE mounts (
+                    id           TEXT PRIMARY KEY,
+                    user_id      TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                    vault_id     TEXT NOT NULL REFERENCES vaults(id) ON DELETE CASCADE,
+                    share_id     TEXT NOT NULL,
+                    share_name   TEXT NOT NULL,
+                    mount_prefix TEXT NOT NULL,
+                    access       TEXT NOT NULL,
+                    home_node    TEXT NOT NULL,
+                    secret       TEXT NOT NULL,
+                    created_at   TEXT NOT NULL,
+                    revoked_at   TEXT
+                );
+                CREATE INDEX IF NOT EXISTS mounts_vault ON mounts(vault_id);
+                CREATE INDEX IF NOT EXISTS mounts_share ON mounts(share_id);
+                "#,
+            )?;
+        }
+        version = 1;
+    }
+
+    if version < 2 {
+        // v2: remote mounts (server-to-server) need the owner's addresses and the single-note flag.
+        if !has_column(conn, "mounts", "home_addrs")? {
+            conn.execute_batch("ALTER TABLE mounts ADD COLUMN home_addrs TEXT NOT NULL DEFAULT ''")?;
+        }
+        if !has_column(conn, "mounts", "only_file")? {
+            conn.execute_batch("ALTER TABLE mounts ADD COLUMN only_file TEXT")?;
+        }
+        version = 2;
+    }
+
+    if version > REGISTRY_SCHEMA_VERSION {
+        anyhow::bail!(
+            "registry.db schema is v{version} but this server only knows v{REGISTRY_SCHEMA_VERSION}; upgrade the server"
+        );
+    }
+    if version != start {
+        conn.pragma_update(None, "user_version", version)?;
+        tracing::info!("registry: migrated schema v{start} -> v{version}");
+    } else if start == 0 {
+        conn.pragma_update(None, "user_version", REGISTRY_SCHEMA_VERSION)?;
+    }
+    Ok(())
+}
+
+fn has_column(conn: &Connection, table: &str, column: &str) -> anyhow::Result<bool> {
+    let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+    let cols: Vec<String> = stmt.query_map([], |r| r.get::<_, String>(1))?.collect::<Result<_, _>>()?;
+    Ok(cols.iter().any(|c| c == column))
+}
+
 const SHARE_COLS: &str = "SELECT id, user_id, vault_id, name, prefix, only_file, created_at FROM shares";
 const MOUNT_COLS: &str = "SELECT id, user_id, vault_id, share_id, share_name, mount_prefix, access, home_node, secret, created_at, revoked_at, home_addrs, only_file FROM mounts";
 
@@ -574,4 +642,72 @@ fn row_to_mount(r: &rusqlite::Row) -> rusqlite::Result<MountInfo> {
 
 fn row_to_vault(r: &rusqlite::Row) -> rusqlite::Result<VaultInfo> {
     Ok(VaultInfo { id: r.get(0)?, user_id: r.get(1)?, name: r.get(2)?, created_at: r.get(3)? })
+}
+
+#[cfg(test)]
+mod migration_tests {
+    use super::*;
+
+    fn open_with(sql: &str) -> (tempfile::TempDir, Registry) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("registry.db");
+        {
+            let c = Connection::open(&path).unwrap();
+            c.execute_batch(sql).unwrap();
+        }
+        let reg = Registry::open(&path).unwrap();
+        (dir, reg)
+    }
+
+    fn user_version(reg: &Registry) -> u32 {
+        reg.conn.lock().unwrap().query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap()
+    }
+
+    #[test]
+    fn fresh_db_is_current() {
+        let (_d, reg) = open_with("");
+        assert_eq!(user_version(&reg), REGISTRY_SCHEMA_VERSION);
+        assert!(has_column(&reg.conn.lock().unwrap(), "mounts", "home_addrs").unwrap());
+    }
+
+    #[test]
+    fn scaffold_v0_reserved_mounts_table_is_replaced() {
+        let (_d, reg) = open_with(
+            "CREATE TABLE users (id TEXT PRIMARY KEY, name TEXT NOT NULL UNIQUE, created_at TEXT NOT NULL);
+             CREATE TABLE vaults (id TEXT PRIMARY KEY, user_id TEXT NOT NULL, name TEXT NOT NULL, created_at TEXT NOT NULL);
+             CREATE TABLE mounts (id TEXT PRIMARY KEY, vault_id TEXT NOT NULL, mount_path TEXT NOT NULL, share_id TEXT NOT NULL, remote_server TEXT, created_at TEXT NOT NULL);",
+        );
+        assert_eq!(user_version(&reg), REGISTRY_SCHEMA_VERSION);
+        let c = reg.conn.lock().unwrap();
+        assert!(has_column(&c, "mounts", "user_id").unwrap());
+        assert!(has_column(&c, "mounts", "only_file").unwrap());
+        drop(c);
+        // The query that failed in the field now works.
+        assert!(reg.mounts_for_vault("nope").unwrap().is_empty());
+    }
+
+    #[test]
+    fn phase1_db_gets_v2_columns() {
+        let (_d, reg) = open_with(
+            "CREATE TABLE users (id TEXT PRIMARY KEY, name TEXT NOT NULL UNIQUE, created_at TEXT NOT NULL);
+             CREATE TABLE vaults (id TEXT PRIMARY KEY, user_id TEXT NOT NULL, name TEXT NOT NULL, created_at TEXT NOT NULL);
+             CREATE TABLE mounts (id TEXT PRIMARY KEY, user_id TEXT NOT NULL, vault_id TEXT NOT NULL, share_id TEXT NOT NULL, share_name TEXT NOT NULL, mount_prefix TEXT NOT NULL, access TEXT NOT NULL, home_node TEXT NOT NULL, secret TEXT NOT NULL, created_at TEXT NOT NULL, revoked_at TEXT);
+             INSERT INTO mounts VALUES ('m1','u','v','s','S','Shared/S/','rw','node','sec','t',NULL);",
+        );
+        assert_eq!(user_version(&reg), REGISTRY_SCHEMA_VERSION);
+        let m = reg.mount_by_id("m1").unwrap().unwrap();
+        assert!(m.home_addrs.is_empty());
+        assert_eq!(m.only_file, None);
+    }
+
+    #[test]
+    fn newer_schema_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("registry.db");
+        {
+            let c = Connection::open(&path).unwrap();
+            c.pragma_update(None, "user_version", 99u32).unwrap();
+        }
+        assert!(Registry::open(&path).is_err());
+    }
 }
