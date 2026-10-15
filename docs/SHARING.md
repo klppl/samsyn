@@ -7,7 +7,7 @@ Goal: share one folder or one note from my vault with another person, with live 
 1. **The plugin does not know about sharing.** It syncs one vault document with its server exactly as today. Its only sharing-related features are UI calls to the server: create a share, show the ticket, mount a ticket, revoke, unshare.
 2. **The server composes.** It knows which paths are shared and keeps the shared subtree equal between the owner's vault document and a separate *share document*; on the other side it keeps the share document equal to the subtree at the mount path in the friend's vault document.
 3. **One ticket = one share, fixed at creation.** A ticket grants access to exactly the folder or note it was created for. Changing what a ticket covers is not supported; create a new share instead.
-4. **Server-to-server over iroh** (phase 2). The share document is replicated between the two servers over an encrypted QUIC connection with NAT traversal; neither server needs an open port.
+4. **Server-to-server over iroh.** The share document is replicated between the two servers over an encrypted QUIC connection with NAT traversal; neither server needs an open port.
 
 ## Why a bridge instead of a shared document
 

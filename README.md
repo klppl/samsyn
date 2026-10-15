@@ -91,9 +91,9 @@ Obsidian → Settings → Replica:
 | Token      | the `rp_…` token printed by the server                       |
 | Vault ID   | defaults to the vault name; use the same ID on every device  |
 
-Press **Test connection** (checks server and token), then **Reconnect**. The **Status** section at the top of the settings page shows live state, last error and hints; on desktop the status bar shows it too. The command **Replica: Show sync status** works on every platform.
+Press **Test connection** (checks server and token), then **Reconnect**. The **Status** section at the top of the Server tab shows live state, last error and hints; on desktop the status bar shows it too. The command **Replica: Show sync status** works on every platform.
 
-Repeat on each device with the same server, token and vault ID. That is all.
+Repeat on each device with the same server, token and vault ID. That is all. (No server of your own? You can still take part in folders others share with you: Sharing tab → *Add from ticket…*.)
 
 ## How it works
 
@@ -130,6 +130,8 @@ replica-server sync --server https://sync.example.com --token rp_... --vault not
 - Works offline and catches up on reconnect. Bookkeeping lives in `<dir>/.replica/` (do not copy that folder to another machine).
 - `--once` connects, syncs, and exits when idle. Good for cron or a deploy step.
 - Same mass-delete guard as the plugin: removing most of the vault from the directory is held back unless `--allow-mass-delete` is set.
+- Folders mounted read-only from someone else's share are respected: edits there are not sent, the server's version is put back, new files move to `<mount> (read-only copy)/`, and the files are marked read-only on disk.
+- Guest mode, no account needed: `replica-server sync --ticket <ticket> --dir /srv/x` syncs one shared folder straight from the owner's server (the ticket must come from a server started with `--public-url`). A revoked ticket makes the client exit.
 
 All flags can be environment variables (`REPLICA_SERVER`, `REPLICA_TOKEN`, `REPLICA_VAULT`, `REPLICA_DIR`). A systemd unit:
 

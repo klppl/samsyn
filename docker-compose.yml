@@ -14,5 +14,7 @@ services:
       - ./data:/data
     environment:
       RUST_LOG: info
+      # Public https URL of this server; lets people without a server join your shares with a ticket.
+      # REPLICA_PUBLIC_URL: "https://sync.example.com"
       # REPLICA_SNAPSHOT_HOURS: "24"
       # REPLICA_MAX_BLOB_MB: "256"

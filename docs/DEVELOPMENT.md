@@ -127,7 +127,7 @@ adb push plugin/main.js plugin/manifest.json plugin/styles.css \
 
 Obsidian mobile does not expose a developer console. Options, in order of usefulness:
 
-0. **Settings → Replica → Status.** Live status, whether the initial sync completed, peer count, file counts, the exact WebSocket URL, last error and a hint. Also the command **Replica: Show sync status**. Check this first.
+0. **Settings → Replica → Server tab → Status.** Live status, whether the initial sync completed, peer count, file counts, the exact WebSocket URL, last error and a hint. Also the command **Replica: Show sync status**. Check this first.
 1. **Watch the server.** `RUST_LOG=debug cargo run -- serve` shows every connection, auth failure and message. Most mobile issues (wrong URL, token, mixed content) are visible there.
 2. **Use the status bar and Notices.** Replica reports connection state in the status bar and shows a Notice on errors that matter.
 3. **Android: Chrome remote debugging.** With USB debugging enabled, `chrome://inspect` on a desktop Chrome lists the Obsidian WebView and gives a full console. Obsidian on Android must be a debuggable build for this; recent releases are, if not, fall back to 1 and 2.
@@ -173,7 +173,7 @@ What still costs at the high end: the first sync sends the whole state as one We
 
 ## Safety behaviour worth knowing while testing
 
-- **Sync state is device-bound.** `state.json` records which files this install has seen in sync. It is tagged with a per-device install id (Obsidian's `appId`, falling back to localStorage) and ignored if it was copied from another device along with `.obsidian`. Copying `doc.bin` is harmless; copying `state.json` used to make the new device think every file had been deleted locally.
+- **Sync state is device-bound.** The "last synced" hashes live in IndexedDB on the device (see "Local cache on the device"), never in the vault folder, so copying `.obsidian` to another device cannot carry one device's bookkeeping along. (The old `state.json` was the cause of a phone deleting a vault once; it is migrated and removed on first start.)
 - **Mass-delete guard.** If one reconcile would remove at least 5 files and more than half of the shared vault, the plugin refuses, re-downloads them, shows a Notice, and lists them under *Held back* on the settings page. The command **Replica: Apply held-back deletions** does it for real. Single and small deletions are applied normally.
 - **Remote deletions go to trash**, never a hard delete (Obsidian's "Deleted files" setting decides system trash vs `.trash/`).
 
