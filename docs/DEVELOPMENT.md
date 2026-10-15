@@ -205,7 +205,7 @@ Leftover `sync` processes keep watching their directory. Kill them before deleti
 
 Scenario test (one server, three users, headless clients as plugins): `server/scripts/share-e2e.sh`. Needs a debug build (`cargo build` in `server/`), uses port 8798 and a temp dir (`REPLICA_E2E_DIR=… ` to keep it), kills every running `replica-server` first. Covers create, overlap race, mount, both-way and concurrent edits, blobs, read-only revert and rescue copy, revoke, restart, unmount. Turning it into a Rust integration test is still on the list.
 
-Presence across a bridge: `server/scripts/presence-e2e.sh` (one server, Node y-websocket clients from `plugin/tests/presence-e2e.mjs`, needs `npm install` in `plugin/`).
+Guest mode: `server/scripts/guest-e2e.sh` (owner server with `--public-url`, two headless guests via `--ticket`, rw and ro, auth hygiene, revoke). Presence across a bridge: `server/scripts/presence-e2e.sh` (one server, Node y-websocket clients from `plugin/tests/presence-e2e.mjs`, needs `npm install` in `plugin/`).
 
 ### Server to server (iroh)
 

@@ -1,10 +1,15 @@
-//! Share tickets: `replica` + base32(postcard(TicketV1)). Self-contained: tells the
-//! receiving server which share, on which node, with which secret and access level.
+//! Share tickets: `replica` + base32(postcard(Ticket)). Self-contained: tells the receiving
+//! side which share, on which node, with which secret and access level, and (v2) the owner
+//! server's public URL so a plugin without its own server can join directly ("guest mode").
+//!
+//! Postcard is not self-describing, so the leading version byte selects the layout: v1 has no
+//! `url`; v2 appends it. New tickets are always v2; both are accepted.
 
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
 
 pub const PREFIX: &str = "replica";
+pub const CURRENT_VERSION: u8 = 2;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Ticket {
@@ -15,13 +20,39 @@ pub struct Ticket {
     pub node_id: String,
     pub secret: String,
     pub access: String,
-    /// Relay URL and direct addresses of the owner server (phase 2). Empty = unknown.
+    /// Relay URL and direct addresses of the owner server. Empty = unknown.
     pub addrs: Vec<String>,
+    /// Owner server's public HTTPS URL for guest clients (v2). Empty = not reachable that way.
+    pub url: String,
+}
+
+/// Wire layout of version 1 tickets (kept so old tickets keep working).
+#[derive(Serialize, Deserialize)]
+struct TicketV1 {
+    version: u8,
+    share_id: String,
+    name: String,
+    node_id: String,
+    secret: String,
+    access: String,
+    addrs: Vec<String>,
 }
 
 impl Ticket {
     pub fn encode(&self) -> anyhow::Result<String> {
-        let bytes = postcard::to_stdvec(self)?;
+        let bytes = if self.version == 1 {
+            postcard::to_stdvec(&TicketV1 {
+                version: 1,
+                share_id: self.share_id.clone(),
+                name: self.name.clone(),
+                node_id: self.node_id.clone(),
+                secret: self.secret.clone(),
+                access: self.access.clone(),
+                addrs: self.addrs.clone(),
+            })?
+        } else {
+            postcard::to_stdvec(self)?
+        };
         Ok(format!("{PREFIX}{}", data_encoding::BASE32_NOPAD.encode(&bytes).to_ascii_lowercase()))
     }
 
@@ -31,9 +62,24 @@ impl Ticket {
         let bytes = data_encoding::BASE32_NOPAD
             .decode(body.to_ascii_uppercase().as_bytes())
             .context("ticket is not valid base32")?;
-        let t: Ticket = postcard::from_bytes(&bytes).context("ticket payload is malformed")?;
-        anyhow::ensure!(t.version == 1, "unsupported ticket version {}", t.version);
-        Ok(t)
+        match bytes.first() {
+            Some(1) => {
+                let t: TicketV1 = postcard::from_bytes(&bytes).context("ticket payload is malformed")?;
+                Ok(Ticket {
+                    version: 1,
+                    share_id: t.share_id,
+                    name: t.name,
+                    node_id: t.node_id,
+                    secret: t.secret,
+                    access: t.access,
+                    addrs: t.addrs,
+                    url: String::new(),
+                })
+            }
+            Some(2) => Ok(postcard::from_bytes(&bytes).context("ticket payload is malformed")?),
+            Some(v) => anyhow::bail!("unsupported ticket version {v}; upgrade this server"),
+            None => anyhow::bail!("ticket payload is empty"),
+        }
     }
 }
 
@@ -41,20 +87,43 @@ impl Ticket {
 mod tests {
     use super::*;
 
-    #[test]
-    fn round_trip() {
-        let t = Ticket {
-            version: 1,
+    fn sample() -> Ticket {
+        Ticket {
+            version: CURRENT_VERSION,
             share_id: "0123456789abcdef".into(),
             name: "Project X".into(),
             node_id: "ab".repeat(32),
             secret: "cd".repeat(32),
             access: "rw".into(),
-            addrs: vec![],
-        };
+            addrs: vec!["relay:https://r.example/".into()],
+            url: "https://sync.example".into(),
+        }
+    }
+
+    #[test]
+    fn round_trip_v2() {
+        let t = sample();
         let s = t.encode().unwrap();
         assert!(s.starts_with("replica"));
         assert_eq!(Ticket::decode(&s).unwrap(), t);
         assert_eq!(Ticket::decode(&format!("  {}\n", s.to_ascii_uppercase().replacen("REPLICA", "replica", 1))).unwrap(), t);
+    }
+
+    #[test]
+    fn v1_tickets_still_decode() {
+        let mut t = sample();
+        t.version = 1;
+        t.url.clear();
+        let s = t.encode().unwrap();
+        let back = Ticket::decode(&s).unwrap();
+        assert_eq!(back, t);
+        assert_eq!(back.url, "");
+    }
+
+    #[test]
+    fn unknown_version_is_refused() {
+        let bytes = postcard::to_stdvec(&(7u8, "x")).unwrap();
+        let s = format!("{PREFIX}{}", data_encoding::BASE32_NOPAD.encode(&bytes).to_ascii_lowercase());
+        assert!(Ticket::decode(&s).unwrap_err().to_string().contains("version 7"));
     }
 }

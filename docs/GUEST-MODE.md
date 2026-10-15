@@ -1,6 +1,6 @@
 # Guest mode: participate in a share with only the plugin
 
-Status: design (not implemented).
+Status: phase A (server + headless guest) implemented; phase B (plugin) in progress. See SHARING.md "Guests".
 
 Goal: Bob runs a replica server that is reachable on the public internet. He shares `Projects/X` and sends Alice the ticket. Alice installs the Replica plugin, pastes the ticket, picks a local folder — and is in the live sync. She has no replica server, no account on Bob's server, and nothing outside that folder ever syncs anywhere. Many-to-many: a share can have any number of guests, and one vault can carry any number of guest mounts from different servers, alongside (or instead of) its own home-server sync.
 

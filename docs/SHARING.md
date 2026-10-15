@@ -76,6 +76,20 @@ Limits on the link (the node id is public, so everything before the hello must b
 - Unshare: bridge removed, share document deleted, owner's files untouched; all mounts of it go inert.
 - Unmount: bridge removed, friend's files stay.
 
+## Guests (no server of their own)
+
+A person without a replica server can still join a share: the plugin or the headless client (`replica-server sync --ticket <ticket> --dir …`) connects straight to the **owner's** server and syncs the share document, authenticated by the ticket secret. The owner's server must be reachable over HTTPS and started with `--public-url https://…`, which is embedded in every ticket it issues (ticket v2; v1 tickets still decode). Full design in `GUEST-MODE.md`.
+
+Guest routes, all authenticated by `(share id, secret)` given as `?secret=` or `Authorization: Bearer`:
+
+| Method | Path | Notes |
+|---|---|---|
+| GET | `/guest/shares/{id}` | name, access, folder or note; validates the ticket |
+| GET | `/guest/ws/{id}` | y-sync WebSocket on the share document; read-only grants have their document updates dropped server-side |
+| GET/PUT | `/guest/blobs/{id}/{hash}` | share-scoped blobs; PUT only for read & write |
+
+Hygiene on these public routes: unknown share and bad secret answer identically (403), more than 10 failures per IP in 10 minutes gives 429, and the request log carries the path only, never the query string. The owner re-checks the grant every 30 s on open guest sockets and closes them when the ticket is revoked or the share deleted; the headless client then exits with a clear message. Each guest connection stamps `last_seen_at` on its ticket, shown to the owner.
+
 ## API (user token auth, same as everything else)
 
 | Method | Path | Body → Result |

@@ -88,7 +88,7 @@ pub async fn get_sharing(
                     .iter()
                     .filter(|m| m.revoked_at.is_none() && hash.as_deref() == Some(crate::ids::token_hash(&m.secret).as_str()))
                     .count();
-                serde_json::json!({ "label": g.label, "access": g.access, "created_at": g.created_at, "revoked_at": g.revoked_at, "mounted_by": mounted_by })
+                serde_json::json!({ "label": g.label, "access": g.access, "created_at": g.created_at, "revoked_at": g.revoked_at, "mounted_by": mounted_by, "last_seen_at": g.last_seen_at })
             })
             .collect();
         shares_json.push(serde_json::json!({
@@ -114,7 +114,7 @@ pub async fn get_sharing(
             })
         })
         .collect();
-    Json(serde_json::json!({ "node_id": state.docs.node_id, "shares": shares_json, "mounts": mounts_json })).into_response()
+    Json(serde_json::json!({ "node_id": state.docs.node_id, "public_url": state.serve.public_url, "shares": shares_json, "mounts": mounts_json })).into_response()
 }
 
 // ------------------------------------------------------------------ POST /api/vaults/{vault}/shares
@@ -128,13 +128,14 @@ pub struct CreateShare {
 
 fn make_ticket(state: &SharedState, share: &ShareInfo, secret: String, access: &str) -> anyhow::Result<String> {
     Ticket {
-        version: 1,
+        version: crate::ticket::CURRENT_VERSION,
         share_id: share.id.clone(),
         name: share.name.clone(),
         node_id: state.docs.node_id.clone(),
         secret,
         access: access.to_string(),
         addrs: state.docs.endpoint.as_ref().map(crate::remote::addr_strings).unwrap_or_default(),
+        url: state.serve.public_url.clone().unwrap_or_default().trim_end_matches('/').to_string(),
     }
     .encode()
 }
@@ -475,6 +476,7 @@ pub async fn inspect_ticket(
         "node_id": ticket.node_id,
         "same_server": same_server,
         "p2p_available": state.docs.endpoint.is_some(),
+        "url": ticket.url,
         "valid": valid,
         "from_own_vault": own_vault,
     }))

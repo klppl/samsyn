@@ -20,16 +20,21 @@ use self::ws::WsEvent;
 #[command(name = "sync")]
 pub struct SyncArgs {
     /// Server base URL, e.g. https://sync.example.com or http://127.0.0.1:8787
-    #[arg(long, env = "REPLICA_SERVER")]
-    pub server: String,
+    #[arg(long, env = "REPLICA_SERVER", required_unless_present = "ticket")]
+    pub server: Option<String>,
 
     /// User token (rp_...).
-    #[arg(long, env = "REPLICA_TOKEN")]
-    pub token: String,
+    #[arg(long, env = "REPLICA_TOKEN", required_unless_present = "ticket")]
+    pub token: Option<String>,
 
     /// Vault name on the server (same "Vault ID" as in the plugin).
-    #[arg(long, env = "REPLICA_VAULT")]
-    pub vault: String,
+    #[arg(long, env = "REPLICA_VAULT", required_unless_present = "ticket")]
+    pub vault: Option<String>,
+
+    /// Guest mode: sync one shared folder or note using a ticket instead of a server account.
+    /// The ticket must come from a server started with --public-url.
+    #[arg(long, env = "REPLICA_TICKET", conflicts_with_all = ["server", "token", "vault"])]
+    pub ticket: Option<String>,
 
     /// Local directory to keep in sync.
     #[arg(long, env = "REPLICA_DIR", default_value = ".")]
@@ -64,18 +69,70 @@ pub struct SyncArgs {
     pub once: bool,
 }
 
+/// What we sync against: a vault on our own server, or a share on the owner's server (guest).
+#[derive(Debug, Clone)]
+pub enum Target {
+    Vault { http: String, token: String, vault: String },
+    Guest { http: String, share_id: String, secret: String, name: String },
+}
+
+fn normalize_http(raw: &str) -> String {
+    let mut s = raw.trim().trim_end_matches('/').to_string();
+    if !s.contains("://") {
+        s = format!("http://{s}");
+    }
+    if let Some(rest) = s.strip_prefix("ws://") {
+        s = format!("http://{rest}");
+    } else if let Some(rest) = s.strip_prefix("wss://") {
+        s = format!("https://{rest}");
+    }
+    s
+}
+
 impl SyncArgs {
+    pub fn target(&self) -> anyhow::Result<Target> {
+        if let Some(t) = &self.ticket {
+            let t = crate::ticket::Ticket::decode(t)?;
+            anyhow::ensure!(
+                !t.url.is_empty(),
+                "this ticket has no server URL (the owner's server runs without --public-url); it can only be mounted through a replica server"
+            );
+            return Ok(Target::Guest { http: normalize_http(&t.url), share_id: t.share_id, secret: t.secret, name: t.name });
+        }
+        Ok(Target::Vault {
+            http: normalize_http(self.server.as_deref().unwrap_or_default()),
+            token: self.token.clone().unwrap_or_default(),
+            vault: self.vault.clone().unwrap_or_default(),
+        })
+    }
+
     pub fn http_base(&self) -> String {
-        let mut s = self.server.trim().trim_end_matches('/').to_string();
-        if !s.contains("://") {
-            s = format!("http://{s}");
+        match self.target() {
+            Ok(Target::Vault { http, .. }) | Ok(Target::Guest { http, .. }) => http,
+            Err(_) => String::new(),
         }
-        if let Some(rest) = s.strip_prefix("ws://") {
-            s = format!("http://{rest}");
-        } else if let Some(rest) = s.strip_prefix("wss://") {
-            s = format!("https://{rest}");
+    }
+
+    /// Credential for HTTP calls: the user token, or the ticket secret for guests.
+    pub fn bearer(&self) -> String {
+        match self.target() {
+            Ok(Target::Vault { token, .. }) => token,
+            Ok(Target::Guest { secret, .. }) => secret,
+            Err(_) => String::new(),
         }
-        s
+    }
+
+    /// Human-readable name of what we sync against, for logs.
+    pub fn label(&self) -> String {
+        match self.target() {
+            Ok(Target::Vault { http, vault, .. }) => format!("{http}/{vault}"),
+            Ok(Target::Guest { http, name, .. }) => format!("{http} share \"{name}\" (guest)"),
+            Err(_) => "?".into(),
+        }
+    }
+
+    pub fn is_guest(&self) -> bool {
+        self.ticket.is_some()
     }
 
     pub fn ws_url(&self) -> String {
@@ -85,7 +142,28 @@ impl SyncArgs {
         } else {
             format!("ws://{}", http.trim_start_matches("http://"))
         };
-        format!("{ws}/ws/{}?token={}", self.vault, self.token)
+        match self.target() {
+            Ok(Target::Guest { share_id, secret, .. }) => format!("{ws}/guest/ws/{share_id}?secret={secret}"),
+            Ok(Target::Vault { token, vault, .. }) => format!("{ws}/ws/{vault}?token={token}"),
+            Err(_) => String::new(),
+        }
+    }
+
+    pub fn blob_url(&self, hash: &str) -> String {
+        match self.target() {
+            Ok(Target::Guest { http, share_id, .. }) => format!("{http}/guest/blobs/{share_id}/{hash}"),
+            Ok(Target::Vault { http, vault, .. }) => format!("{http}/blobs/{vault}/{hash}"),
+            Err(_) => String::new(),
+        }
+    }
+
+    /// Where to learn about read-only status: the vault's sharing list, or the share's guest info.
+    pub fn sharing_url(&self) -> String {
+        match self.target() {
+            Ok(Target::Guest { http, share_id, .. }) => format!("{http}/guest/shares/{share_id}"),
+            Ok(Target::Vault { http, vault, .. }) => format!("{http}/api/vaults/{vault}/sharing"),
+            Err(_) => String::new(),
+        }
     }
 }
 
@@ -112,7 +190,7 @@ pub async fn run(args: SyncArgs) -> anyhow::Result<()> {
     let mut sharing_tick = tokio::time::interval(Duration::from_secs(20));
     sharing_tick.tick().await; // first refresh happens on connect
     let mut idle_since: Option<tokio::time::Instant> = None;
-    tracing::info!("syncing {} <-> {}/{}", args.dir.display(), args.http_base(), args.vault);
+    tracing::info!("syncing {} <-> {}", args.dir.display(), args.label());
 
     loop {
         tokio::select! {
@@ -130,6 +208,11 @@ pub async fn run(args: SyncArgs) -> anyhow::Result<()> {
                     idle_since = Some(tokio::time::Instant::now());
                 }
                 Some(WsEvent::Disconnected) => engine.on_disconnected(),
+                Some(WsEvent::Fatal(msg)) => {
+                    engine.on_disconnected();
+                    engine.flush_persistence();
+                    anyhow::bail!("{msg}; check the token or ticket (a revoked ticket stays revoked)");
+                }
                 None => break,
             },
             Some(paths) = fs_rx.recv() => {

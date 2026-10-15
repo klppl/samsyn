@@ -192,6 +192,11 @@ impl Engine {
         if rel.split('/').any(|seg| seg.starts_with('.')) {
             return false;
         }
+        // A guest's whole directory is the share; files moved aside from a read-only share must
+        // not be pushed back into it (they would be reverted again) and are left alone.
+        if self.args.is_guest() && rel.starts_with("read-only copy/") {
+            return false;
+        }
         if rel.starts_with(META_DIR) {
             return false;
         }
@@ -261,8 +266,8 @@ impl Engine {
     /// Ask the server which mounts in this vault are read-only, so edits under them are not
     /// pushed (the server would revert them anyway) and the files are marked read-only on disk.
     pub async fn refresh_sharing(&mut self) {
-        let url = format!("{}/api/vaults/{}/sharing", self.args.http_base(), self.args.vault);
-        let res = match self.http.get(&url).bearer_auth(&self.args.token).send().await {
+        let url = self.args.sharing_url();
+        let res = match self.http.get(&url).bearer_auth(self.args.bearer()).send().await {
             Ok(r) => r,
             Err(e) => {
                 tracing::debug!("sharing info unavailable: {e}");
@@ -271,7 +276,10 @@ impl Engine {
         };
         let Ok(body) = res.bytes().await else { return };
         let Ok(v) = serde_json::from_slice::<serde_json::Value>(&body) else { return };
-        let mut ro: Vec<String> = v["mounts"]
+        let mut ro: Vec<String> = if self.args.is_guest() {
+            // Guest: the whole directory is the share; read-only means all of it.
+            if v["access"].as_str() == Some("ro") { vec![String::new()] } else { vec![] }
+        } else { v["mounts"]
             .as_array()
             .map(|ms| {
                 ms.iter()
@@ -279,14 +287,18 @@ impl Engine {
                     .filter_map(|m| m["mount_path"].as_str().map(|p| format!("{}/", p.trim_end_matches('/'))))
                     .collect()
             })
-            .unwrap_or_default();
+            .unwrap_or_default() };
         ro.sort();
         if ro == self.ro_prefixes {
             return;
         }
         let was = std::mem::replace(&mut self.ro_prefixes, ro);
         for p in &self.ro_prefixes {
-            tracing::info!("{p} is a read-only share: edits there are not synced and are restored from the server");
+            if p.is_empty() {
+                tracing::info!("this share is read-only: local edits are not synced and are restored from the server");
+            } else {
+                tracing::info!("{p} is a read-only share: edits there are not synced and are restored from the server");
+            }
         }
         // Flip permissions on disk for prefixes that changed state.
         for p in was.iter().chain(self.ro_prefixes.iter()) {
@@ -299,8 +311,19 @@ impl Engine {
         }
     }
 
+    /// Where files created under a read-only prefix are moved aside.
+    fn rescue_root(prefix: &str) -> String {
+        if prefix.is_empty() {
+            "read-only copy/".to_string()
+        } else {
+            format!("{} (read-only copy)/", prefix.trim_end_matches('/'))
+        }
+    }
+
     fn is_ro(&self, rel: &str) -> bool {
-        self.ro_prefixes.iter().any(|p| rel.starts_with(p.as_str()))
+        self.ro_prefixes
+            .iter()
+            .any(|p| rel.starts_with(p.as_str()) && !rel.starts_with(Self::rescue_root(p).as_str()))
     }
 
     fn protect_if_ro(&self, rel: &str) {
@@ -320,14 +343,22 @@ impl Engine {
         };
         let abs = self.abs(rel);
         if in_doc {
+            // Plain overwrite, no conflict copy: the edit was never allowed in the first place.
             tracing::warn!("{rel} is in a read-only share; restoring the server's version");
-            self.base.remove(rel);
-            if let Err(e) = self.apply_remote(rel).await {
+            let res = if let Some(content) = self.text_of(rel) {
+                self.write_text(rel, &content)
+            } else if let Some(meta) = self.blob_of(rel) {
+                self.state.synced.remove(rel);
+                self.download_blob(rel, &meta).await
+            } else {
+                Ok(())
+            };
+            if let Err(e) = res {
                 tracing::warn!("restoring {rel} failed: {e}");
             }
         } else if abs.is_file() {
             let rest = rel.strip_prefix(prefix.as_str()).unwrap_or(rel);
-            let rescue = format!("{} (read-only copy)/{rest}", prefix.trim_end_matches('/'));
+            let rescue = format!("{}{rest}", Self::rescue_root(&prefix));
             let dst = self.abs(&rescue);
             tracing::warn!("{rel} is in a read-only share; keeping it as {rescue}");
             if let Some(parent) = dst.parent() {
@@ -519,8 +550,8 @@ impl Engine {
                 self.write_conflict_copy(rel, &local)?;
             }
         }
-        let url = format!("{}/blobs/{}/{}", self.args.http_base(), self.args.vault, meta.hash);
-        let res = self.http.get(&url).bearer_auth(&self.args.token).send().await?;
+        let url = self.args.blob_url(&meta.hash);
+        let res = self.http.get(&url).bearer_auth(self.args.bearer()).send().await?;
         if res.status() == reqwest::StatusCode::NOT_FOUND {
             // Metadata can precede the bytes (slow uploader, or a server-side share link still
             // fetching them); retry with backoff for up to about ten minutes.
@@ -730,9 +761,9 @@ impl Engine {
             self.mark_synced(rel, hash);
             return Ok(());
         }
-        let url = format!("{}/blobs/{}/{}", self.args.http_base(), self.args.vault, hash);
+        let url = self.args.blob_url(&hash);
         let size = data.len();
-        let res = self.http.put(&url).bearer_auth(&self.args.token).body(data).send().await?;
+        let res = self.http.put(&url).bearer_auth(self.args.bearer()).body(data).send().await?;
         if !res.status().is_success() {
             anyhow::bail!("upload failed: HTTP {}", res.status());
         }

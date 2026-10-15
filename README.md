@@ -36,6 +36,8 @@ docker compose up -d
 docker compose logs server | grep token
 ```
 
+Server flags worth knowing: `--public-url` (guest tickets), `--p2p-port`/`--relay`/`--no-p2p` (server-to-server), `--tls-cert`/`--tls-key`, `--max-blob-mb`, `--snapshot-hours`. `replica-server serve --help` lists them all.
+
 Prebuilt images are published by CI (`.github/workflows`) to the
 the private tracker registry on every push to `main` and on tags:
 
@@ -110,6 +112,8 @@ Share part of a vault, not all of it, with live editing on both sides. The plugi
 1. Owner: right-click a folder or note → **Replica: Share…** (or Settings → Replica → **Sharing** → *Share a folder or note…*). Pick read & write or read only, **Create share**, copy the ticket. One ticket = exactly that folder or note; issue one ticket per person so you can revoke them separately.
 2. Friend: Settings → Replica → **Sharing** → *Add from ticket…*: paste, see what it is (name, access, which server), choose where it goes (default `Shared/X`), **Mount**. The files appear and stay live in both directions.
 3. While both edit, each sees the other's presence inside the shared folder. Revoke a ticket, or unshare, at any time; the friend is told in their Sharing tab and keeps their copy as ordinary notes.
+
+The other person does not even need a server: start yours with `--public-url https://your.server` and the ticket lets them join straight from the plugin or with `replica-server sync --ticket … --dir …` (guest mode, see [docs/SHARING.md](docs/SHARING.md#guests-no-server-of-their-own)).
 
 The two users can be on the same server or on different ones. Between servers the share travels over an encrypted [iroh](https://iroh.computer) connection: no open ports, no public address, NAT traversal through a relay (public n0 relays by default, `--relay <url>` for your own, `--relay none` for LAN only). The ticket carries the owner server's node id and addresses; the friend's server verifies the ticket with the owner before mounting, then keeps a local replica in sync. `--p2p-port` (UDP, default 8788) is worth keeping fixed; forwarding it is optional. `--no-p2p` turns all of this off.
 

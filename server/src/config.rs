@@ -109,6 +109,11 @@ pub struct ServeArgs {
     #[arg(long, env = "REPLICA_P2P_PORT", default_value_t = 8788)]
     pub p2p_port: u16,
 
+    /// Public HTTPS URL of this server, embedded in tickets so people without a server of
+    /// their own can join a share directly from the plugin ("guest mode"). Unset = guests off.
+    #[arg(long, env = "REPLICA_PUBLIC_URL")]
+    pub public_url: Option<String>,
+
     /// Disable the peer-to-peer endpoint entirely (tickets then only work on this server).
     #[arg(long, env = "REPLICA_NO_P2P", default_value_t = false)]
     pub no_p2p: bool,

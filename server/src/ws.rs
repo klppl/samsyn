@@ -74,19 +74,26 @@ pub async fn ws_handler(
             return (StatusCode::INTERNAL_SERVER_ERROR, "failed to load vault").into_response();
         }
     };
-    ws.on_upgrade(move |socket| handle_socket(socket, state, user, vault))
+    let _ = user;
+    ws.on_upgrade(move |socket| handle_socket(socket, state, vault, true, None))
 }
 
-async fn handle_socket(
+/// Pump y-sync between one WebSocket and a live document. `writable == false` drops the
+/// client's document updates (read-only guests); `revoke` = (share id, secret) re-checked every
+/// 30 s so a revoked ticket or deleted share ends the session.
+pub async fn handle_socket(
     socket: WebSocket,
     state: SharedState,
-    _user: User,
     vault: std::sync::Arc<crate::vault::LiveDoc>,
+    writable: bool,
+    revoke: Option<(String, String)>,
 ) {
     let (mut sink, mut stream) = socket.split();
     let mut rx = vault.tx.subscribe();
     let protocol = DefaultProtocol;
     let label = vault.label.clone();
+    let mut revoke_tick = tokio::time::interval(std::time::Duration::from_secs(30));
+    revoke_tick.tick().await;
 
     let hello = {
         let aw = vault.awareness.lock().unwrap();
@@ -116,7 +123,7 @@ async fn handle_socket(
                             let _apply = state.docs.apply_lock.lock().unwrap();
                             let r = {
                                 let mut aw = vault.awareness.lock().unwrap();
-                                handle_payload(&protocol, &mut aw, &data, &mut owned_clients, true)
+                                handle_payload(&protocol, &mut aw, &data, &mut owned_clients, writable)
                             };
                             state.docs.propagate(&vault);
                             r
@@ -137,6 +144,15 @@ async fn handle_socket(
                     Some(Ok(_)) => {}
                     Some(Err(e)) => {
                         tracing::debug!(vault = %label, "ws error: {e}");
+                        break;
+                    }
+                }
+            }
+            _ = revoke_tick.tick() => {
+                if let Some((share_id, secret)) = &revoke {
+                    let ok = state.storage.registry().check_grant(share_id, secret).ok().flatten().is_some();
+                    if !ok {
+                        tracing::info!(doc = %label, "ticket revoked or share gone; closing guest socket");
                         break;
                     }
                 }

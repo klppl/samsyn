@@ -9,6 +9,7 @@ mod bridge;
 mod cli;
 mod client;
 mod config;
+mod guest;
 mod ids;
 mod presence;
 mod remote;
@@ -41,6 +42,7 @@ pub struct AppState {
     pub serve: ServeArgs,
     pub storage: Storage,
     pub docs: Arc<DocRegistry>,
+    pub guest_limiter: std::sync::Mutex<guest::GuestLimiter>,
 }
 
 pub type SharedState = Arc<AppState>;
@@ -133,7 +135,11 @@ async fn serve(args: ServeArgs, storage: Storage) -> anyhow::Result<()> {
             .accept(remote::ALPN, remote::ShareProtocol { docs: docs.clone() })
             .spawn()
     });
-    let state: SharedState = Arc::new(AppState { docs, storage, serve: args });
+    let state: SharedState = Arc::new(AppState { docs, storage, serve: args, guest_limiter: Default::default() });
+    match &state.serve.public_url {
+        Some(u) => tracing::info!("guest mode on: tickets carry public URL {u}"),
+        None => tracing::info!("guest mode off (set --public-url to let people without a server join shares)"),
+    }
 
     state.docs.start_presence_mirror();
     state.docs.preload_bridged();
@@ -151,12 +157,21 @@ async fn serve(args: ServeArgs, storage: Storage) -> anyhow::Result<()> {
         .route("/api/vaults/{vault}/mounts", post(sharing::create_mount))
         .route("/api/mounts/{id}", delete(sharing::delete_mount))
         .route("/api/tickets/inspect", post(sharing::inspect_ticket))
+        .route("/guest/shares/{id}", get(guest::info))
+        .route("/guest/ws/{id}", get(guest::ws))
+        .route(
+            "/guest/blobs/{id}/{hash}",
+            put(guest::put_blob).get(guest::get_blob).layer(DefaultBodyLimit::max(max_blob)),
+        )
         .route(
             "/blobs/{vault}/{hash}",
             put(blobs::put_blob).get(blobs::get_blob).layer(DefaultBodyLimit::max(max_blob)),
         )
         .layer(CorsLayer::new().allow_origin(Any).allow_methods(Any).allow_headers(Any))
-        .layer(TraceLayer::new_for_http())
+        // Span without the query string: guest routes carry the ticket secret there.
+        .layer(TraceLayer::new_for_http().make_span_with(|req: &axum::http::Request<_>| {
+            tracing::info_span!("request", method = %req.method(), path = %req.uri().path())
+        }))
         .with_state(state.clone());
 
     if state.serve.snapshot_hours > 0 {
@@ -189,7 +204,7 @@ async fn serve(args: ServeArgs, storage: Storage) -> anyhow::Result<()> {
             tracing::info!("replica-server listening on https://{} (TLS)", state.serve.bind);
             axum_server::bind_rustls(state.serve.bind, tls)
                 .handle(handle)
-                .serve(app.into_make_service())
+                .serve(app.into_make_service_with_connect_info::<std::net::SocketAddr>())
                 .await?;
         }
         _ => {
@@ -197,7 +212,7 @@ async fn serve(args: ServeArgs, storage: Storage) -> anyhow::Result<()> {
             tracing::info!("note: iOS needs https; put this behind Caddy/Tailscale or pass --tls-cert/--tls-key");
             axum_server::bind(state.serve.bind)
                 .handle(handle)
-                .serve(app.into_make_service())
+                .serve(app.into_make_service_with_connect_info::<std::net::SocketAddr>())
                 .await?;
         }
     }

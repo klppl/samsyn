@@ -564,6 +564,7 @@ async fn run_link(ep: &Endpoint, docs: &Arc<DocRegistry>, mount: &MountInfo, rep
         secret: mount.secret.clone(),
         access: mount.access.clone(),
         addrs: mount.home_addrs.clone(),
+        url: String::new(),
     };
     let addr = ticket_addr(&ticket)?;
     let conn = tokio::time::timeout(CONNECT_TIMEOUT, ep.connect(addr, ALPN))

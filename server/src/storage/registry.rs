@@ -42,6 +42,8 @@ pub struct GrantInfo {
     pub access: String,
     pub created_at: String,
     pub revoked_at: Option<String>,
+    /// Last time a guest client authenticated with this ticket.
+    pub last_seen_at: Option<String>,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -393,9 +395,9 @@ impl Registry {
 
     pub fn grants_for_share(&self, share_id: &str) -> anyhow::Result<Vec<GrantInfo>> {
         let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare("SELECT label, access, created_at, revoked_at FROM share_grants WHERE share_id = ?1 ORDER BY created_at")?;
+        let mut stmt = conn.prepare("SELECT label, access, created_at, revoked_at, last_seen_at FROM share_grants WHERE share_id = ?1 ORDER BY created_at")?;
         let rows = stmt.query_map(params![share_id], |r| {
-            Ok(GrantInfo { label: r.get(0)?, access: r.get(1)?, created_at: r.get(2)?, revoked_at: r.get(3)? })
+            Ok(GrantInfo { label: r.get(0)?, access: r.get(1)?, created_at: r.get(2)?, revoked_at: r.get(3)?, last_seen_at: r.get(4)? })
         })?;
         Ok(rows.collect::<Result<_, _>>()?)
     }
@@ -410,6 +412,16 @@ impl Registry {
                 |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
             )
             .optional()?)
+    }
+
+    /// Record that a guest just authenticated with this secret.
+    pub fn touch_grant(&self, share_id: &str, secret: &str) -> anyhow::Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE share_grants SET last_seen_at = ?1 WHERE share_id = ?2 AND secret_hash = ?3",
+            params![Self::now(), share_id, token_hash(secret)],
+        )?;
+        Ok(())
     }
 
     pub fn grant_secret_hash(&self, share_id: &str, label: &str) -> anyhow::Result<Option<String>> {
@@ -536,7 +548,7 @@ impl Registry {
 // bump REGISTRY_SCHEMA_VERSION together with the new step. See docs/STORAGE.md.
 
 /// Current registry schema version (`PRAGMA user_version` after all steps ran).
-pub const REGISTRY_SCHEMA_VERSION: u32 = 2;
+pub const REGISTRY_SCHEMA_VERSION: u32 = 3;
 
 fn migrate(conn: &Connection) -> anyhow::Result<()> {
     let mut version: u32 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
@@ -585,6 +597,14 @@ fn migrate(conn: &Connection) -> anyhow::Result<()> {
             conn.execute_batch("ALTER TABLE mounts ADD COLUMN only_file TEXT")?;
         }
         version = 2;
+    }
+
+    if version < 3 {
+        // v3: guest mode shows the owner when a ticket was last used.
+        if !has_column(conn, "share_grants", "last_seen_at")? {
+            conn.execute_batch("ALTER TABLE share_grants ADD COLUMN last_seen_at TEXT")?;
+        }
+        version = 3;
     }
 
     if version > REGISTRY_SCHEMA_VERSION {

@@ -11,6 +11,8 @@ pub enum WsEvent {
     Connected(mpsc::UnboundedSender<Vec<u8>>),
     Message(Vec<u8>),
     Disconnected,
+    /// The server refused us for good (bad token, revoked ticket); retrying is pointless.
+    Fatal(String),
 }
 
 pub fn spawn(url: String, events: mpsc::UnboundedSender<WsEvent>) {
@@ -49,8 +51,13 @@ pub fn spawn(url: String, events: mpsc::UnboundedSender<WsEvent>) {
                     }
                     tracing::warn!("disconnected, reconnecting in {backoff:?}");
                 }
+                Err(tokio_tungstenite::tungstenite::Error::Http(resp)) if matches!(resp.status().as_u16(), 401 | 403) => {
+                    let _ = events.send(WsEvent::Fatal(format!("server refused the connection (HTTP {})", resp.status())));
+                    return;
+                }
                 Err(e) => {
-                    tracing::warn!("connect to {url} failed: {e}; retrying in {backoff:?}");
+                    let shown = url.split('?').next().unwrap_or(&url);
+                    tracing::warn!("connect to {shown} failed: {e}; retrying in {backoff:?}");
                 }
             }
             tokio::time::sleep(backoff).await;
