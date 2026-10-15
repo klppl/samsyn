@@ -36,6 +36,13 @@ docker compose up -d
 docker compose logs server | grep token
 ```
 
+Prebuilt images are published by CI (`.github/workflows`) to the
+the private tracker registry on every push to `main` and on tags:
+
+```sh
+docker pull ghcr.io/mrboatsman/samsyn:latest
+```
+
 ### 1b. HTTPS (required for iOS, recommended everywhere)
 
 Obsidian on iOS runs in a secure WebKit context and refuses plain `ws://` WebSockets, so the server must be reachable over `https://` with a certificate the phone trusts. Three easy ways:
