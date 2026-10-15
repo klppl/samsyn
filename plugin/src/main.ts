@@ -146,10 +146,12 @@ export default class ReplicaPlugin extends Plugin {
     // Deep links: obsidian://replica?op=mount&ticket=…  and  obsidian://replica?op=setup&server=…&token=…&vault=…
     this.registerObsidianProtocolHandler("replica", (params) => {
       const op = params.op ?? (params.ticket ? "mount" : params.server ? "setup" : "");
+      console.info("[replica] deep link", op, Object.keys(params));
       if (op === "mount" && params.ticket) {
         new MountModal(this, () => this.settingTab?.show("sharing"), params.ticket).open();
       } else if (op === "setup" && params.server && params.token) {
-        new SetupConfirmModal(this, { server: params.server, token: params.token, vault: params.vault || slugify(this.app.vault.getName()), user: params.user }).open();
+        // `vault` never arrives here (Obsidian consumes it); the vault id is `vid`.
+        new SetupConfirmModal(this, { server: params.server, token: params.token, vault: params.vid || params.vault || slugify(this.app.vault.getName()), user: params.user }).open();
       } else {
         new Notice("Replica: this link is not understood (expected op=mount with a ticket, or op=setup with server and token).", 8000);
       }

@@ -142,7 +142,7 @@ Obsidian mobile does not expose a developer console. Options, in order of useful
 
 ## Deep links
 
-`registerObsidianProtocolHandler("replica", …)` in `main.ts` handles `obsidian://replica?op=mount&ticket=…` (opens the mount dialog) and `obsidian://replica?op=setup&server=…&token=…&vault=…[&user=…]` (asks before replacing the connection settings). QR codes are those links rendered with `qrcode-generator` (`src/qr.ts`). Test on desktop by pasting the link into a browser's address bar; on iOS point the camera at the QR.
+`registerObsidianProtocolHandler("replica", …)` in `main.ts` handles `obsidian://replica?op=mount&ticket=…` (opens the mount dialog) and `obsidian://replica?op=setup&server=…&token=…&vid=…[&user=…]` (asks before replacing the connection settings). `vault` cannot be used as a parameter name: Obsidian reserves it for choosing a local vault and silently drops the link when no local vault has that name, which is why the server-side vault id travels as `vid`. QR codes are those links rendered with `qrcode-generator` (`src/qr.ts`). Test on desktop by pasting the link into a browser's address bar; on iOS point the camera at the QR.
 
 ## Engines and scopes
 

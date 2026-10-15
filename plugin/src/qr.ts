@@ -7,8 +7,12 @@ export function mountLink(ticket: string): string {
   return `${PROTOCOL}?op=mount&ticket=${encodeURIComponent(ticket.trim())}`;
 }
 
-export function setupLink(server: string, token: string, vault: string, user?: string): string {
-  const q = new URLSearchParams({ op: "setup", server, token, vault });
+/**
+ * Note: `vault` is reserved in obsidian:// links (Obsidian uses it to pick a local vault and
+ * drops the link when none matches), so the server-side vault id travels as `vid`.
+ */
+export function setupLink(server: string, token: string, vaultId: string, user?: string): string {
+  const q = new URLSearchParams({ op: "setup", server, token, vid: vaultId });
   if (user) q.set("user", user);
   return `${PROTOCOL}?${q.toString()}`;
 }

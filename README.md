@@ -93,7 +93,7 @@ Obsidian → Settings → Replica:
 
 Press **Test connection** (checks server and token), then **Reconnect**. The **Status** section at the top of the Server tab shows live state, last error and hints; on desktop the status bar shows it too. The command **Replica: Show sync status** works on every platform.
 
-Repeat on each device with the same server and vault ID. Easiest: Settings → Server → **Devices** → *Set up another device…* creates a token for that device and shows a QR code; scan it with the phone's camera and Obsidian connects (`obsidian://replica?op=setup&…`). One token per device means a lost phone is one revoke. (No server of your own? You can still take part in folders others share with you: Sharing tab → *Add from ticket…*.)
+Repeat on each device with the same server and vault ID. Easiest: Settings → Server → **Devices** → *Set up another device…* creates a token for that device and shows a QR code; scan it with the phone's camera and Obsidian connects (`obsidian://replica?op=setup&server=…&token=…&vid=…`). One token per device means a lost phone is one revoke. (No server of your own? You can still take part in folders others share with you: Sharing tab → *Add from ticket…*.)
 
 ## How it works
 
