@@ -97,6 +97,21 @@ pub struct ServeArgs {
     /// PEM private key for --tls-cert.
     #[arg(long, env = "REPLICA_TLS_KEY", requires = "tls_cert")]
     pub tls_key: Option<PathBuf>,
+
+    /// Relay server URL(s) for server-to-server sharing (repeat or comma-separate).
+    /// Default: the public n0 relays. "none" disables relays (direct connections only).
+    #[arg(long, env = "REPLICA_RELAY", value_delimiter = ',')]
+    pub relay: Vec<String>,
+
+    /// UDP port for the peer-to-peer endpoint (0 = random). A fixed port keeps the direct
+    /// addresses in old tickets valid across restarts; forwarding it is optional (relays
+    /// cover the rest).
+    #[arg(long, env = "REPLICA_P2P_PORT", default_value_t = 8788)]
+    pub p2p_port: u16,
+
+    /// Disable the peer-to-peer endpoint entirely (tickets then only work on this server).
+    #[arg(long, env = "REPLICA_NO_P2P", default_value_t = false)]
+    pub no_p2p: bool,
 }
 
 #[derive(Subcommand, Debug, Clone)]

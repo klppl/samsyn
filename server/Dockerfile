@@ -15,5 +15,6 @@ COPY --from=build /src/target/release/replica-server /usr/local/bin/replica-serv
 ENV REPLICA_DATA_DIR=/data REPLICA_BIND=0.0.0.0:8787
 VOLUME ["/data"]
 EXPOSE 8787
+EXPOSE 8788/udp
 ENTRYPOINT ["replica-server"]
 CMD ["serve"]

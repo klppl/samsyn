@@ -8,6 +8,8 @@ services:
     restart: unless-stopped
     ports:
       - "8787:8787"
+      # Peer-to-peer sharing between servers (optional: works through relays without it).
+      - "8788:8788/udp"
     volumes:
       - ./data:/data
     environment:

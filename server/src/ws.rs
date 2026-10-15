@@ -15,7 +15,7 @@ use bytes::Bytes;
 use futures::{SinkExt, StreamExt};
 use tokio::sync::broadcast::error::RecvError;
 use yrs::block::ClientID;
-use yrs::sync::{DefaultProtocol, Message, MessageReader, Protocol};
+use yrs::sync::{DefaultProtocol, Message, MessageReader, Protocol, SyncMessage};
 use yrs::updates::decoder::DecoderV1;
 use yrs::updates::encoder::{Encoder, EncoderV1};
 
@@ -116,7 +116,7 @@ async fn handle_socket(
                             let _apply = state.docs.apply_lock.lock().unwrap();
                             let r = {
                                 let mut aw = vault.awareness.lock().unwrap();
-                                handle_payload(&protocol, &mut aw, &data, &mut owned_clients)
+                                handle_payload(&protocol, &mut aw, &data, &mut owned_clients, true)
                             };
                             state.docs.propagate(&vault);
                             r
@@ -172,17 +172,23 @@ async fn handle_socket(
     tracing::debug!(vault = %label, "client disconnected");
 }
 
-fn handle_payload(
+/// Feed one y-sync payload to the document. With `writable == false` (read-only peer) the
+/// peer's document updates are dropped; it can still pull our state and send awareness.
+pub(crate) fn handle_payload(
     protocol: &DefaultProtocol,
     aw: &mut yrs::sync::Awareness,
     data: &[u8],
     owned: &mut HashSet<ClientID>,
+    writable: bool,
 ) -> Result<Vec<Bytes>, yrs::sync::Error> {
     let mut decoder = DecoderV1::from(data);
     let reader = MessageReader::new(&mut decoder);
     let mut out = Vec::new();
     for msg in reader {
         let msg = msg?;
+        if !writable && matches!(msg, Message::Sync(SyncMessage::Update(_)) | Message::Sync(SyncMessage::SyncStep2(_))) {
+            continue;
+        }
         if let Message::Awareness(update) = &msg {
             owned.extend(update.clients.keys().copied());
         }

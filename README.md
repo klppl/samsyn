@@ -109,7 +109,7 @@ Share part of a vault, not all of it, with live editing on both sides. The plugi
 2. Friend: Settings → Replica → **Sharing** → *Add from ticket*: paste, choose a mount path (default `Shared/X`), **Mount**. The files appear and stay live in both directions.
 3. Tickets can be read-only. Revoke a ticket, or unshare, at any time; the friend keeps their copy as ordinary notes.
 
-Today both users must be on the same server. Server-to-server sharing over an encrypted iroh connection (no open ports) is the next phase; tickets already carry the server's node id for it.
+The two users can be on the same server or on different ones. Between servers the share travels over an encrypted [iroh](https://iroh.computer) connection: no open ports, no public address, NAT traversal through a relay (public n0 relays by default, `--relay <url>` for your own, `--relay none` for LAN only). The ticket carries the owner server's node id and addresses; the friend's server verifies the ticket with the owner before mounting, then keeps a local replica in sync. `--p2p-port` (UDP, default 8788) is worth keeping fixed; forwarding it is optional. `--no-p2p` turns all of this off.
 
 ## Headless client (no Obsidian)
 

@@ -54,6 +54,10 @@ pub struct MountInfo {
     pub mount_prefix: String,
     pub access: String,
     pub home_node: String,
+    /// Owner server's relay/direct addresses as printed in the ticket (remote mounts).
+    pub home_addrs: Vec<String>,
+    /// Set when the share is a single note (remote mounts; local ones read it from the share).
+    pub only_file: Option<String>,
     #[serde(skip_serializing)]
     pub secret: String,
     pub created_at: String,
@@ -135,6 +139,19 @@ impl Registry {
             CREATE INDEX IF NOT EXISTS mounts_share ON mounts(share_id);
             "#,
         )?;
+        // Additive migrations (schema v1 -> v1.1): remote mounts need the owner's addresses
+        // and the single-note flag locally, since the share row lives on another server.
+        let cols: Vec<String> = {
+            let mut stmt = conn.prepare("PRAGMA table_info(mounts)")?;
+            let rows = stmt.query_map([], |r| r.get::<_, String>(1))?;
+            rows.collect::<Result<_, _>>()?
+        };
+        if !cols.iter().any(|c| c == "home_addrs") {
+            conn.execute_batch("ALTER TABLE mounts ADD COLUMN home_addrs TEXT NOT NULL DEFAULT ''")?;
+        }
+        if !cols.iter().any(|c| c == "only_file") {
+            conn.execute_batch("ALTER TABLE mounts ADD COLUMN only_file TEXT")?;
+        }
         Ok(Self { conn: Arc::new(Mutex::new(conn)) })
     }
 
@@ -435,6 +452,8 @@ impl Registry {
         mount_prefix: &str,
         access: &str,
         home_node: &str,
+        home_addrs: &[String],
+        only_file: Option<&str>,
         secret: &str,
     ) -> anyhow::Result<MountInfo> {
         let m = MountInfo {
@@ -446,16 +465,38 @@ impl Registry {
             mount_prefix: mount_prefix.into(),
             access: access.into(),
             home_node: home_node.into(),
+            home_addrs: home_addrs.to_vec(),
+            only_file: only_file.map(str::to_string),
             secret: secret.into(),
             created_at: Self::now(),
             revoked_at: None,
         };
         let conn = self.conn.lock().unwrap();
         conn.execute(
-            "INSERT INTO mounts (id, user_id, vault_id, share_id, share_name, mount_prefix, access, home_node, secret, created_at)              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
-            params![m.id, m.user_id, m.vault_id, m.share_id, m.share_name, m.mount_prefix, m.access, m.home_node, m.secret, m.created_at],
+            "INSERT INTO mounts (id, user_id, vault_id, share_id, share_name, mount_prefix, access, home_node, home_addrs, only_file, secret, created_at)              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+            params![m.id, m.user_id, m.vault_id, m.share_id, m.share_name, m.mount_prefix, m.access, m.home_node, m.home_addrs.join(" "), m.only_file, m.secret, m.created_at],
         )?;
         Ok(m)
+    }
+
+    /// Mark one mount revoked (used when the owner server denies our secret).
+    pub fn revoke_mount(&self, id: &str) -> anyhow::Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        Ok(conn.execute("UPDATE mounts SET revoked_at = ?1 WHERE id = ?2 AND revoked_at IS NULL", params![Self::now(), id])? > 0)
+    }
+
+    pub fn all_mounts(&self) -> anyhow::Result<Vec<MountInfo>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(&format!("{MOUNT_COLS} ORDER BY created_at"))?;
+        let rows = stmt.query_map([], row_to_mount)?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    pub fn all_shares(&self) -> anyhow::Result<Vec<ShareInfo>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(&format!("{SHARE_COLS} ORDER BY created_at"))?;
+        let rows = stmt.query_map([], row_to_share)?;
+        Ok(rows.collect::<Result<_, _>>()?)
     }
 
     pub fn mount_by_id(&self, id: &str) -> anyhow::Result<Option<MountInfo>> {
@@ -498,7 +539,8 @@ impl Registry {
     }
 }
 
-const MOUNT_COLS: &str = "SELECT id, user_id, vault_id, share_id, share_name, mount_prefix, access, home_node, secret, created_at, revoked_at FROM mounts";
+const SHARE_COLS: &str = "SELECT id, user_id, vault_id, name, prefix, only_file, created_at FROM shares";
+const MOUNT_COLS: &str = "SELECT id, user_id, vault_id, share_id, share_name, mount_prefix, access, home_node, secret, created_at, revoked_at, home_addrs, only_file FROM mounts";
 
 fn row_to_share(r: &rusqlite::Row) -> rusqlite::Result<ShareInfo> {
     Ok(ShareInfo {
@@ -525,6 +567,8 @@ fn row_to_mount(r: &rusqlite::Row) -> rusqlite::Result<MountInfo> {
         secret: r.get(8)?,
         created_at: r.get(9)?,
         revoked_at: r.get(10)?,
+        home_addrs: r.get::<_, String>(11)?.split_whitespace().map(str::to_string).collect(),
+        only_file: r.get(12)?,
     })
 }
 

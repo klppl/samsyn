@@ -30,8 +30,8 @@ owner's vault doc  ──bridge──  share doc  ══iroh══  share doc re
 
 - **Share**: `{ id, owner, vault, name, prefix, only_file? }`. `prefix` is the folder (`Projects/X/`); `only_file` narrows it to one note (`prefix = Notes/`, `only_file = a.md`). Share keys are relative to `prefix`.
 - **Grant** (= ticket): `{ share, secret_hash, label, access: rw|ro, revoked_at }`. Many grants per share; revoke one without affecting others.
-- **Mount**: `{ id, user, vault, share, mount_prefix, access, home_node, secret }`. A mount bridges the share into the friend's vault at `mount_prefix`. `home_node` is the owner's server; when it equals this server the share is local (two users on one server) and no network is involved.
-- **Ticket**: `replica` + base32 of `{ v, share_id, name, node_id, secret, access, relay/addrs }`.
+- **Mount**: `{ id, user, vault, share, mount_prefix, access, home_node, home_addrs, only_file, secret }`. A mount bridges the share into the friend's vault at `mount_prefix`. `home_node` is the owner's server; when it equals this server the share is local (two users on one server) and no network is involved. Otherwise the server keeps a local *replica* of the share document and links it to the owner's server (below).
+- **Ticket**: `replica` + base32 of `{ v, share_id, name, node_id, secret, access, addrs }`. `addrs` are the owner server's relay URL and direct addresses at the time the ticket was made (`relay:https://…`, `ip:host:port`); the node id alone is enough when a relay is in use.
 
 Overlapping shares or mounts (nested prefixes) in one vault are refused. A mount prefix must be empty in the vault when mounted, so nothing is overwritten.
 
@@ -40,13 +40,26 @@ Overlapping shares or mounts (nested prefixes) in one vault are refused. A mount
 Share documents use the same store type as vaults, so snapshot, backup and restore are unchanged:
 
 ```
-users/<uid>/shares/<share_id>/    share.json, doc.db, blobs/, snapshots/      (owned shares)
-users/<uid>/mounts/<share_id>/    mount.json, doc.db, blobs/, snapshots/      (replicas of remote shares, phase 2)
+users/<uid>/shares/<share_id>/    vault.json, doc.db, blobs/, snapshots/      (owned shares)
+users/<uid>/mounts/<mount_id>/    vault.json, doc.db, blobs/, snapshots/      (replicas of shares on other servers)
 ```
 
 Registry tables: `shares`, `share_grants`, `mounts`. The server's iroh identity is `data/identity.key`; its public key is the `node_id` in tickets.
 
-Blobs: when a blob entry crosses a bridge the bytes are copied (hard-linked when possible) into the target store so each store stays self-contained and the friend's clients fetch from their own server.
+Blobs: when a blob entry crosses a bridge the bytes are copied into the target store so each store stays self-contained and the friend's clients fetch from their own server. Across a server link the bytes are fetched on demand (below).
+
+## Server to server (phase 2)
+
+Every server binds an [iroh](https://iroh.computer) endpoint with its identity key (UDP, `--p2p-port`, default 8788) and accepts connections on ALPN `replica/share/1`. Connections are QUIC, end-to-end encrypted and authenticated by the node ids; iroh dials through a relay first and upgrades to a direct path when NAT traversal succeeds. Neither server needs an open port or a public address. The default relays are the public n0 ones; `--relay <url>` selects your own ([self-hosting a relay](https://github.com/n0-computer/iroh/tree/main/iroh-relay)), `--relay none` disables relays (LAN / VPN only), `--no-p2p` turns the endpoint off.
+
+When a ticket from another server is mounted:
+
+1. The mounting server connects and does a hello handshake (share id + ticket secret) before storing anything, so a bad or revoked ticket fails immediately with a clear error. The owner answers with the granted access level, share name and single-note flag.
+2. It creates a replica document under `users/<uid>/mounts/<mount_id>/`, bridges it into the vault at the mount path exactly like a local share (truth = replica), and starts a *link* task.
+3. The link keeps one connection open with one long-lived control stream carrying y-sync messages both ways, framed as `u32 length + payload`. On the owner side this stream is treated like any WebSocket client of the share document; for a read-only grant the owner drops incoming document updates. Reconnects use exponential backoff (2 s … 60 s); the owner re-checks the grant every 30 s and closes the link when it is revoked or the share is deleted, after which the mounting server marks the mount revoked and removes the bridge (files stay).
+4. Blobs: whenever either side's copy of the share document references a hash its store lacks, it opens a short blob stream (`frame(hash)` → `frame(bytes)`), verifies the SHA-256, stores the bytes and copies them to the bridged vault's store. The vault's clients may see the metadata a moment before the bytes exist; both the plugin and the headless client retry a missing blob with backoff.
+
+Ticket secrets never leave the two servers; users still only talk to their own server with their own token. Mount status (`connected`, `reconnecting (…)`, `revoked: …`) is shown in the Sharing settings.
 
 ## Semantics
 
@@ -79,6 +92,6 @@ Settings → **Sharing**: *Shared by me* (create from folder/note path, list wit
 
 ## Phases
 
-1. **One server.** Share docs, bridges, reconcile, API, tickets with local `node_id`, plugin Sharing UI. Two users on the same server collaborate on a folder.
-2. **iroh.** Identity already exists; add endpoint, accept loop, `replica/share/1` protocol (y-sync framed over a QUIC stream + blob fetch), remote mounts, reconnect, relay config.
+1. **One server** (done). Share docs, bridges, reconcile, API, tickets with local `node_id`, plugin Sharing UI. Two users on the same server collaborate on a folder.
+2. **iroh** (done). Endpoint, accept loop, `replica/share/1` protocol (y-sync framed over a QUIC stream + blob fetch), remote mounts with local replicas, reconnect, relay config. Scenario: `server/scripts/remote-e2e.sh`.
 3. **Polish.** Presence across the bridge, headless client awareness of read-only, revocation UX, docs for self-hosted relay.

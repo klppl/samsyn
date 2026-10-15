@@ -20,6 +20,8 @@ pub const BRIDGE_ORIGIN_PREFIX: &[u8] = b"bridge:";
 pub enum DocKind {
     Vault(VaultInfo),
     Share(ShareInfo),
+    /// Local replica of a share owned by another server (one per remote mount).
+    Remote(MountInfo),
 }
 
 pub struct LiveDoc {
@@ -195,10 +197,15 @@ pub struct DocRegistry {
     /// Serializes share/mount creation (overlap check + registry insert + bridge attach) so
     /// two concurrent requests cannot both pass the overlap check. Taken before `apply_lock`.
     pub share_admin: Mutex<()>,
+    /// Peer-to-peer endpoint for server-to-server shares; `None` with `--no-p2p`.
+    pub endpoint: Option<iroh::Endpoint>,
+    /// Running link tasks for remote mounts, by mount id.
+    links: Mutex<HashMap<String, tokio::task::JoinHandle<()>>>,
+    link_status: Mutex<HashMap<String, String>>,
 }
 
 impl DocRegistry {
-    pub fn new(storage: Storage, node_id: String) -> Self {
+    pub fn new(storage: Storage, node_id: String, endpoint: Option<iroh::Endpoint>) -> Self {
         Self {
             storage,
             node_id,
@@ -207,6 +214,45 @@ impl DocRegistry {
             bridges: Mutex::new(Vec::new()),
             apply_lock: Mutex::new(()),
             share_admin: Mutex::new(()),
+            endpoint,
+            links: Mutex::new(HashMap::new()),
+            link_status: Mutex::new(HashMap::new()),
+        }
+    }
+
+    pub fn set_link_status(&self, mount_id: &str, status: &str) {
+        self.link_status.lock().unwrap().insert(mount_id.to_string(), status.to_string());
+    }
+
+    pub fn link_status(&self, mount_id: &str) -> Option<String> {
+        self.link_status.lock().unwrap().get(mount_id).cloned()
+    }
+
+    /// A blob just landed in `doc`'s store (fetched over a link): copy it to the stores of
+    /// every document bridged to `doc`, so clients of those vaults can download it.
+    pub fn blob_arrived(&self, doc: &Arc<LiveDoc>, hash: &str) {
+        let Ok(Some(bytes)) = doc.store.get_blob(hash) else { return };
+        for b in self.bridges_for(&doc.id) {
+            let other = if b.share.id == doc.id { &b.vault } else { &b.share };
+            if !other.store.has_blob(hash) {
+                if let Err(e) = other.store.put_blob(hash, &bytes) {
+                    tracing::warn!(doc = %other.label, "copying fetched blob failed: {e}");
+                }
+            }
+        }
+    }
+
+    /// The live share document for an incoming p2p link, loading the owner's vault (and with
+    /// it the share and its bridge) if needed.
+    pub fn share_doc_for_link(self: &Arc<Self>, share: &ShareInfo) -> anyhow::Result<Arc<LiveDoc>> {
+        self.load_vault_by_id(&share.vault_id)?;
+        let existing = self.shares.lock().unwrap().get(&share.id).cloned();
+        match existing {
+            Some(d) => Ok(d),
+            None => {
+                let _g = self.apply_lock.lock().unwrap();
+                self.load_share(share)
+            }
         }
     }
 
@@ -215,7 +261,7 @@ impl DocRegistry {
     }
 
     /// Live document for `user`'s vault `name`, loading it and its bridges on first use.
-    pub fn get_or_load(&self, user: &User, name: &str) -> anyhow::Result<Arc<LiveDoc>> {
+    pub fn get_or_load(self: &Arc<Self>, user: &User, name: &str) -> anyhow::Result<Arc<LiveDoc>> {
         let (info, store) = self.storage.open_vault_for_user(user, name)?;
         let existing = self.vaults.lock().unwrap().get(&info.id).cloned();
         if let Some(v) = existing {
@@ -248,7 +294,7 @@ impl DocRegistry {
         Ok(doc)
     }
 
-    fn attach_vault_bridges(&self, vault: &Arc<LiveDoc>, info: &VaultInfo) {
+    fn attach_vault_bridges(self: &Arc<Self>, vault: &Arc<LiveDoc>, info: &VaultInfo) {
         let reg = self.storage.registry();
         match reg.shares_for_vault(&info.id) {
             Ok(shares) => {
@@ -290,31 +336,54 @@ impl DocRegistry {
         Ok(())
     }
 
-    fn attach_mount_bridge_locked(&self, vault: &Arc<LiveDoc>, mount: &MountInfo) -> anyhow::Result<()> {
-        if mount.home_node != self.node_id {
-            tracing::warn!(mount = %mount.share_name, "remote shares are not supported yet; mount is inactive");
-            return Ok(());
-        }
-        let share = self
-            .storage
-            .registry()
-            .share_by_id(&mount.share_id)?
-            .ok_or_else(|| anyhow::anyhow!("share {} no longer exists", mount.share_id))?;
-        let sdoc = self.load_share(&share)?;
+    fn attach_mount_bridge_locked(self: &Arc<Self>, vault: &Arc<LiveDoc>, mount: &MountInfo) -> anyhow::Result<()> {
+        let (sdoc, only_file) = if mount.home_node == self.node_id {
+            let share = self
+                .storage
+                .registry()
+                .share_by_id(&mount.share_id)?
+                .ok_or_else(|| anyhow::anyhow!("share {} no longer exists", mount.share_id))?;
+            (self.load_share(&share)?, share.only_file.clone())
+        } else {
+            (self.load_remote_replica(mount)?, mount.only_file.clone())
+        };
         let bridge = Arc::new(Bridge {
-            share_id: share.id.clone(),
+            share_id: mount.share_id.clone(),
             mount_id: Some(mount.id.clone()),
             vault: vault.clone(),
-            share: sdoc,
+            share: sdoc.clone(),
             vault_prefix: mount.mount_prefix.clone(),
-            only_file: share.only_file.clone(),
+            only_file,
             access: mount.access.clone(),
             truth: Side::Share,
         });
         bridge.reconcile();
         self.bridges.lock().unwrap().push(bridge.clone());
         self.propagate(&bridge.vault);
+        if mount.home_node != self.node_id {
+            if self.endpoint.is_some() {
+                let handle = crate::remote::spawn_link(self.clone(), mount.clone(), sdoc);
+                if let Some(old) = self.links.lock().unwrap().insert(mount.id.clone(), handle) {
+                    old.abort();
+                }
+            } else {
+                tracing::warn!(mount = %mount.share_name, "p2p is disabled (--no-p2p); remote mount stays offline");
+                self.set_link_status(&mount.id, "offline (p2p disabled)");
+            }
+        }
         Ok(())
+    }
+
+    /// Replica document for a remote mount, keyed by mount id in the share map.
+    fn load_remote_replica(&self, mount: &MountInfo) -> anyhow::Result<Arc<LiveDoc>> {
+        let existing = self.shares.lock().unwrap().get(&mount.id).cloned();
+        if let Some(s) = existing {
+            return Ok(s);
+        }
+        let store = self.storage.mount_store(mount)?;
+        let doc = LiveDoc::load(mount.id.clone(), format!("remote:{}", mount.share_name), DocKind::Remote(mount.clone()), store)?;
+        self.shares.lock().unwrap().insert(mount.id.clone(), doc.clone());
+        Ok(doc)
     }
 
     /// Called by the API after creating a share. Takes the apply lock itself.
@@ -324,7 +393,7 @@ impl DocRegistry {
         self.attach_owner_bridge_locked(&vault, share)
     }
 
-    pub fn add_mount_bridge(&self, mount: &MountInfo) -> anyhow::Result<()> {
+    pub fn add_mount_bridge(self: &Arc<Self>, mount: &MountInfo) -> anyhow::Result<()> {
         let _g = self.apply_lock.lock().unwrap();
         let vault = self.loaded_vault(&mount.vault_id).ok_or_else(|| anyhow::anyhow!("vault not loaded"))?;
         self.attach_mount_bridge_locked(&vault, mount)
@@ -342,11 +411,20 @@ impl DocRegistry {
         let before = bridges.len();
         bridges.retain(|b| b.mount_id.as_ref().map(|m| !mount_ids.contains(m)).unwrap_or(true));
         tracing::info!("removed {} mount bridge(s) for {:?}", before - bridges.len(), mount_ids);
+        drop(bridges);
+        let mut links = self.links.lock().unwrap();
+        for id in mount_ids {
+            if let Some(h) = links.remove(id) {
+                h.abort();
+            }
+            self.shares.lock().unwrap().remove(id);
+            self.link_status.lock().unwrap().remove(id);
+        }
     }
 
     /// Load every vault that takes part in a bridge, owners first, so a share can never
     /// advance while one of its ends is not loaded (which would make reconcile lossy).
-    pub fn preload_bridged(&self) {
+    pub fn preload_bridged(self: &Arc<Self>) {
         let reg = self.storage.registry();
         let mut vault_ids: Vec<String> = Vec::new();
         for s in reg.list_vaults(None).unwrap_or_default() {
@@ -366,7 +444,7 @@ impl DocRegistry {
         }
     }
 
-    pub fn load_vault_by_id(&self, vault_id: &str) -> anyhow::Result<Arc<LiveDoc>> {
+    pub fn load_vault_by_id(self: &Arc<Self>, vault_id: &str) -> anyhow::Result<Arc<LiveDoc>> {
         let reg = self.storage.registry();
         let info = reg.vault_by_id(vault_id)?.ok_or_else(|| anyhow::anyhow!("no vault {vault_id}"))?;
         let user = reg.user_by_id(&info.user_id)?.ok_or_else(|| anyhow::anyhow!("no user {}", info.user_id))?;

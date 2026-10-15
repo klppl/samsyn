@@ -178,6 +178,17 @@ Leftover `sync` processes keep watching their directory. Kill them before deleti
 
 Scenario test (one server, three users, headless clients as plugins): `server/scripts/share-e2e.sh`. Needs a debug build (`cargo build` in `server/`), uses port 8798 and a temp dir (`REPLICA_E2E_DIR=… ` to keep it), kills every running `replica-server` first. Covers create, overlap race, mount, both-way and concurrent edits, blobs, read-only revert and rescue copy, revoke, restart, unmount. Turning it into a Rust integration test is still on the list.
 
+### Server to server (iroh)
+
+`server/src/remote.rs`: endpoint, accept handler (`ShareProtocol`), link task per remote mount (`spawn_link`), framing and blob fetch. Things worth knowing:
+
+- Both servers on one machine need different `--p2p-port`s. `--relay none` makes the test deterministic (direct connection over loopback/LAN, no internet); without it the endpoint registers with the public n0 relays, which takes a few seconds and is done in the background so HTTP is not delayed.
+- A ticket embeds the owner's direct addresses *with port*, so a random p2p port (`--p2p-port 0`) breaks old tickets after a restart unless a relay is configured. Hence the fixed default.
+- Blob bytes cross the link lazily: the metadata can reach a vault before the bytes do. Both clients retry a 404 with backoff; the server copies fetched bytes into the bridged vault store (`DocRegistry::blob_arrived`).
+- When the owner denies a hello it waits for the reply to drain before closing, otherwise the peer only sees "connection lost" and keeps retrying instead of marking the mount revoked.
+
+Scenario test: `server/scripts/remote-e2e.sh` (two servers, ports 8798/8799 + p2p 9798/9799, `REPLICA_E2E_RELAY=none|default|<url>`). Covers probe of a bad ticket, mount over p2p, blobs both ways, concurrent edits, read-only, revoke → mount revoked on the other server, restart of either server, unmount. It takes 3–4 minutes.
+
 ## Tests
 
 ```sh

@@ -7,9 +7,12 @@ Goals: many users, each with many vaults; every vault self-contained on disk; tr
 ```
 <data-dir>/
   server.json                       instance id, schema version
-  registry.db                       SQLite: users, token hashes, vault index, (future) mounts
+  registry.db                       SQLite: users, token hashes, vault index, shares, grants, mounts
+  identity.key                      ed25519 secret (hex, 0600); public half = node id in tickets
   users/
     <user-id>/
+      shares/<share-id>/            share documents this user owns (same shape as a vault)
+      mounts/<mount-id>/            local replicas of shares mounted from other servers
       vaults/
         <vault-id>/
           vault.json                owner, name, created (plain text, for recovery by hand)
@@ -105,18 +108,6 @@ The server does not encrypt data itself. Recommended: run on an encrypted filesy
 
 ## Shares and mounts
 
-Shares are separate documents stored like vaults under `users/<uid>/shares/<share_id>/`. Registry tables `shares`, `share_grants` (hashed ticket secrets) and `mounts` describe who shares what and who mounted it. The server keeps shared subtrees equal between documents at runtime; see `docs/SHARING.md`. Backup and restore include share directories automatically because they sit inside the user's tree.
+Shares are separate documents stored like vaults under `users/<uid>/shares/<share_id>/`; a share mounted from another server is replicated into `users/<uid>/mounts/<mount_id>/`. Registry tables `shares`, `share_grants` (hashed ticket secrets) and `mounts` (including the owner's node id, addresses and the ticket secret, which is why `registry.db` should be treated as sensitive) describe who shares what and who mounted it. The server keeps shared subtrees equal between documents at runtime; see `docs/SHARING.md`.
 
-## Future: shared folders between users (server-to-server)
-
-Goal from the plugin's point of view: "add my friend's `Projects/Shared` folder to my vault at `Shared/Anna`", after which it is just another folder that syncs. The plugin should not know whether the other user is on the same server or a different one.
-
-Planned model, already reserved in the schema:
-
-- A **share** is its own Yjs document (same `texts`/`blobs` shape) that holds one subtree. Its owner's vault *mounts* it at a path; the sharer's server is its home.
-- A **mount** row (`mounts` table: `vault_id, mount_path, share_id, remote_server`) tells the server that paths under `mount_path` in that vault are backed by the share document instead of the vault document.
-- The server composes what the client sees: updates for the mounted subtree are routed to/from the share document; the vault document never contains those keys. The client still speaks plain y-sync to one WebSocket.
-- For a share whose home is another server, the local server keeps a replica of the share document and syncs it server-to-server over the same y-sync protocol (the server acts as a client to the remote server, authenticated with a share token issued by the remote owner). Blobs are fetched lazily from the home server and cached in the local vault's blob store.
-- Permissions live with the share (read-only or read-write per grantee). Revocation = remote server stops accepting the share token; the local copy stays readable until the mount is removed.
-
-Storage consequences are small: a share is a directory with the same `doc.db`/`blobs/`/`snapshots/` shape under `users/<owner>/shares/<share-id>/`, so backup, snapshot and restore work unchanged.
+Full backups (`backup` without `--user`/`--vault`) include share and mount directories; a full `restore` puts them back. Filtered backups and `restore --merge` only carry vaults. That is survivable: an owned share is refilled from the owner's vault on the next start, and a remote replica is refilled from the owner's server. Losing a replica means the mount path is briefly emptied and then re-downloaded, so prefer full backups on servers that mount remote shares.

@@ -100,6 +100,22 @@ impl Storage {
         VaultStore::open(&dir, &as_vault)
     }
 
+    /// Local replica of a share that lives on another server (one per remote mount).
+    pub fn mount_dir(&self, user_id: &str, mount_id: &str) -> PathBuf {
+        self.root.join("users").join(user_id).join("mounts").join(mount_id)
+    }
+
+    pub fn mount_store(&self, info: &MountInfo) -> anyhow::Result<VaultStore> {
+        let dir = self.mount_dir(&info.user_id, &info.id);
+        let as_vault = VaultInfo {
+            id: info.id.clone(),
+            user_id: info.user_id.clone(),
+            name: format!("remote:{}", info.share_name),
+            created_at: info.created_at.clone(),
+        };
+        VaultStore::open(&dir, &as_vault)
+    }
+
     /// This server's long-lived identity (ed25519). Public half is the node id in tickets.
     pub fn identity(&self) -> anyhow::Result<iroh_base::SecretKey> {
         let path = self.root.join("identity.key");

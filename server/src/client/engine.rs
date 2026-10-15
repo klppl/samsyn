@@ -46,6 +46,8 @@ pub struct Engine {
     root_missing: bool,
     /// (when, how many) shared files we removed recently; feeds the mass-delete guard.
     recent_deletes: VecDeque<(Instant, usize)>,
+    /// Blobs the document references but the server did not have yet: (meta, retry at, attempts).
+    pending_blobs: HashMap<String, (BlobMeta, Instant, u32)>,
     pub synced: bool,
     pub had_cached_doc: bool,
     pub pending_deletions: Vec<String>,
@@ -150,6 +152,7 @@ impl Engine {
             state_dirty: false,
             root_missing: false,
             recent_deletes: VecDeque::new(),
+            pending_blobs: HashMap::new(),
             synced: false,
             had_cached_doc,
             pending_deletions: Vec::new(),
@@ -434,9 +437,20 @@ impl Engine {
         let url = format!("{}/blobs/{}/{}", self.args.http_base(), self.args.vault, meta.hash);
         let res = self.http.get(&url).bearer_auth(&self.args.token).send().await?;
         if res.status() == reqwest::StatusCode::NOT_FOUND {
-            tracing::warn!("blob for {rel} not on server yet");
+            // Metadata can precede the bytes (slow uploader, or a server-side share link still
+            // fetching them); retry with backoff for up to about ten minutes.
+            let attempts = self.pending_blobs.get(rel).map(|(_, _, n)| *n).unwrap_or(0) + 1;
+            if attempts > 20 {
+                tracing::warn!("blob for {rel} never appeared on server, giving up");
+                self.pending_blobs.remove(rel);
+                return Ok(());
+            }
+            let delay = Duration::from_secs(match attempts { 1 => 2, 2 => 5, 3 => 15, 4 => 30, _ => 60 });
+            tracing::warn!("blob for {rel} not on server yet, retrying in {delay:?}");
+            self.pending_blobs.insert(rel.to_string(), (meta.clone(), Instant::now() + delay, attempts));
             return Ok(());
         }
+        self.pending_blobs.remove(rel);
         let bytes = res.error_for_status()?.bytes().await?;
         self.mark_synced(rel, meta.hash.clone());
         write_atomic(&abs, &bytes)?;
@@ -794,6 +808,37 @@ impl Engine {
     }
 
     // ------------------------------------------------------------------ persistence
+
+    /// Retry blobs that were missing on the server when their metadata arrived.
+    pub async fn retry_pending_blobs(&mut self) {
+        let now = Instant::now();
+        let due: Vec<(String, BlobMeta)> = self
+            .pending_blobs
+            .iter()
+            .filter(|(_, (_, at, _))| *at <= now)
+            .map(|(rel, (meta, _, _))| (rel.clone(), meta.clone()))
+            .collect();
+        for (rel, meta) in due {
+            let current = {
+                let txn = self.awareness.doc().transact();
+                match self.blobs.get(&txn, &rel) {
+                    Some(Out::Any(Any::Map(m))) => BlobMeta::from_any(&m),
+                    _ => None,
+                }
+            };
+            match current {
+                Some(m) if m.hash == meta.hash => {
+                    if let Err(e) = self.download_blob(&rel, &meta).await {
+                        tracing::warn!("retrying blob {rel} failed: {e}");
+                    }
+                }
+                _ => {
+                    // Replaced or removed meanwhile; nothing to fetch.
+                    self.pending_blobs.remove(&rel);
+                }
+            }
+        }
+    }
 
     pub fn flush_persistence(&mut self) {
         let dirty = std::mem::replace(&mut *self.doc_dirty.lock().unwrap(), false);

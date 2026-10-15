@@ -77,9 +77,56 @@ pub fn write_backup<W: Write>(storage: &Storage, filter: &BackupFilter, out: W) 
         stats.vaults += 1;
     }
 
+    // Share documents and remote-mount replicas, laid out next to the vaults. Only in full
+    // backups: they are keyed by user id and the merge path does not know how to merge them.
+    if filter.user.is_none() && filter.vault.is_none() {
+        for sh in storage.registry().all_shares()? {
+            let store = storage.share_store(&sh)?;
+            append_store(&mut tar, tmp.path(), &store, &format!("users/{}/shares/{}", sh.user_id, sh.id), &sh.id, &mut stats)?;
+        }
+        for m in storage.registry().all_mounts()? {
+            if !storage.mount_dir(&m.user_id, &m.id).join("doc.db").exists() {
+                continue;
+            }
+            let store = storage.mount_store(&m)?;
+            append_store(&mut tar, tmp.path(), &store, &format!("users/{}/mounts/{}", m.user_id, m.id), &m.id, &mut stats)?;
+        }
+    }
+
     let enc = tar.into_inner()?;
     enc.finish()?;
     Ok(stats)
+}
+
+fn append_store<W: Write>(
+    tar: &mut tar::Builder<W>,
+    tmp: &Path,
+    store: &VaultStore,
+    rel: &str,
+    id: &str,
+    stats: &mut BackupStats,
+) -> anyhow::Result<()> {
+    let dir = store.dir();
+    tar.append_path_with_name(dir.join("vault.json"), format!("{rel}/vault.json"))?;
+    let db_copy = tmp.join(format!("{id}.db"));
+    store.backup_db_to(&db_copy)?;
+    tar.append_path_with_name(&db_copy, format!("{rel}/doc.db"))?;
+    for h in store.list_blob_hashes()? {
+        let p = dir.join("blobs").join(&h[..2]).join(&h);
+        tar.append_path_with_name(&p, format!("{rel}/blobs/{}/{}", &h[..2], h))?;
+        stats.blobs += 1;
+    }
+    for s in store.list_snapshots()? {
+        let name = s.file_name().unwrap().to_string_lossy().to_string();
+        tar.append_path_with_name(&s, format!("{rel}/snapshots/{name}"))?;
+        let man = s.with_extension("json");
+        if man.exists() {
+            let mname = man.file_name().unwrap().to_string_lossy().to_string();
+            tar.append_path_with_name(&man, format!("{rel}/snapshots/{mname}"))?;
+        }
+        stats.snapshots += 1;
+    }
+    Ok(())
 }
 
 #[derive(Default, Debug)]

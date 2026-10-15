@@ -10,6 +10,7 @@ mod cli;
 mod client;
 mod config;
 mod ids;
+mod remote;
 mod sharing;
 mod storage;
 mod ticket;
@@ -38,7 +39,7 @@ use crate::vault::DocRegistry;
 pub struct AppState {
     pub serve: ServeArgs,
     pub storage: Storage,
-    pub docs: DocRegistry,
+    pub docs: Arc<DocRegistry>,
 }
 
 pub type SharedState = Arc<AppState>;
@@ -94,12 +95,35 @@ async fn serve(args: ServeArgs, storage: Storage) -> anyhow::Result<()> {
     let node_id = identity.public().to_string();
     tracing::info!("server node id: {node_id}");
 
+    // Peer-to-peer endpoint for server-to-server shares (phase 2).
+    let endpoint = if args.no_p2p {
+        tracing::info!("p2p disabled; tickets only work between vaults on this server");
+        None
+    } else {
+        let ep = remote::bind_endpoint(identity, &args.relay, args.p2p_port).await?;
+        let relays_off = args.relay.iter().any(|r| r.trim() == "none");
+        tracing::info!("p2p endpoint bound ({})", if relays_off { "direct only, no relay" } else { "relay + direct" });
+        {
+            // Relay registration can take a few seconds; do not hold up HTTP for it.
+            let ep = ep.clone();
+            tokio::spawn(async move {
+                if !relays_off && tokio::time::timeout(Duration::from_secs(20), ep.online()).await.is_err() {
+                    tracing::warn!("p2p endpoint not online after 20 s (relay unreachable?); direct connections may still work");
+                }
+                tracing::info!("p2p addresses: {:?}", remote::addr_strings(&ep));
+            });
+        }
+        Some(ep)
+    };
+
     let max_blob = args.max_blob_mb * 1024 * 1024;
-    let state: SharedState = Arc::new(AppState {
-        docs: DocRegistry::new(storage.clone(), node_id),
-        storage,
-        serve: args,
+    let docs = Arc::new(DocRegistry::new(storage.clone(), node_id, endpoint.clone()));
+    let router = endpoint.map(|ep| {
+        iroh::protocol::Router::builder(ep)
+            .accept(remote::ALPN, remote::ShareProtocol { docs: docs.clone() })
+            .spawn()
     });
+    let state: SharedState = Arc::new(AppState { docs, storage, serve: args });
 
     state.docs.preload_bridged();
 
@@ -166,6 +190,9 @@ async fn serve(args: ServeArgs, storage: Storage) -> anyhow::Result<()> {
         }
     }
 
+    if let Some(r) = router {
+        let _ = r.shutdown().await;
+    }
     tracing::info!("flushing snapshots before exit");
     state.docs.snapshot_all(state.serve.snapshot_keep);
     Ok(())

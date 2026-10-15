@@ -89,11 +89,11 @@ pub async fn get_sharing(
         .iter()
         .map(|m| {
             let status = if m.revoked_at.is_some() {
-                "revoked"
+                "revoked".to_string()
             } else if m.home_node != state.docs.node_id {
-                "remote (not supported yet)"
+                format!("remote: {}", state.docs.link_status(&m.id).unwrap_or_else(|| "starting".into()))
             } else {
-                "active"
+                "active".to_string()
             };
             serde_json::json!({
                 "id": m.id, "share_id": m.share_id, "name": m.share_name, "mount_path": m.mount_prefix.trim_end_matches('/'),
@@ -121,7 +121,7 @@ fn make_ticket(state: &SharedState, share: &ShareInfo, secret: String, access: &
         node_id: state.docs.node_id.clone(),
         secret,
         access: access.to_string(),
-        addrs: vec![],
+        addrs: state.docs.endpoint.as_ref().map(crate::remote::addr_strings).unwrap_or_default(),
     }
     .encode()
 }
@@ -348,27 +348,36 @@ pub async fn create_mount(
         Ok(t) => t,
         Err(e) => return err(StatusCode::BAD_REQUEST, format!("bad ticket: {e}")),
     };
-    if ticket.node_id != state.docs.node_id {
-        return err(StatusCode::NOT_IMPLEMENTED, "this ticket is for a share on another server; server-to-server sync is not available yet");
-    }
     let reg = state.storage.registry();
-    let share = match reg.share_by_id(&ticket.share_id) {
-        Ok(Some(s)) => s,
-        Ok(None) => return err(StatusCode::NOT_FOUND, "the share in this ticket no longer exists"),
-        Err(e) => return internal(e),
-    };
-    if share.vault_id == info.id {
-        return err(StatusCode::BAD_REQUEST, "you cannot mount your own share into the same vault");
-    }
-    let (label, grant_access) = match reg.check_grant(&share.id, &ticket.secret) {
-        Ok(Some(g)) => g,
-        Ok(None) => return err(StatusCode::FORBIDDEN, "ticket is invalid or has been revoked"),
-        Err(e) => return internal(e),
+    let remote = ticket.node_id != state.docs.node_id;
+    // What the owner granted: (label for the log, access, share name, single-note flag).
+    let (label, grant_access, share_name, only_file) = if remote {
+        let Some(ep) = state.docs.endpoint.as_ref() else {
+            return err(StatusCode::NOT_IMPLEMENTED, "this ticket is for a share on another server and p2p is disabled on this one (--no-p2p)");
+        };
+        match crate::remote::probe(ep, &ticket).await {
+            Ok((access, name, only_file)) => ("p2p".to_string(), access, name, only_file),
+            Err(e) => return err(StatusCode::BAD_GATEWAY, e.to_string()),
+        }
+    } else {
+        let share = match reg.share_by_id(&ticket.share_id) {
+            Ok(Some(s)) => s,
+            Ok(None) => return err(StatusCode::NOT_FOUND, "the share in this ticket no longer exists"),
+            Err(e) => return internal(e),
+        };
+        if share.vault_id == info.id {
+            return err(StatusCode::BAD_REQUEST, "you cannot mount your own share into the same vault");
+        }
+        match reg.check_grant(&share.id, &ticket.secret) {
+            Ok(Some((label, access))) => (label, access, share.name.clone(), share.only_file.clone()),
+            Ok(None) => return err(StatusCode::FORBIDDEN, "ticket is invalid or has been revoked"),
+            Err(e) => return internal(e),
+        }
     };
     let access = if grant_access == "ro" || ticket.access == "ro" { "ro" } else { "rw" };
 
     let mount_path = clean_path(&body.mount_path.unwrap_or_default());
-    let mount_path = if mount_path.is_empty() { format!("Shared/{}", share.name) } else { mount_path };
+    let mount_path = if mount_path.is_empty() { format!("Shared/{share_name}") } else { mount_path };
     let prefix = format!("{mount_path}/");
     let _admin = state.docs.share_admin.lock().unwrap();
     match taken_prefixes(&state, &info.id) {
@@ -382,7 +391,18 @@ pub async fn create_mount(
     if doc.keys().iter().any(|k| k.starts_with(&prefix)) {
         return err(StatusCode::CONFLICT, format!("'{mount_path}' already contains files; choose an empty or new folder"));
     }
-    let mount = match reg.create_mount(&user.id, &info.id, &share.id, &share.name, &prefix, access, &ticket.node_id, &ticket.secret) {
+    let mount = match reg.create_mount(
+        &user.id,
+        &info.id,
+        &ticket.share_id,
+        &share_name,
+        &prefix,
+        access,
+        &ticket.node_id,
+        &ticket.addrs,
+        only_file.as_deref(),
+        &ticket.secret,
+    ) {
         Ok(m) => m,
         Err(e) => return internal(e),
     };
@@ -390,7 +410,7 @@ pub async fn create_mount(
         let _ = reg.delete_mount(&mount.id);
         return internal(e);
     }
-    tracing::info!(user = %user.name, share = %share.name, "mounted at {prefix} via {label} ({access})");
+    tracing::info!(user = %user.name, share = %share_name, remote, "mounted at {prefix} via {label} ({access})");
     Json(serde_json::json!({ "mount": mount, "mount_path": mount_path, "access": access })).into_response()
 }
 
@@ -415,6 +435,14 @@ pub async fn delete_mount(
     state.docs.remove_bridges_for_mounts(&[mount.id.clone()]);
     if let Err(e) = reg.delete_mount(&mount.id) {
         return internal(e);
+    }
+    if mount.home_node != state.docs.node_id {
+        let dir = state.storage.mount_dir(&mount.user_id, &mount.id);
+        if dir.exists() {
+            if let Err(e) = std::fs::remove_dir_all(&dir) {
+                tracing::warn!("removing replica dir {} failed: {e}", dir.display());
+            }
+        }
     }
     tracing::info!(user = %user.name, "unmounted {}", mount.mount_prefix);
     StatusCode::NO_CONTENT.into_response()

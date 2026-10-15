@@ -133,6 +133,7 @@ pub async fn run(args: SyncArgs) -> anyhow::Result<()> {
                 }
             }
             _ = save_tick.tick() => {
+                engine.retry_pending_blobs().await;
                 engine.flush_persistence();
                 if !reconciled && tokio::time::Instant::now() > first_sync_deadline {
                     tracing::warn!("no server state after 10s; reconciling offline");
