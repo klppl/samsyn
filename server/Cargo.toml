@@ -26,7 +26,7 @@ postcard = { version = "1", features = ["use-std"] }
 tokio = { version = "1", features = ["full"] }
 tower-http = { version = "0.7", features = ["cors", "trace"] }
 notify-debouncer-mini = "0.7"
-reqwest = { version = "0.13", default-features = false, features = ["rustls", "webpki-roots", "charset"] }
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "webpki-roots", "charset", "blocking", "json"] }
 tar = "0.4"
 tokio-tungstenite = { version = "0.30", features = ["rustls-tls-webpki-roots"] }
 walkdir = "2"

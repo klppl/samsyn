@@ -228,6 +228,14 @@ Numbered migrations in `server/src/storage/registry.rs` (`migrate()`, `REGISTRY_
 
 ## Tests
 
+Sharing scenarios also exist as Rust integration tests in `server/tests/` (`sharing_same_server`, `sharing_remote`, `sharing_guest`; helpers in `tests/common/mod.rs`). They spawn the freshly built binary as servers and headless clients in a temp dir and take 1–3 minutes each:
+
+```sh
+cd server && cargo test --test sharing_same_server   # or --test sharing_remote / --test sharing_guest
+```
+
+They run as part of plain `cargo test` too. The zsh scripts under `server/scripts/` remain for poking at a scenario by hand.
+
 ```sh
 cd plugin && npm test                       # diff/hash unit tests (node:test)
 cd plugin && node tests/e2e.mjs ws://127.0.0.1:8787/ws rp_yourtoken   # against a running server
