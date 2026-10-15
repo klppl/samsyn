@@ -99,14 +99,19 @@ export class SetupConfirmModal extends Modal {
           .setCta()
           .setDisabled(!urls)
           .onClick(async () => {
+            b.setDisabled(true);
             current.serverUrl = server;
             current.token = token;
             current.vaultId = slugify(vault);
             current.enabled = true;
             await this.plugin.saveSettings();
-            await this.plugin.restartEngine();
-            new Notice(`Replica: connected to ${server}`);
+            // The first sync downloads the whole vault; do not keep the dialog open for it.
             this.close();
+            new Notice(`Replica: connecting to ${server}. The first sync can take a while; progress is on the Server tab.`, 8000);
+            void this.plugin
+              .restartEngine()
+              .then(() => new Notice("Replica: first sync done"))
+              .catch((e) => new Notice(`Replica: connecting failed (${(e as Error).message})`, 10_000));
             this.plugin.settingTab?.show("server");
           }),
       );
