@@ -38,15 +38,20 @@ fn every_authenticated_route_rejects_anonymous_and_bad_tokens() {
         ("GET", &format!("/blobs/va/{}", hex64('a')), None),
         ("PUT", &format!("/blobs/va/{}", hex64('a')), None),
     ];
+    // After 30 failures from one address the budget answers 429 instead; both mean "no".
+    let mut attempts = 0;
     for (method, path, body) in routes {
         for token in ["", "rp_00000000000000000000000000000000", "garbage"] {
             let (code, _) = api_raw(&server, token, method, path, body.clone());
-            assert_eq!(code, 401, "{method} {path} with token {token:?} must be 401");
+            let expected = if attempts < 30 { 401 } else { 429 };
+            assert_eq!(code, expected, "{method} {path} with token {token:?} (attempt {attempts})");
+            attempts += 1;
         }
     }
-    // The WebSocket upgrade is refused before the upgrade when the token is wrong.
+    // The WebSocket upgrade is refused before the upgrade when the token is wrong (budget
+    // already exhausted above, so 429 here).
     let (code, _) = api_raw(&server, "", "GET", "/ws/va?token=rp_00000000000000000000000000000000", None);
-    assert_eq!(code, 401);
+    assert!(code == 401 || code == 429);
     // Public routes stay public but reveal nothing sensitive.
     let (code, body) = api_raw(&server, "", "GET", "/health", None);
     assert_eq!(code, 200);
@@ -521,6 +526,176 @@ fn reading_never_creates_vaults_and_creation_is_capped() {
     assert_eq!(ws_code, 409, "WebSocket should refuse to create past the cap");
     let me = api_json(&server, &owner, "GET", "/me", None);
     assert_eq!(me["vaults"].as_array().unwrap().len(), 2, "{me}");
+}
+
+
+// ------------------------------------------------------------------ limits (plan batch 1)
+
+#[test]
+fn per_token_connection_cap_and_auth_failure_budget() {
+    let dir = tmp("sec-caps");
+    let server = Server::start(&dir, "s", &["--max-conns-per-token", "3"]);
+    let owner = server.owner_token.clone();
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let url = format!("ws://127.0.0.1:{}/ws/va?token={owner}", server.port);
+        let mut held = Vec::new();
+        for _ in 0..3 {
+            held.push(tokio_tungstenite::connect_async(&url).await.expect("connect"));
+        }
+        match tokio_tungstenite::connect_async(&url).await {
+            Err(tokio_tungstenite::tungstenite::Error::Http(resp)) => assert_eq!(resp.status().as_u16(), 429),
+            other => panic!("fourth connection should be refused, got {:?}", other.is_ok()),
+        }
+        drop(held.pop());
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(tokio_tungstenite::connect_async(&url).await.is_ok(), "slot not released on close");
+    });
+    // 30 failed user-token attempts from one address → 429 for a while, even with a good token.
+    for _ in 0..30 {
+        api_raw(&server, "rp_00000000000000000000000000000000", "GET", "/me", None);
+    }
+    let (code, _) = api_raw(&server, &owner, "GET", "/me", None);
+    assert_eq!(code, 429, "auth failure budget not enforced");
+}
+
+#[test]
+fn document_size_cap_and_awareness_cap() {
+    let dir = tmp("sec-doccap");
+    let server = Server::start(&dir, "s", &["--max-doc-mb", "1"]);
+    let owner = server.owner_token.clone();
+    let a = Client::start(&server, &owner, "va", &dir.join("A"), "A");
+    a.write("small.md", "hello\n");
+    eventually!(10, a.proc.log_contains("reconcile done"), "client up", a.proc);
+    let url = format!("ws://127.0.0.1:{}/ws/va?token={owner}", server.port);
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        use futures::{SinkExt, StreamExt};
+        use tokio_tungstenite::tungstenite::Message;
+        use yrs::sync::{Message as M, SyncMessage};
+        use yrs::updates::encoder::Encode;
+        use yrs::{Map, ReadTxn, Transact};
+        let (mut ws, _) = tokio_tungstenite::connect_async(&url).await.expect("connect");
+        // A 2 MB note into a 1 MB document: refused.
+        let doc = yrs::Doc::new();
+        let texts = doc.get_or_insert_map("texts");
+        {
+            let mut txn = doc.transact_mut();
+            texts.insert(&mut txn, "huge.md", yrs::TextPrelim::new("x".repeat(2 * 1024 * 1024).as_str()));
+        }
+        let update = doc.transact().encode_state_as_update_v1(&yrs::StateVector::default());
+        ws.send(Message::Binary(M::Sync(SyncMessage::Update(update)).encode_v1().into())).await.unwrap();
+        // An awareness update claiming 1 000 clients: ignored.
+        let mut clients = std::collections::HashMap::new();
+        for i in 1..=1000u64 {
+            clients.insert(yrs::block::ClientID::new(i), yrs::sync::awareness::AwarenessUpdateEntry { clock: 1, json: "{\"user\":{\"name\":\"x\"}}".into() });
+        }
+        let aw = yrs::sync::awareness::AwarenessUpdate { clients };
+        ws.send(Message::Binary(M::Awareness(aw).encode_v1().into())).await.unwrap();
+        // Then a legitimate small awareness state and a step 1, to see the server still answers.
+        let mut one = std::collections::HashMap::new();
+        one.insert(yrs::block::ClientID::new(4242), yrs::sync::awareness::AwarenessUpdateEntry { clock: 1, json: "{\"user\":{\"name\":\"probe\"}}".into() });
+        ws.send(Message::Binary(M::Awareness(yrs::sync::awareness::AwarenessUpdate { clients: one }).encode_v1().into())).await.unwrap();
+        let d2 = yrs::Doc::new();
+        ws.send(Message::Binary(M::Sync(SyncMessage::SyncStep1(d2.transact().state_vector())).encode_v1().into())).await.unwrap();
+        let answered = tokio::time::timeout(Duration::from_secs(5), async {
+            while let Some(Ok(m)) = ws.next().await {
+                if let Message::Binary(_) = m {
+                    return true;
+                }
+            }
+            false
+        })
+        .await
+        .unwrap_or(false);
+        assert!(answered);
+    });
+    sleep(2.0);
+    assert!(!a.exists("huge.md"), "oversized update was applied");
+    assert!(server.proc.log_contains("would exceed 1 MB"), "size refusal not logged");
+    assert!(server.proc.log_contains("awareness update with 1000 clients ignored"), "awareness cap not enforced");
+}
+
+#[test]
+fn cors_is_not_wide_open_by_default() {
+    let dir = tmp("sec-cors");
+    let server = Server::start(&dir, "s", &[]);
+    let client = reqwest::blocking::Client::new();
+    let res = client.get(format!("{}/health", server.url())).header("origin", "https://evil.example").send().unwrap();
+    assert!(res.headers().get("access-control-allow-origin").is_none(), "arbitrary origin allowed");
+    let res = client.get(format!("{}/health", server.url())).header("origin", "app://obsidian.md").send().unwrap();
+    assert_eq!(res.headers().get("access-control-allow-origin").map(|v| v.to_str().unwrap()), Some("app://obsidian.md"));
+}
+
+#[test]
+fn initial_token_file_keeps_the_token_out_of_the_log() {
+    let dir = tmp("sec-tokenfile");
+    let file = dir.join("owner.token");
+    let server = Server::start(&dir, "s", &["--initial-token-file", file.to_str().unwrap()]);
+    let token = std::fs::read_to_string(&file).unwrap().trim().to_string();
+    assert!(token.starts_with("rp_"));
+    assert!(!server.proc.log_contains(&token), "token still in the log");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(std::fs::metadata(&file).unwrap().permissions().mode() & 0o777, 0o600);
+    }
+    let (code, _) = api_raw(&server, &token, "GET", "/me", None);
+    assert_eq!(code, 200);
+}
+
+#[test]
+fn per_user_storage_quota_refuses_uploads_past_the_cap() {
+    let dir = tmp("sec-userquota");
+    let server = Server::start(&dir, "s", &["--max-user-mb", "1"]);
+    let owner = server.owner_token.clone();
+    let big = vec![1u8; 700 * 1024];
+    let h1 = hex::encode(sha2::Sha256::digest(&big));
+    let (code, _) = api_raw_bytes(&server, &owner, "PUT", &format!("/blobs/va/{h1}"), &big);
+    assert_eq!(code, 201);
+    let big2 = vec![2u8; 700 * 1024];
+    let h2 = hex::encode(sha2::Sha256::digest(&big2));
+    let (code, body) = api_raw_bytes(&server, &owner, "PUT", &format!("/blobs/va/{h2}"), &big2);
+    assert_eq!(code, 413, "second upload should exceed the 1 MB quota: {body}");
+    // Re-uploading an existing blob is free (same hash, nothing new stored).
+    let (code, _) = api_raw_bytes(&server, &owner, "PUT", &format!("/blobs/va/{h1}"), &big);
+    assert_eq!(code, 201);
+    let me = api_json(&server, &owner, "GET", "/me", None);
+    assert!(me["usage_bytes"].as_u64().unwrap() >= 700 * 1024, "{me}");
+    assert_eq!(me["quota_bytes"].as_u64().unwrap(), 1024 * 1024);
+}
+
+#[test]
+fn mount_secrets_are_sealed_at_rest() {
+    let dir = tmp("sec-sealed");
+    let server = Server::start(&dir, "s", &[]);
+    let owner = server.owner_token.clone();
+    let bob = server.add_user("bob");
+    let a = Client::start(&server, &owner, "va", &dir.join("A"), "A");
+    a.write("S/a.md", "x\n");
+    eventually!(10, a.proc.log_contains("reconcile done"), "owner up", a.proc);
+    let r = api_json(&server, &owner, "POST", "/api/vaults/va/shares", Some(json!({"path": "S", "name": "S"})));
+    let ticket = r["ticket"].as_str().unwrap().to_string();
+    let secret = ticket_secret(&ticket);
+    let b = Client::start(&server, &bob, "vb", &dir.join("B"), "B");
+    eventually!(10, b.proc.log_contains("reconcile done"), "bob up", b.proc);
+    let m = api_json(&server, &bob, "POST", "/api/vaults/vb/mounts", Some(json!({"ticket": ticket})));
+    assert_eq!(m["access"], "rw", "{m}");
+    // The registry on disk never holds the plaintext secret (WAL mode: the row may still be
+    // in the -wal file, so read both).
+    let mut db = std::fs::read(server.data.join("registry.db")).unwrap();
+    db.extend(std::fs::read(server.data.join("registry.db-wal")).unwrap_or_default());
+    let hay = String::from_utf8_lossy(&db);
+    assert!(!hay.contains(&secret), "mount secret stored in plaintext");
+    assert!(hay.contains("enc1:"), "no sealed secret found");
+    // And the mount still works after a restart (the key is derived from identity.key).
+    drop(a);
+    let mut server = server;
+    server.restart(&[]);
+    let a = Client::start(&server, &owner, "va", &dir.join("A"), "A2");
+    eventually!(15, a.proc.log_contains("reconcile done"), "owner back", a.proc);
+    a.append("S/a.md", "after-restart");
+    eventually!(20, b.contains("Shared/S/a.md", "after-restart"), "mount works after restart with sealed secret", b.proc, server.proc);
 }
 
 // ------------------------------------------------------------------ helpers

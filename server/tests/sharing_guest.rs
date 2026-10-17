@@ -79,6 +79,8 @@ fn guests_join_with_tickets_only() {
     let g2 = Client::start_guest(&ro_ticket, &dir.join("G2"), "G2");
     eventually!(20, g1.exists("a.md") && g1.exists("pic.png") && g2.exists("a.md"), "guests get files", g1.proc, g2.proc, server.proc);
     assert_eq!(g1.read("a.md"), "a-content\n");
+    assert!(g1.proc.log_contains("guest session established"), "headless guest did not exchange a session");
+    assert!(!server.proc.log_contains("secret="), "secret in server log");
     assert!(g1.exists("sub/b.md"));
     assert!(g1.same_bytes("pic.png", &o.path("Projects/X/pic.png")));
     assert!(!g1.exists("private.md"));

@@ -101,13 +101,20 @@ fn mirror(docs: &DocRegistry, src_id: &str, update: AwarenessUpdate, st: &mut Mi
 fn targets_for(docs: &DocRegistry, src_id: &str, json: &serde_json::Value) -> Vec<(Arc<LiveDoc>, serde_json::Value)> {
     let file = json.get("file").and_then(|f| f.as_str()).map(str::to_string);
     let mut out: Vec<(Arc<LiveDoc>, serde_json::Value)> = Vec::new();
+    // Only what other people's clients need, never the whole client-supplied object: a short
+    // display name, the mapped file, and the marker.
+    let name: String = json
+        .get("user")
+        .and_then(|u| u.get("name"))
+        .and_then(|n| n.as_str())
+        .map(|n| n.chars().filter(|c| !c.is_control()).take(64).collect())
+        .unwrap_or_default();
     let rewrite = |file: String, via: &str| {
-        let mut v = json.clone();
-        if let serde_json::Value::Object(m) = &mut v {
-            m.insert("file".into(), serde_json::Value::String(file));
-            m.insert(VIA.into(), serde_json::Value::String(via.to_string()));
-        }
-        v
+        serde_json::json!({
+            "user": { "name": name },
+            "file": file,
+            VIA: via,
+        })
     };
     for b in docs.bridges_for(src_id) {
         if b.vault.id == src_id {

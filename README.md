@@ -36,7 +36,7 @@ docker compose up -d
 docker compose logs server | grep token
 ```
 
-Running on the public internet? Read [docs/PUBLIC-SERVER.md](docs/PUBLIC-SERVER.md). Server flags worth knowing: `--public-url` (guest tickets), `--max-share-mb` (guest upload quota), `--p2p-port`/`--relay`/`--no-p2p` (server-to-server), `--tls-cert`/`--tls-key`, `--max-blob-mb`, `--snapshot-hours`. `replica-server serve --help` lists them all.
+Running on the public internet? Read [docs/PUBLIC-SERVER.md](docs/PUBLIC-SERVER.md). Server flags worth knowing: `--public-url` (guest tickets), `--max-user-mb` / `--max-share-mb` / `--max-doc-mb` (quotas), `--initial-token-file` (keep the first token out of logs), `--trust-proxy` (behind Caddy), `--p2p-port`/`--relay`/`--no-p2p` (server-to-server), `--tls-cert`/`--tls-key`, `--max-blob-mb`, `--snapshot-hours`. `replica-server serve --help` lists them all.
 
 Prebuilt images are published by CI (`.github/workflows`) to the
 the private tracker registry on every push to `main` and on tags:

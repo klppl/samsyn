@@ -36,6 +36,14 @@ pub struct SyncArgs {
     #[arg(long, env = "REPLICA_TICKET", conflicts_with_all = ["server", "token", "vault"])]
     pub ticket: Option<String>,
 
+    /// Guest mode with the ticket read from a file (keeps it out of the process list).
+    #[arg(long, env = "REPLICA_TICKET_FILE", conflicts_with_all = ["server", "token", "vault", "ticket"])]
+    pub ticket_file: Option<PathBuf>,
+
+    /// Session id obtained from the owner's server at start (guest mode); never set by hand.
+    #[arg(skip)]
+    pub session: Option<String>,
+
     /// Local directory to keep in sync.
     #[arg(long, env = "REPLICA_DIR", default_value = ".")]
     pub dir: PathBuf,
@@ -90,9 +98,20 @@ fn normalize_http(raw: &str) -> String {
 }
 
 impl SyncArgs {
-    pub fn target(&self) -> anyhow::Result<Target> {
+    fn raw_ticket(&self) -> anyhow::Result<Option<String>> {
         if let Some(t) = &self.ticket {
-            let t = crate::ticket::Ticket::decode(t)?;
+            return Ok(Some(t.clone()));
+        }
+        if let Some(p) = &self.ticket_file {
+            let s = std::fs::read_to_string(p).map_err(|e| anyhow::anyhow!("reading {}: {e}", p.display()))?;
+            return Ok(Some(s.trim().to_string()));
+        }
+        Ok(None)
+    }
+
+    pub fn target(&self) -> anyhow::Result<Target> {
+        if let Some(t) = self.raw_ticket()? {
+            let t = crate::ticket::Ticket::decode(&t)?;
             anyhow::ensure!(
                 !t.url.is_empty(),
                 "this ticket has no server URL (the owner's server runs without --public-url); it can only be mounted through a replica server"
@@ -113,11 +132,12 @@ impl SyncArgs {
         }
     }
 
-    /// Credential for HTTP calls: the user token, or the ticket secret for guests.
+    /// Credential for HTTP calls: the user token, or for guests the session id (the secret
+    /// itself is only presented once, to obtain the session).
     pub fn bearer(&self) -> String {
         match self.target() {
             Ok(Target::Vault { token, .. }) => token,
-            Ok(Target::Guest { secret, .. }) => secret,
+            Ok(Target::Guest { secret, .. }) => self.session.clone().unwrap_or(secret),
             Err(_) => String::new(),
         }
     }
@@ -132,7 +152,7 @@ impl SyncArgs {
     }
 
     pub fn is_guest(&self) -> bool {
-        self.ticket.is_some()
+        self.ticket.is_some() || self.ticket_file.is_some()
     }
 
     pub fn ws_url(&self) -> String {
@@ -143,7 +163,10 @@ impl SyncArgs {
             format!("ws://{}", http.trim_start_matches("http://"))
         };
         match self.target() {
-            Ok(Target::Guest { share_id, secret, .. }) => format!("{ws}/guest/ws/{share_id}?secret={secret}"),
+            Ok(Target::Guest { share_id, secret, .. }) => match &self.session {
+                Some(s) => format!("{ws}/guest/ws/{share_id}?session={s}"),
+                None => format!("{ws}/guest/ws/{share_id}?secret={secret}"),
+            },
             Ok(Target::Vault { token, vault, .. }) => format!("{ws}/ws/{vault}?token={token}"),
             Err(_) => String::new(),
         }
@@ -167,8 +190,26 @@ impl SyncArgs {
     }
 }
 
-pub async fn run(args: SyncArgs) -> anyhow::Result<()> {
+pub async fn run(mut args: SyncArgs) -> anyhow::Result<()> {
     anyhow::ensure!(args.dir.is_dir(), "{} is not a directory", args.dir.display());
+    if let Target::Guest { http, share_id, secret, .. } = args.target()? {
+        // Present the ticket secret once and use a session from then on, so the secret never
+        // rides in the WebSocket URL or any request after this one.
+        let client = reqwest::Client::builder().timeout(Duration::from_secs(20)).build()?;
+        let res = client.post(format!("{http}/guest/session/{share_id}")).bearer_auth(&secret).send().await
+            .map_err(|e| anyhow::anyhow!("cannot reach the owner's server: {e}"))?;
+        match res.status().as_u16() {
+            200 => {
+                let body = res.bytes().await?;
+                let v: serde_json::Value = serde_json::from_slice(&body)?;
+                args.session = v["session"].as_str().map(str::to_string);
+                tracing::info!("guest session established for share {}", v["name"].as_str().unwrap_or(&share_id));
+            }
+            403 => anyhow::bail!("the ticket is invalid or has been revoked"),
+            429 => anyhow::bail!("too many failed attempts from this address; try again later"),
+            s => anyhow::bail!("owner's server answered HTTP {s}"),
+        }
+    }
     let mut engine = Engine::new(&args)?;
 
     let (ws_tx, mut ws_rx) = mpsc::unbounded_channel::<WsEvent>();

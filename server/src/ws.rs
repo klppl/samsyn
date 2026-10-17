@@ -56,7 +56,9 @@ pub async fn whoami(
                 .list_vaults(Some(&u.id))
                 .map(|v| v.into_iter().map(|v| v.name).collect())
                 .unwrap_or_default();
-            Json(serde_json::json!({ "user": u.name, "vaults": vaults })).into_response()
+            let used = state.limits.usage.get(&u.id, || state.storage.user_bytes(&u.id)).unwrap_or(0);
+            let quota = state.serve.max_user_mb * 1024 * 1024;
+            Json(serde_json::json!({ "user": u.name, "vaults": vaults, "usage_bytes": used, "quota_bytes": quota })).into_response()
         }
         Err(r) => r,
     }
@@ -76,6 +78,10 @@ pub async fn ws_handler(
         Ok(u) => u,
         Err(r) => return r,
     };
+    let token = extract_token(&headers, query.get("token").map(String::as_str)).unwrap_or_default();
+    let Some(slot) = state.limits.conns.acquire(&format!("u:{}", crate::ids::token_hash(&token)), state.serve.max_conns_per_token) else {
+        return (StatusCode::TOO_MANY_REQUESTS, "too many connections for this token").into_response();
+    };
     let vault = match state.docs.get_or_load(&user, &vault_name) {
         Ok(v) => v,
         Err(e) if e.to_string().contains("vault limit") => {
@@ -87,10 +93,9 @@ pub async fn ws_handler(
         }
     };
     let _ = user;
-    let token = extract_token(&headers, query.get("token").map(String::as_str)).unwrap_or_default();
     ws.max_message_size(MAX_WS_MESSAGE)
         .max_frame_size(MAX_WS_MESSAGE)
-        .on_upgrade(move |socket| handle_socket(socket, state, vault, true, Some(SessionCheck::User(token))))
+        .on_upgrade(move |socket| handle_socket(socket, state, vault, true, Some(SessionCheck::User(token)), slot))
 }
 
 /// What keeps a socket alive; re-checked every 30 s so a revoked token or ticket ends the
@@ -110,8 +115,12 @@ pub async fn handle_socket(
     vault: std::sync::Arc<crate::vault::LiveDoc>,
     writable: bool,
     check: Option<SessionCheck>,
+    _slot: crate::limits::ConnSlot,
 ) {
     let (mut sink, mut stream) = socket.split();
+    vault.conns.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    *vault.last_active.lock() = std::time::Instant::now();
+    let mut step1 = crate::limits::RequestBudget::new(6, std::time::Duration::from_secs(60));
     let mut rx = vault.tx.subscribe();
     let protocol = DefaultProtocol;
     let label = vault.label.clone();
@@ -146,7 +155,11 @@ pub async fn handle_socket(
                             let _apply = state.docs.apply_lock.lock();
                             let r = {
                                 let mut aw = vault.awareness.lock();
-                                handle_payload(&protocol, &mut aw, &data, &mut owned_clients, writable)
+                                let mut limits = PayloadLimits {
+                                    doc_bytes: (vault.approx_bytes.load(std::sync::atomic::Ordering::Relaxed), state.docs.max_doc_bytes),
+                                    step1: &mut step1,
+                                };
+                                handle_payload(&protocol, &mut aw, &data, &mut owned_clients, writable, &mut limits)
                             };
                             state.docs.propagate(&vault);
                             r
@@ -210,18 +223,28 @@ pub async fn handle_socket(
             aw.remove_state(id);
         }
     }
+    vault.conns.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    *vault.last_active.lock() = std::time::Instant::now();
     state.docs.maybe_compact(&vault);
     tracing::debug!(vault = %label, "client disconnected");
 }
 
 /// Feed one y-sync payload to the document. With `writable == false` (read-only peer) the
 /// peer's document updates are dropped; it can still pull our state and send awareness.
+/// Limits applied while feeding a payload: document size and full-state request budget.
+pub(crate) struct PayloadLimits<'a> {
+    /// (current approximate size, max) in bytes; `max == 0` means unlimited.
+    pub doc_bytes: (u64, u64),
+    pub step1: &'a mut crate::limits::RequestBudget,
+}
+
 pub(crate) fn handle_payload(
     protocol: &DefaultProtocol,
     aw: &mut yrs::sync::Awareness,
     data: &[u8],
     owned: &mut HashSet<ClientID>,
     writable: bool,
+    limits: &mut PayloadLimits<'_>,
 ) -> Result<Vec<Bytes>, yrs::sync::Error> {
     let mut decoder = DecoderV1::from(data);
     let reader = MessageReader::new(&mut decoder);
@@ -230,6 +253,21 @@ pub(crate) fn handle_payload(
         let msg = msg?;
         if !writable && matches!(msg, Message::Sync(SyncMessage::Update(_)) | Message::Sync(SyncMessage::SyncStep2(_))) {
             continue;
+        }
+        if let Message::Sync(SyncMessage::Update(u)) | Message::Sync(SyncMessage::SyncStep2(u)) = &msg {
+            let (cur, max) = limits.doc_bytes;
+            if max > 0 && cur + u.len() as u64 > max {
+                tracing::warn!("document would exceed {} MB; update of {} bytes refused", max / 1_048_576, u.len());
+                continue;
+            }
+        }
+        if let Message::Sync(SyncMessage::SyncStep1(_)) = &msg {
+            // A full-state request makes us encode the whole document; a few per connection
+            // are normal (connect, resync), a stream of them is not.
+            if !limits.step1.allow() {
+                tracing::warn!("too many full-state requests on one connection; ignored");
+                continue;
+            }
         }
         if let Message::Awareness(update) = &msg {
             // One connection speaks for a handful of clients at most; a message carrying

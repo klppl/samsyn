@@ -37,6 +37,12 @@ pub struct LiveDoc {
     pub changes: Arc<Mutex<Vec<Change>>>,
     /// Serializes quota check + blob write for guests.
     pub quota_lock: Mutex<()>,
+    /// Approximate encoded size: full state at load/compaction plus every update since.
+    /// Shared with the update observer, hence the Arc.
+    pub approx_bytes: Arc<std::sync::atomic::AtomicU64>,
+    /// Sockets and links currently attached.
+    pub conns: std::sync::atomic::AtomicUsize,
+    pub last_active: Arc<Mutex<std::time::Instant>>,
 }
 
 impl LiveDoc {
@@ -49,14 +55,22 @@ impl LiveDoc {
         }
 
         let (tx, _rx) = broadcast::channel(BROADCAST_CAPACITY);
+        let approx_bytes = Arc::new(std::sync::atomic::AtomicU64::new(
+            doc.transact().encode_state_as_update_v1(&StateVector::default()).len() as u64,
+        ));
+        let last_active = Arc::new(Mutex::new(std::time::Instant::now()));
         {
             let store = store.clone();
             let tx = tx.clone();
             let label = label.clone();
+            let approx = approx_bytes.clone();
+            let active = last_active.clone();
             doc.observe_update_v1("replica", move |_txn, event| {
                 if let Err(e) = store.append_update(&event.update) {
                     tracing::error!(doc = %label, "failed to persist update: {e}");
                 }
+                approx.fetch_add(event.update.len() as u64, std::sync::atomic::Ordering::Relaxed);
+                *active.lock() = std::time::Instant::now();
                 let _ = tx.send(encode_message(&Message::Sync(SyncMessage::Update(event.update.clone()))));
             })?;
         }
@@ -147,7 +161,19 @@ impl LiveDoc {
         }
 
         tracing::info!(doc = %label, "loaded ({n} stored updates)");
-        Ok(Arc::new(LiveDoc { id, label, kind, store, awareness: Mutex::new(awareness), tx, changes, quota_lock: Mutex::new(()) }))
+        Ok(Arc::new(LiveDoc {
+            id,
+            label,
+            kind,
+            store,
+            awareness: Mutex::new(awareness),
+            tx,
+            changes,
+            quota_lock: Mutex::new(()),
+            approx_bytes,
+            conns: std::sync::atomic::AtomicUsize::new(0),
+            last_active,
+        }))
     }
 
     pub fn full_state(&self) -> Vec<u8> {
@@ -162,6 +188,7 @@ impl LiveDoc {
         let full = aw.doc().transact().encode_state_as_update_v1(&StateVector::default());
         drop(aw);
         self.store.compact(&full)?;
+        self.approx_bytes.store(full.len() as u64, std::sync::atomic::Ordering::Relaxed);
         let pruned = self.store.prune_snapshots(keep)?;
         tracing::info!(doc = %self.label, "snapshot {} written, {pruned} pruned", path.display());
         Ok(())
@@ -215,6 +242,8 @@ pub struct DocRegistry {
     /// Largest blob we accept over a p2p link (same limit as the HTTP blob route).
     pub max_blob_bytes: usize,
     pub max_vaults_per_user: usize,
+    /// Documents past this many encoded bytes refuse further updates (0 = unlimited).
+    pub max_doc_bytes: u64,
     /// Awareness changes of every loaded document, consumed by the presence mirror task.
     presence_tx: PresenceSender,
     presence_rx: Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<PresenceEvent>>>,
@@ -224,7 +253,7 @@ pub struct DocRegistry {
 }
 
 impl DocRegistry {
-    pub fn new(storage: Storage, node_id: String, endpoint: Option<iroh::Endpoint>, max_blob_bytes: usize, max_vaults_per_user: usize) -> Self {
+    pub fn new(storage: Storage, node_id: String, endpoint: Option<iroh::Endpoint>, max_blob_bytes: usize, max_vaults_per_user: usize, max_doc_bytes: u64) -> Self {
         let (presence_tx, presence_rx) = tokio::sync::mpsc::unbounded_channel();
         Self {
             presence_tx,
@@ -239,6 +268,7 @@ impl DocRegistry {
             endpoint,
             max_blob_bytes,
             max_vaults_per_user,
+            max_doc_bytes,
             links: Mutex::new(HashMap::new()),
             link_status: Mutex::new(HashMap::new()),
         }
@@ -616,10 +646,35 @@ impl DocRegistry {
     pub fn maybe_compact(&self, doc: &LiveDoc) {
         if doc.store.needs_compaction() {
             let full = doc.full_state();
+            doc.approx_bytes.store(full.len() as u64, std::sync::atomic::Ordering::Relaxed);
             match doc.store.compact(&full) {
                 Ok(()) => tracing::info!(doc = %doc.label, "compacted update log"),
                 Err(e) => tracing::error!(doc = %doc.label, "compaction failed: {e}"),
             }
+        }
+    }
+
+    /// Drop vaults from memory that have had no connection or activity for `idle` and take
+    /// part in no bridge. They come back from disk on the next connection.
+    pub fn unload_idle(&self, idle: std::time::Duration, keep_snapshots: usize) {
+        let candidates: Vec<Arc<LiveDoc>> = self
+            .vaults
+            .lock()
+            .values()
+            .filter(|d| d.conns.load(std::sync::atomic::Ordering::Relaxed) == 0 && d.last_active.lock().elapsed() > idle)
+            .cloned()
+            .collect();
+        for d in candidates {
+            let _g = self.apply_lock.lock();
+            if d.conns.load(std::sync::atomic::Ordering::Relaxed) != 0 || !self.bridges_for(&d.id).is_empty() {
+                continue;
+            }
+            if let Err(e) = d.snapshot(keep_snapshots) {
+                tracing::warn!(doc = %d.label, "snapshot before unload failed: {e}; keeping it loaded");
+                continue;
+            }
+            self.vaults.lock().remove(&d.id);
+            tracing::info!(doc = %d.label, "unloaded after {} min idle", idle.as_secs() / 60);
         }
     }
 

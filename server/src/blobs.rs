@@ -44,6 +44,21 @@ pub async fn put_blob(
             return StatusCode::INTERNAL_SERVER_ERROR.into_response();
         }
     };
+    let quota = state.serve.max_user_mb * 1024 * 1024;
+    if quota > 0 && !store.has_blob(&actual) {
+        let used = match state.limits.usage.get(&user.id, || state.storage.user_bytes(&user.id)) {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::error!("usage lookup failed: {e}");
+                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+            }
+        };
+        if used + body.len() as u64 > quota {
+            tracing::warn!(user = %user.name, "upload refused: storage quota of {} MB reached", state.serve.max_user_mb);
+            return (StatusCode::PAYLOAD_TOO_LARGE, format!("storage quota ({} MB) is full", state.serve.max_user_mb)).into_response();
+        }
+        state.limits.usage.add(&user.id, body.len() as u64);
+    }
     match store.put_blob(&actual, &body) {
         Ok(()) => StatusCode::CREATED.into_response(),
         Err(e) => {

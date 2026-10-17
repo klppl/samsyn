@@ -77,6 +77,40 @@ pub struct TokenInfo {
 #[derive(Clone)]
 pub struct Registry {
     conn: Arc<Mutex<Connection>>,
+    /// Key for mount secrets at rest (derived from identity.key); None until the storage layer
+    /// provides it, in which case secrets are handled as stored.
+    secret_key: Arc<Mutex<Option<[u8; 32]>>>,
+}
+
+const ENC_PREFIX: &str = "enc1:";
+
+fn seal(key: &[u8; 32], plain: &str) -> String {
+    use chacha20poly1305::aead::{Aead, KeyInit};
+    use chacha20poly1305::{XChaCha20Poly1305, XNonce};
+    let cipher = XChaCha20Poly1305::new(key.into());
+    let mut nonce_bytes = [0u8; 24];
+    rand::Rng::fill_bytes(&mut rand::rng(), &mut nonce_bytes);
+    let nonce = XNonce::from_slice(&nonce_bytes);
+    let ct = cipher.encrypt(nonce, plain.as_bytes()).expect("xchacha20poly1305 encrypt cannot fail");
+    use base64::Engine as _;
+    format!("{ENC_PREFIX}{}{}", base64::engine::general_purpose::STANDARD.encode(nonce_bytes), base64::engine::general_purpose::STANDARD.encode(ct))
+}
+
+fn open_sealed(key: &[u8; 32], stored: &str) -> Option<String> {
+    use base64::Engine as _;
+    use chacha20poly1305::aead::{Aead, KeyInit};
+    use chacha20poly1305::{XChaCha20Poly1305, XNonce};
+    let body = stored.strip_prefix(ENC_PREFIX)?;
+    // nonce is 24 bytes → 32 base64 chars.
+    if body.len() < 32 {
+        return None;
+    }
+    let (n, c) = body.split_at(32);
+    let nonce_bytes = base64::engine::general_purpose::STANDARD.decode(n).ok()?;
+    let ct = base64::engine::general_purpose::STANDARD.decode(c).ok()?;
+    let cipher = XChaCha20Poly1305::new(key.into());
+    let pt = cipher.decrypt(XNonce::from_slice(&nonce_bytes), ct.as_ref()).ok()?;
+    String::from_utf8(pt).ok()
 }
 
 impl Registry {
@@ -143,7 +177,50 @@ impl Registry {
             "#,
         )?;
         migrate(&conn)?;
-        Ok(Self { conn: Arc::new(Mutex::new(conn)) })
+        Ok(Self { conn: Arc::new(Mutex::new(conn)), secret_key: Arc::new(Mutex::new(None)) })
+    }
+
+    /// Provide the at-rest key. Any mount secret still stored in plaintext is sealed now.
+    pub fn set_secret_key(&self, key: [u8; 32]) -> anyhow::Result<()> {
+        *self.secret_key.lock() = Some(key);
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare("SELECT id, secret FROM mounts")?;
+        let rows: Vec<(String, String)> = stmt
+            .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
+            .filter_map(|r| r.ok())
+            .collect();
+        drop(stmt);
+        let mut sealed = 0;
+        for (id, secret) in rows {
+            if !secret.starts_with(ENC_PREFIX) {
+                conn.execute("UPDATE mounts SET secret = ?1 WHERE id = ?2", params![seal(&key, &secret), id])?;
+                sealed += 1;
+            }
+        }
+        if sealed > 0 {
+            tracing::info!("registry: sealed {sealed} mount secret(s) at rest");
+        }
+        Ok(())
+    }
+
+    fn protect_secret(&self, secret: &str) -> String {
+        match *self.secret_key.lock() {
+            Some(k) => seal(&k, secret),
+            None => secret.to_string(),
+        }
+    }
+
+    fn reveal_secret(&self, stored: &str) -> String {
+        if !stored.starts_with(ENC_PREFIX) {
+            return stored.to_string();
+        }
+        match *self.secret_key.lock() {
+            Some(k) => open_sealed(&k, stored).unwrap_or_else(|| {
+                tracing::error!("a mount secret could not be decrypted (identity.key changed?)");
+                String::new()
+            }),
+            None => String::new(),
+        }
     }
 
     fn now() -> String {
@@ -474,7 +551,7 @@ impl Registry {
         let ids: Vec<String> = stmt
             .query_map(params![share_id], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
             .filter_map(|r| r.ok())
-            .filter(|(_, s)| token_hash(s) == secret_hash)
+            .filter(|(_, s)| token_hash(&self.reveal_secret(s)) == secret_hash)
             .map(|(id, _)| id)
             .collect();
         for id in &ids {
@@ -536,7 +613,7 @@ impl Registry {
         let conn = self.conn.lock();
         conn.execute(
             "INSERT INTO mounts (id, user_id, vault_id, share_id, share_name, mount_prefix, access, home_node, home_addrs, only_file, secret, created_at)              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
-            params![m.id, m.user_id, m.vault_id, m.share_id, m.share_name, m.mount_prefix, m.access, m.home_node, m.home_addrs.join(" "), m.only_file, m.secret, m.created_at],
+            params![m.id, m.user_id, m.vault_id, m.share_id, m.share_name, m.mount_prefix, m.access, m.home_node, m.home_addrs.join(" "), m.only_file, self.protect_secret(&m.secret), m.created_at],
         )?;
         Ok(m)
     }
@@ -551,7 +628,10 @@ impl Registry {
         let conn = self.conn.lock();
         let mut stmt = conn.prepare(&format!("{MOUNT_COLS} ORDER BY created_at"))?;
         let rows = stmt.query_map([], row_to_mount)?;
-        Ok(rows.collect::<Result<_, _>>()?)
+        let v: Vec<MountInfo> = rows.collect::<Result<_, _>>()?;
+        drop(stmt);
+        drop(conn);
+        Ok(v.into_iter().map(|m| self.revealed(m)).collect())
     }
 
     pub fn all_shares(&self) -> anyhow::Result<Vec<ShareInfo>> {
@@ -563,21 +643,34 @@ impl Registry {
 
     pub fn mount_by_id(&self, id: &str) -> anyhow::Result<Option<MountInfo>> {
         let conn = self.conn.lock();
-        Ok(conn.query_row(&format!("{MOUNT_COLS} WHERE id = ?1"), params![id], row_to_mount).optional()?)
+        let m = conn.query_row(&format!("{MOUNT_COLS} WHERE id = ?1"), params![id], row_to_mount).optional()?;
+        drop(conn);
+        Ok(m.map(|m| self.revealed(m)))
+    }
+
+    fn revealed(&self, mut m: MountInfo) -> MountInfo {
+        m.secret = self.reveal_secret(&m.secret);
+        m
     }
 
     pub fn mounts_for_vault(&self, vault_id: &str) -> anyhow::Result<Vec<MountInfo>> {
         let conn = self.conn.lock();
         let mut stmt = conn.prepare(&format!("{MOUNT_COLS} WHERE vault_id = ?1 ORDER BY mount_prefix"))?;
         let rows = stmt.query_map(params![vault_id], row_to_mount)?;
-        Ok(rows.collect::<Result<_, _>>()?)
+        let v: Vec<MountInfo> = rows.collect::<Result<_, _>>()?;
+        drop(stmt);
+        drop(conn);
+        Ok(v.into_iter().map(|m| self.revealed(m)).collect())
     }
 
     pub fn mounts_for_share(&self, share_id: &str) -> anyhow::Result<Vec<MountInfo>> {
         let conn = self.conn.lock();
         let mut stmt = conn.prepare(&format!("{MOUNT_COLS} WHERE share_id = ?1"))?;
         let rows = stmt.query_map(params![share_id], row_to_mount)?;
-        Ok(rows.collect::<Result<_, _>>()?)
+        let v: Vec<MountInfo> = rows.collect::<Result<_, _>>()?;
+        drop(stmt);
+        drop(conn);
+        Ok(v.into_iter().map(|m| self.revealed(m)).collect())
     }
 
     pub fn update_mount_prefix(&self, id: &str, prefix: &str) -> anyhow::Result<bool> {
@@ -596,7 +689,7 @@ impl Registry {
         let ids: Vec<String> = stmt
             .query_map(params![share_id], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
             .filter_map(|r| r.ok())
-            .filter(|(_, s)| token_hash(s) == secret_hash)
+            .filter(|(_, s)| token_hash(&self.reveal_secret(s)) == secret_hash)
             .map(|(id, _)| id)
             .collect();
         for id in &ids {

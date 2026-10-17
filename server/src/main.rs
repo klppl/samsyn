@@ -12,6 +12,7 @@ mod client;
 mod config;
 mod guest;
 mod ids;
+mod limits;
 mod presence;
 mod remote;
 mod sharing;
@@ -43,7 +44,7 @@ pub struct AppState {
     pub serve: ServeArgs,
     pub storage: Storage,
     pub docs: Arc<DocRegistry>,
-    pub guest_limiter: parking_lot::Mutex<guest::GuestLimiter>,
+    pub limits: Arc<limits::Limits>,
     pub guest_sessions: parking_lot::Mutex<guest::GuestSessions>,
 }
 
@@ -89,11 +90,25 @@ async fn serve(args: ServeArgs, storage: Storage) -> anyhow::Result<()> {
         let u = storage.registry().create_user("owner")?;
         let token = storage.registry().create_token(&u.id, "initial")?;
         tracing::info!("first start: created user 'owner'");
-        tracing::info!("========================================================");
-        tracing::info!("  token: {token}");
-        tracing::info!("  paste the server URL and this token into the plugin");
-        tracing::info!("  add more users with: replica-server user add <name>");
-        tracing::info!("========================================================");
+        match &args.initial_token_file {
+            Some(path) => {
+                std::fs::write(path, format!("{token}\n")).with_context(|| format!("writing {}", path.display()))?;
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+                }
+                tracing::info!("  owner token written to {} (mode 0600); it is not in this log", path.display());
+            }
+            None => {
+                tracing::info!("========================================================");
+                tracing::info!("  token: {token}");
+                tracing::info!("  paste the server URL and this token into the plugin");
+                tracing::info!("  add more users with: replica-server user add <name>");
+                tracing::info!("  (this is the only copy; --initial-token-file keeps it out of logs)");
+                tracing::info!("========================================================");
+            }
+        }
     }
 
     let identity = storage.identity()?;
@@ -131,13 +146,14 @@ async fn serve(args: ServeArgs, storage: Storage) -> anyhow::Result<()> {
     };
 
     let max_blob = args.max_blob_mb * 1024 * 1024;
-    let docs = Arc::new(DocRegistry::new(storage.clone(), node_id, endpoint.clone(), max_blob, args.max_vaults_per_user));
+    let limits = Arc::new(limits::Limits::default());
+    let docs = Arc::new(DocRegistry::new(storage.clone(), node_id, endpoint.clone(), max_blob, args.max_vaults_per_user, args.max_doc_mb * 1024 * 1024));
     let router = endpoint.map(|ep| {
         iroh::protocol::Router::builder(ep)
-            .accept(remote::ALPN, remote::ShareProtocol::new(docs.clone()))
+            .accept(remote::ALPN, remote::ShareProtocol::new(docs.clone(), limits.clone(), args.max_conns_per_peer))
             .spawn()
     });
-    let state: SharedState = Arc::new(AppState { docs, storage, serve: args, guest_limiter: Default::default(), guest_sessions: Default::default() });
+    let state: SharedState = Arc::new(AppState { docs, storage, serve: args, limits, guest_sessions: Default::default() });
     match &state.serve.public_url {
         Some(u) => tracing::info!("guest mode on: tickets carry public URL {u}"),
         None => tracing::info!("guest mode off (set --public-url to let people without a server join shares)"),
@@ -179,12 +195,23 @@ async fn serve(args: ServeArgs, storage: Storage) -> anyhow::Result<()> {
             "/guest/blobs/{id}/{hash}",
             put(guest::put_blob).get(guest::get_blob).layer(DefaultBodyLimit::max(max_blob)),
         )
-        .layer(CorsLayer::new().allow_origin(Any).allow_methods(Any).allow_headers(Any))
+        .layer(cors_layer(&state.serve))
         // Span without the query string: guest routes carry the ticket secret there.
         .layer(TraceLayer::new_for_http().make_span_with(|req: &axum::http::Request<_>| {
             tracing::info_span!("request", method = %req.method(), path = %req.uri().path())
         }))
         .with_state(state.clone());
+
+    if state.serve.idle_unload_minutes > 0 {
+        let st = state.clone();
+        tokio::spawn(async move {
+            let idle = Duration::from_secs(st.serve.idle_unload_minutes * 60);
+            loop {
+                tokio::time::sleep(Duration::from_secs(60)).await;
+                st.docs.unload_idle(idle, st.serve.snapshot_keep);
+            }
+        });
+    }
 
     if state.serve.snapshot_hours > 0 {
         let st = state.clone();
@@ -237,13 +264,52 @@ async fn serve(args: ServeArgs, storage: Storage) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// CORS: Obsidian's own origins plus whatever the operator adds. The plugin itself uses
+/// Obsidian's native request API and WebSockets, neither of which is subject to CORS, so this
+/// only matters for browsers; `--cors-any` restores the permissive behaviour.
+fn cors_layer(args: &ServeArgs) -> CorsLayer {
+    use axum::http::HeaderValue;
+    use tower_http::cors::AllowOrigin;
+    let base = CorsLayer::new().allow_methods(Any).allow_headers(Any);
+    if args.cors_any {
+        return base.allow_origin(Any);
+    }
+    let mut origins: Vec<HeaderValue> = ["app://obsidian.md", "capacitor://localhost", "http://localhost", "ionic://localhost"]
+        .iter()
+        .map(|o| HeaderValue::from_static(o))
+        .collect();
+    for o in &args.cors_origin {
+        match HeaderValue::from_str(o.trim()) {
+            Ok(v) if !o.trim().is_empty() => origins.push(v),
+            _ => tracing::warn!("ignoring invalid --cors-origin {o:?}"),
+        }
+    }
+    base.allow_origin(AllowOrigin::list(origins))
+}
+
 /// Reject requests without a valid user token before the handler (and its body extractors) run.
+/// Failures are budgeted per client address so probing is cheap for us and loud in the log
+/// only the first few times.
 async fn require_user(
     State(state): State<SharedState>,
+    axum::extract::ConnectInfo(peer): axum::extract::ConnectInfo<std::net::SocketAddr>,
     req: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> axum::response::Response {
     use axum::response::IntoResponse;
+    let ip = if state.serve.trust_proxy {
+        req.headers()
+            .get("x-forwarded-for")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.split(',').next_back())
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(peer.ip())
+    } else {
+        peer.ip()
+    };
+    if state.limits.auth_fails.lock().blocked(&ip) {
+        return (StatusCode::TOO_MANY_REQUESTS, "too many failed attempts; try again later").into_response();
+    }
     let query_token = req
         .uri()
         .query()
@@ -254,6 +320,7 @@ async fn require_user(
     if ok {
         next.run(req).await
     } else {
+        state.limits.auth_fails.lock().record_failure(ip);
         (StatusCode::UNAUTHORIZED, "bad token").into_response()
     }
 }

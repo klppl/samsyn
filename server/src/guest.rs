@@ -26,8 +26,6 @@ use crate::storage::ShareInfo;
 use crate::vault::LiveDoc;
 use crate::SharedState;
 
-const MAX_FAILURES: u32 = 10;
-const FAILURE_WINDOW: Duration = Duration::from_secs(600);
 /// Guest sessions live this long; the client exchanges the secret again afterwards.
 const SESSION_TTL: Duration = Duration::from_secs(7 * 24 * 3600);
 
@@ -79,41 +77,6 @@ impl GuestSessions {
     }
 }
 
-/// Failed guest authentications per client IP: (count, window start).
-#[derive(Default)]
-pub struct GuestLimiter {
-    fails: HashMap<IpAddr, (u32, Instant)>,
-}
-
-impl GuestLimiter {
-    fn blocked(&mut self, ip: IpAddr) -> bool {
-        match self.fails.get(&ip) {
-            Some((n, since)) if since.elapsed() < FAILURE_WINDOW => *n >= MAX_FAILURES,
-            Some(_) => {
-                self.fails.remove(&ip);
-                false
-            }
-            None => false,
-        }
-    }
-    fn record_failure(&mut self, ip: IpAddr) {
-        if self.fails.len() > 10_000 {
-            self.fails.retain(|_, (_, since)| since.elapsed() < FAILURE_WINDOW);
-            if self.fails.len() > 10_000 {
-                self.fails.clear(); // flooded from many addresses: start over rather than grow
-            }
-        }
-        let e = self.fails.entry(ip).or_insert((0, Instant::now()));
-        if e.1.elapsed() >= FAILURE_WINDOW {
-            *e = (0, Instant::now());
-        }
-        e.0 += 1;
-    }
-}
-
-/// The client's address for rate limiting. `X-Forwarded-For` is only believed when the
-/// operator says there is a proxy (`--trust-proxy`); otherwise anyone could spoof it and dodge
-/// the limiter. With a proxy the *last* entry is the one our proxy appended.
 fn client_ip(state: &SharedState, headers: &HeaderMap, peer: SocketAddr) -> IpAddr {
     if !state.serve.trust_proxy {
         return peer.ip();
@@ -140,7 +103,7 @@ pub struct Guest {
 /// Validate `(share_id, secret)`; the secret comes as `?secret=` or `Authorization: Bearer`.
 fn authenticate(state: &SharedState, share_id: &str, headers: &HeaderMap, query: &HashMap<String, String>, peer: SocketAddr) -> Result<Guest, Response> {
     let ip = client_ip(state, headers, peer);
-    if state.guest_limiter.lock().blocked(ip) {
+    if state.limits.guest_fails.lock().blocked(&ip) {
         return Err((StatusCode::TOO_MANY_REQUESTS, "too many failed attempts; try again later").into_response());
     }
     let presented = extract_token(headers, query.get("secret").or_else(|| query.get("session")).map(String::as_str)).unwrap_or_default();
@@ -165,7 +128,7 @@ fn authenticate(state: &SharedState, share_id: &str, headers: &HeaderMap, query:
             Ok(g)
         }
         None => {
-            state.guest_limiter.lock().record_failure(ip);
+            state.limits.guest_fails.lock().record_failure(ip);
             tracing::warn!(share = %share_id, %ip, "guest auth failed");
             Err(denied())
         }
@@ -251,11 +214,14 @@ pub async fn ws(
     };
     tracing::info!(share = %g.share.name, label = %g.label, access = %g.access, "guest connected");
     let writable = g.access == "rw";
+    let Some(slot) = state.limits.conns.acquire(&format!("g:{}", crate::ids::token_hash(&g.secret)), state.serve.max_conns_per_ticket) else {
+        return (StatusCode::TOO_MANY_REQUESTS, "too many connections for this ticket").into_response();
+    };
     let check = Some(crate::ws::SessionCheck::Guest(g.share.id.clone(), g.secret.clone()));
     let cap = if writable { crate::ws::MAX_WS_MESSAGE } else { crate::ws::MAX_WS_MESSAGE_READONLY };
     ws.max_message_size(cap)
         .max_frame_size(cap)
-        .on_upgrade(move |socket| crate::ws::handle_socket(socket, state, doc, writable, check))
+        .on_upgrade(move |socket| crate::ws::handle_socket(socket, state, doc, writable, check, slot))
 }
 
 // ------------------------------------------------------------------ blobs

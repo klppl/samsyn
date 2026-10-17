@@ -65,7 +65,19 @@ impl Storage {
             );
         }
         let registry = Registry::open(&root.join("registry.db"))?;
-        Ok(Self { root: root.to_path_buf(), registry })
+        let storage = Self { root: root.to_path_buf(), registry };
+        // Mount secrets must be presented again later (p2p re-handshake), so they cannot be
+        // hashed; they are sealed with a key derived from the server identity instead.
+        let identity = storage.identity()?;
+        let key: [u8; 32] = {
+            use sha2::{Digest, Sha256};
+            let mut h = Sha256::new();
+            h.update(b"replica/mount-secrets/v1");
+            h.update(identity.to_bytes());
+            h.finalize().into()
+        };
+        storage.registry.set_secret_key(key)?;
+        Ok(storage)
     }
 
     pub fn root(&self) -> &Path {
@@ -156,6 +168,23 @@ impl Storage {
         };
         let store = self.vault_store(&info)?;
         Ok((info, store))
+    }
+
+    /// Bytes a user occupies: blobs and document logs of every vault and share they own.
+    /// Walks the stores, so callers cache it (see `UsageCache`).
+    pub fn user_bytes(&self, user_id: &str) -> anyhow::Result<u64> {
+        let mut total = 0u64;
+        for v in self.registry.list_vaults(Some(user_id))? {
+            let store = self.vault_store(&v)?;
+            total += store.blob_bytes()?;
+            total += std::fs::metadata(store.dir().join("doc.db")).map(|m| m.len()).unwrap_or(0);
+        }
+        for s in self.registry.all_shares()?.into_iter().filter(|s| s.user_id == user_id) {
+            let store = self.share_store(&s)?;
+            total += store.blob_bytes()?;
+            total += std::fs::metadata(store.dir().join("doc.db")).map(|m| m.len()).unwrap_or(0);
+        }
+        Ok(total)
     }
 
     /// Store for an existing vault only; `None` when the user has no vault by that name.

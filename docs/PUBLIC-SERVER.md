@@ -33,6 +33,30 @@ Everything that user can do: read and write all their vaults, create shares, iss
 - Live sockets re-check their credential every 30 s: a revoked device token or ticket ends the connection within that time.
 - Behind a reverse proxy, start with `--trust-proxy` so the guest rate limiter sees the real client address (last `X-Forwarded-For` entry). Never set it when clients can reach the server directly.
 
+## Limits and their defaults
+
+Every limit is a flag (or `REPLICA_*` env var); the defaults are chosen so a server that nobody tuned is still safe and stable, and generous enough that normal use never hits them.
+
+| Flag | Default | Protects against |
+|---|---|---|
+| `--max-blob-mb` | 256 | one huge upload |
+| `--max-share-mb` | 2048 | guests filling a share's blob store |
+| `--max-user-mb` | 20480 | one user filling the disk (blobs + document logs; `/me` shows usage) |
+| `--max-doc-mb` | 256 | a collaborator growing a document without end (text only) |
+| `--max-vaults-per-user` | 50 | vault creation by name; reads never create |
+| `--max-conns-per-token` | 16 | one token parking many sockets |
+| `--max-conns-per-ticket` | 8 | one ticket parking many sockets |
+| `--max-conns-per-peer` | 4 | one peer server parking many p2p connections (64 in total) |
+| `--idle-unload-minutes` | 30 | memory growth from vaults nobody is using |
+| (fixed) | 10 / 10 min | failed ticket auth per address; 30 / 10 min failed token auth; 10 / 10 min failed p2p hellos per node |
+| (fixed) | 6 / min | full-state requests per socket |
+| (fixed) | 64 | awareness client ids per socket; read-only guests send at most 4 MB per message |
+| `--cors-origin`, `--cors-any` | Obsidian origins only | browsers calling the API from other sites (the plugin does not need CORS) |
+| `--initial-token-file` | unset | the owner token ending up in log storage |
+| `--trust-proxy` | off | believing `X-Forwarded-For` from anyone |
+
+Secrets at rest: user tokens and ticket secrets are stored hashed; mount secrets (which must be presented again) are sealed with XChaCha20-Poly1305 under a key derived from `identity.key`. Keep `identity.key` with the data dir: without it the mounts on this server cannot reconnect.
+
 ## Recommended setup
 
 1. **TLS is mandatory.** Phones refuse plain `ws://`, and tickets must not travel in clear text. Either a reverse proxy with automatic certificates, or `--tls-cert/--tls-key`.

@@ -119,6 +119,46 @@ pub struct ServeArgs {
     #[arg(long, env = "REPLICA_MAX_SHARE_MB", default_value_t = 2048)]
     pub max_share_mb: u64,
 
+    /// Largest document (vault or share) in megabytes of CRDT state; updates past it are
+    /// refused (0 = unlimited). Text only: attachments live in blobs.
+    #[arg(long, env = "REPLICA_MAX_DOC_MB", default_value_t = 256)]
+    pub max_doc_mb: u64,
+
+    /// Concurrent WebSocket connections per user token (0 = unlimited).
+    #[arg(long, env = "REPLICA_MAX_CONNS_PER_TOKEN", default_value_t = 16)]
+    pub max_conns_per_token: usize,
+
+    /// Concurrent guest connections per ticket (0 = unlimited).
+    #[arg(long, env = "REPLICA_MAX_CONNS_PER_TICKET", default_value_t = 8)]
+    pub max_conns_per_ticket: usize,
+
+    /// Concurrent p2p connections per peer server (0 = unlimited).
+    #[arg(long, env = "REPLICA_MAX_CONNS_PER_PEER", default_value_t = 4)]
+    pub max_conns_per_peer: usize,
+
+    /// Unload a vault from memory after this many minutes without connections or shares
+    /// (0 = never). It is reloaded from disk on the next connection.
+    #[arg(long, env = "REPLICA_IDLE_UNLOAD_MINUTES", default_value_t = 30)]
+    pub idle_unload_minutes: u64,
+
+    /// Extra allowed CORS origins (repeat or comma-separate). Obsidian's own origins are
+    /// always allowed; the plugin does not need CORS at all (it uses native requests).
+    #[arg(long, env = "REPLICA_CORS_ORIGIN", value_delimiter = ',')]
+    pub cors_origin: Vec<String>,
+
+    /// Allow any CORS origin (the old behaviour). Harmless with bearer tokens, but off by default.
+    #[arg(long, env = "REPLICA_CORS_ANY", default_value_t = false)]
+    pub cors_any: bool,
+
+    /// On first start, write the owner token to this file (mode 0600) instead of the log.
+    #[arg(long, env = "REPLICA_INITIAL_TOKEN_FILE")]
+    pub initial_token_file: Option<PathBuf>,
+
+    /// Storage per user in megabytes (blobs plus document logs over all their vaults and
+    /// shares; 0 = unlimited). Uploads past it are refused with 413.
+    #[arg(long, env = "REPLICA_MAX_USER_MB", default_value_t = 20480)]
+    pub max_user_mb: u64,
+
     /// Vaults one user may create (0 = unlimited). A vault is created on first use of a name.
     #[arg(long, env = "REPLICA_MAX_VAULTS_PER_USER", default_value_t = 50)]
     pub max_vaults_per_user: usize,

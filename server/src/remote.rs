@@ -161,6 +161,18 @@ async fn read_frame(r: &mut RecvStream, max: usize) -> anyhow::Result<Option<Vec
     Ok(Some(buf))
 }
 
+/// Decrements `doc.conns` when dropped, whichever way the sync loop ends.
+struct ConnDec(Arc<LiveDoc>);
+impl Drop for ConnDec {
+    fn drop(&mut self) {
+        self.0.conns.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        *self.0.last_active.lock() = std::time::Instant::now();
+    }
+}
+fn scopeguard_dec(doc: Arc<LiveDoc>) -> ConnDec {
+    ConnDec(doc)
+}
+
 fn start_message(doc: &LiveDoc) -> anyhow::Result<Vec<u8>> {
     let aw = doc.awareness.lock();
     let mut enc = EncoderV1::new();
@@ -191,6 +203,9 @@ async fn sync_loop(
     let mut rx = doc.tx.subscribe();
     write_frame(send, &start_message(doc)?).await?;
     let mut owned: HashSet<ClientID> = HashSet::new();
+    let mut step1 = crate::limits::RequestBudget::new(6, Duration::from_secs(60));
+    doc.conns.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let _conn_guard = scopeguard_dec(doc.clone());
     let mut tick = tokio::time::interval(Duration::from_secs(30));
     tick.tick().await;
 
@@ -207,7 +222,11 @@ async fn sync_loop(
                     let _apply = docs.apply_lock.lock();
                     let r = {
                         let mut aw = doc.awareness.lock();
-                        handle_payload(&protocol, &mut aw, &data, &mut owned, writable)
+                        let mut limits = crate::ws::PayloadLimits {
+                            doc_bytes: (doc.approx_bytes.load(std::sync::atomic::Ordering::Relaxed), docs.max_doc_bytes),
+                            step1: &mut step1,
+                        };
+                        handle_payload(&protocol, &mut aw, &data, &mut owned, writable, &mut limits)
                     };
                     for h in new_blob_hashes(doc) {
                         let _ = wants.send(h);
@@ -394,11 +413,13 @@ async fn fetch_one(conn: &Connection, hash: &str, max_blob: usize) -> anyhow::Re
 pub struct ShareProtocol {
     pub docs: Arc<DocRegistry>,
     pub conns: Arc<tokio::sync::Semaphore>,
+    pub limits: Arc<crate::limits::Limits>,
+    pub max_per_peer: usize,
 }
 
 impl ShareProtocol {
-    pub fn new(docs: Arc<DocRegistry>) -> Self {
-        Self { docs, conns: Arc::new(tokio::sync::Semaphore::new(MAX_INCOMING_CONNS)) }
+    pub fn new(docs: Arc<DocRegistry>, limits: Arc<crate::limits::Limits>, max_per_peer: usize) -> Self {
+        Self { docs, conns: Arc::new(tokio::sync::Semaphore::new(MAX_INCOMING_CONNS)), limits, max_per_peer }
     }
 }
 
@@ -419,8 +440,19 @@ impl std::fmt::Debug for ShareProtocol {
 impl ProtocolHandler for ShareProtocol {
     async fn accept(&self, conn: Connection) -> Result<(), AcceptError> {
         let peer = conn.remote_id().fmt_short().to_string();
+        let peer_full = conn.remote_id().to_string();
+        if self.limits.p2p_fails.lock().blocked(&peer_full) {
+            tracing::warn!(peer = %peer, "p2p connection refused: too many failed hellos");
+            conn.close(4u32.into(), b"blocked");
+            return Ok(());
+        }
         let Ok(_conn_permit) = self.conns.clone().try_acquire_owned() else {
             tracing::warn!(peer = %peer, "p2p connection refused: too many connections");
+            conn.close(3u32.into(), b"busy");
+            return Ok(());
+        };
+        let Some(_peer_slot) = self.limits.conns.acquire(&format!("p:{peer_full}"), self.max_per_peer) else {
+            tracing::warn!(peer = %peer, "p2p connection refused: too many connections from this peer");
             conn.close(3u32.into(), b"busy");
             return Ok(());
         };
@@ -443,9 +475,11 @@ impl ProtocolHandler for ShareProtocol {
             let session = session.clone();
             let conn2 = conn.clone();
             let peer2 = peer.clone();
+            let limits = self.limits.clone();
+            let peer_full2 = peer_full.clone();
             tokio::spawn(async move {
                 let _permit = permit;
-                if let Err(e) = owner_stream(docs, conn2, session, send, recv, &peer2).await {
+                if let Err(e) = owner_stream(docs, conn2, session, send, recv, &peer2, &limits, &peer_full2).await {
                     tracing::debug!(peer = %peer2, "p2p stream ended: {e}");
                 }
             });
@@ -454,6 +488,7 @@ impl ProtocolHandler for ShareProtocol {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn owner_stream(
     docs: Arc<DocRegistry>,
     conn: Connection,
@@ -461,6 +496,8 @@ async fn owner_stream(
     mut send: SendStream,
     mut recv: RecvStream,
     peer: &str,
+    limits: &Arc<crate::limits::Limits>,
+    peer_node: &str,
 ) -> anyhow::Result<()> {
     let mut kind = [0u8; 1];
     tokio::time::timeout(HELLO_TIMEOUT, recv.read_exact(&mut kind)).await.map_err(|_| anyhow::anyhow!("stream kind timeout"))?.map_err(ae)?;
@@ -493,6 +530,7 @@ async fn owner_stream(
             let (share, (label, access)) = match (share, grant) {
                 (Some(s), Some(g)) => (s, g),
                 _ => {
+                    limits.p2p_fails.lock().record_failure(peer_node.to_string());
                     tracing::warn!(peer = %peer, share = %hello.share_id, "p2p hello denied");
                     let reply = postcard::to_stdvec(&HelloReply::Denied("ticket is invalid or has been revoked".into()))?;
                     write_frame(&mut send, &reply).await?;
