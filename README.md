@@ -27,7 +27,7 @@ and Android, offline and back.
 | **Syncthing** | Conflicted copies | Near | Yes | Android only | No | Yes |
 | **[YAOS](https://community.obsidian.md/plugins/yaos)** | CRDT merge | Yes | Cloudflare Worker | Yes | No | $0 |
 | **[Ilow Sync](https://community.obsidian.md/plugins/ilow-sync)** | CRDT merge | Yes | Go + PostgreSQL | Yes | No | Yes |
-| **Samsyn** | **CRDT merge** | **Yes** | **One binary** | **iOS + Android** | **Any subfolder** | **$0** |
+| **Samsyn** | CRDT merge | Yes | One binary | iOS + Android | Any subfolder | $0 |
 
 Text merges with [Yjs](https://github.com/yjs/yjs) in the plugin and
 [yrs](https://github.com/y-crdt/y-crdt) on the server, so simultaneous edits to
