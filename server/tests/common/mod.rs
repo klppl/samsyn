@@ -33,6 +33,9 @@ impl Proc {
     pub fn log_contains(&self, s: &str) -> bool {
         self.log_text().contains(s)
     }
+    pub fn log_count(&self, s: &str) -> usize {
+        self.log_text().matches(s).count()
+    }
     pub fn kill(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();

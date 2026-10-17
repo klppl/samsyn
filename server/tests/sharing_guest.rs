@@ -112,6 +112,9 @@ fn guests_join_with_tickets_only() {
     sleep(3.0);
     assert!(!o.contains("Projects/X/a.md", "ro-edit"));
     eventually!(5, !g2.contains("a.md", "ro-edit"), "ro edit restored", g2.proc);
+    // The restore itself fires a watcher event; it must not be mistaken for another edit.
+    sleep(3.0);
+    assert_eq!(g2.proc.log_count("restoring the server's version"), 1, "ro restore looped on its own write");
     g2.write("mine.md", "mine\n");
     eventually!(8, g2.read("read-only copy/mine.md") == "mine\n" && !g2.exists("mine.md"), "ro guest's new file moved aside", g2.proc);
     assert!(!g2.proc.log_contains("conflict"), "ro restore made a conflict copy");

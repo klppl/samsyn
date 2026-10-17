@@ -801,7 +801,12 @@ impl Engine {
             }
             touched = true;
             if self.is_ro(&rel) {
-                ro_touched.push(rel);
+                // Our own restores, downloads and chmods come back as watcher events. Only a
+                // real divergence from the document is an edit to undo; restoring a file that
+                // already matches would fire another event and loop forever.
+                if !self.matches_doc(&rel, abs) {
+                    ro_touched.push(rel);
+                }
                 continue;
             }
             if abs.exists() {
