@@ -7,6 +7,7 @@ use std::sync::Arc;
 use yrs::{Any, GetString, Map, Origin, Out, ReadTxn, Text, TextPrelim, Transact, WriteTxn};
 
 use crate::client::diff::diff_text;
+use crate::ids::valid_key;
 use crate::vault::{LiveDoc, BRIDGE_ORIGIN_PREFIX};
 
 #[derive(Debug, Clone)]
@@ -57,6 +58,10 @@ fn bridge_origin(src: &str) -> Origin {
 
 impl Bridge {
     pub fn vault_to_share_key(&self, key: &str) -> Option<String> {
+        if !valid_key(key) {
+            tracing::warn!(share = %self.share_id, "refusing to bridge invalid key {key:?}");
+            return None;
+        }
         let rest = key.strip_prefix(self.vault_prefix.as_str())?;
         if rest.is_empty() {
             return None;
@@ -68,6 +73,10 @@ impl Bridge {
     }
 
     pub fn share_to_vault_key(&self, key: &str) -> Option<String> {
+        if !valid_key(key) {
+            tracing::warn!(share = %self.share_id, "refusing to bridge invalid key {key:?}");
+            return None;
+        }
         match &self.only_file {
             Some(f) if f != key => None,
             _ => Some(format!("{}{}", self.vault_prefix, key)),

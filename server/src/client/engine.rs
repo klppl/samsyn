@@ -182,7 +182,10 @@ impl Engine {
         }
     }
 
+    /// Only ever called with keys that passed `should_sync` (which requires a safe relative
+    /// key), so the result stays under the sync directory.
     fn abs(&self, rel: &str) -> PathBuf {
+        debug_assert!(crate::ids::valid_key(rel) || rel == META_DIR.trim_end_matches('/'), "unsafe key {rel:?}");
         self.root.join(rel)
     }
 
@@ -193,6 +196,11 @@ impl Engine {
     }
 
     fn should_sync(&self, rel: &str) -> bool {
+        // Keys come from other people's documents: anything that could leave the directory
+        // (absolute, "..", empty segments, control characters) is ignored outright.
+        if !crate::ids::valid_key(rel) {
+            return false;
+        }
         if rel.split('/').any(|seg| seg.starts_with('.')) {
             return false;
         }

@@ -4,6 +4,7 @@ import { WebsocketProvider } from "y-websocket";
 import { BlobClient } from "./blobs";
 import { diffText } from "./diff";
 import { hashText, sha256Hex } from "./hash";
+import { isSafeKey } from "./keys";
 import { LocalState, Persistence, StorageInfo, deviceInstallId } from "./persistence";
 import { ReplicaSettings } from "./settings";
 
@@ -397,6 +398,9 @@ export class SyncEngine {
   }
 
   private shouldSync(key: string): boolean {
+    // Keys come from other people's documents (shares): never map anything that could leave
+    // the vault folder (absolute, "..", empty segments, control characters) to a file.
+    if (!isSafeKey(key)) return false;
     if (key.split("/").some((seg) => seg.startsWith("."))) return false;
     if (this.isText(key)) return true;
     return this.settings.syncBinary;

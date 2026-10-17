@@ -146,9 +146,9 @@ async fn serve(args: ServeArgs, storage: Storage) -> anyhow::Result<()> {
     state.docs.start_presence_mirror();
     state.docs.preload_bridged();
 
-    let app = Router::new()
-        .route("/", get(index))
-        .route("/health", get(health))
+    // Everything a user token protects sits behind `require_user`, so a bad or missing token is
+    // answered before any body is read or parsed (anonymous callers cannot make us parse JSON).
+    let user_api = Router::new()
         .route("/me", get(ws::whoami))
         .route("/ws/{vault}", get(ws::ws_handler))
         .route("/api/vaults/{vault}/sharing", get(sharing::get_sharing))
@@ -162,16 +162,22 @@ async fn serve(args: ServeArgs, storage: Storage) -> anyhow::Result<()> {
         .route("/api/tickets/inspect", post(sharing::inspect_ticket))
         .route("/api/me/tokens", get(account::list_tokens).post(account::create_token))
         .route("/api/me/tokens/{label}", delete(account::revoke_token))
+        .route(
+            "/blobs/{vault}/{hash}",
+            put(blobs::put_blob).get(blobs::get_blob).layer(DefaultBodyLimit::max(max_blob)),
+        )
+        .layer(axum::middleware::from_fn_with_state(state.clone(), require_user));
+
+    let app = Router::new()
+        .route("/", get(index))
+        .route("/health", get(health))
+        .merge(user_api)
         .route("/guest/session/{id}", post(guest::session))
         .route("/guest/shares/{id}", get(guest::info))
         .route("/guest/ws/{id}", get(guest::ws))
         .route(
             "/guest/blobs/{id}/{hash}",
             put(guest::put_blob).get(guest::get_blob).layer(DefaultBodyLimit::max(max_blob)),
-        )
-        .route(
-            "/blobs/{vault}/{hash}",
-            put(blobs::put_blob).get(blobs::get_blob).layer(DefaultBodyLimit::max(max_blob)),
         )
         .layer(CorsLayer::new().allow_origin(Any).allow_methods(Any).allow_headers(Any))
         // Span without the query string: guest routes carry the ticket secret there.
@@ -229,6 +235,27 @@ async fn serve(args: ServeArgs, storage: Storage) -> anyhow::Result<()> {
     tracing::info!("flushing snapshots before exit");
     state.docs.snapshot_all(state.serve.snapshot_keep);
     Ok(())
+}
+
+/// Reject requests without a valid user token before the handler (and its body extractors) run.
+async fn require_user(
+    State(state): State<SharedState>,
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    let query_token = req
+        .uri()
+        .query()
+        .and_then(|q| q.split('&').find_map(|kv| kv.strip_prefix("token=")))
+        .map(str::to_string);
+    let token = config::extract_token(req.headers(), query_token.as_deref());
+    let ok = token.map(|t| state.storage.registry().authenticate(&t).ok().flatten().is_some()).unwrap_or(false);
+    if ok {
+        next.run(req).await
+    } else {
+        (StatusCode::UNAUTHORIZED, "bad token").into_response()
+    }
 }
 
 async fn index() -> &'static str {

@@ -119,6 +119,11 @@ pub struct ServeArgs {
     #[arg(long, env = "REPLICA_MAX_SHARE_MB", default_value_t = 2048)]
     pub max_share_mb: u64,
 
+    /// Behind a reverse proxy: take the client address from the last X-Forwarded-For entry
+    /// (for guest rate limiting). Never set this when clients can reach the server directly.
+    #[arg(long, env = "REPLICA_TRUST_PROXY", default_value_t = false)]
+    pub trust_proxy: bool,
+
     /// Disable the peer-to-peer endpoint entirely (tickets then only work on this server).
     #[arg(long, env = "REPLICA_NO_P2P", default_value_t = false)]
     pub no_p2p: bool,

@@ -1,0 +1,442 @@
+//! Security regression tests. Each test pins one property an attacker would try to break;
+//! if a change makes one fail, it is a security regression, not a flaky test. Structure:
+//! anonymous → authenticated-but-wrong-user → ticket holder → malicious collaborator.
+//! The scenarios in sharing_*.rs cover functionality; this file covers what must *not* work.
+
+mod common;
+
+use common::*;
+use serde_json::json;
+use std::time::Duration;
+
+fn hex64(c: char) -> String {
+    std::iter::repeat(c).take(64).collect()
+}
+
+// ------------------------------------------------------------------ anonymous attacker
+
+#[test]
+fn every_authenticated_route_rejects_anonymous_and_bad_tokens() {
+    let dir = tmp("sec-anon");
+    let server = Server::start(&dir, "s", &[]);
+    let routes: &[(&str, &str, Option<serde_json::Value>)] = &[
+        ("GET", "/me", None),
+        ("GET", "/api/vaults/va/sharing", None),
+        ("POST", "/api/vaults/va/shares", Some(json!({"path": "x"}))),
+        ("POST", "/api/vaults/va/mounts", Some(json!({"ticket": "x"}))),
+        ("DELETE", "/api/shares/abc", None),
+        ("PATCH", "/api/shares/abc", Some(json!({"path": "x"}))),
+        ("POST", "/api/shares/abc/tickets", None),
+        ("DELETE", "/api/shares/abc/grants/x", None),
+        ("POST", "/api/shares/abc/grants/x/restore", None),
+        ("DELETE", "/api/mounts/abc", None),
+        ("PATCH", "/api/mounts/abc", Some(json!({"path": "x"}))),
+        ("POST", "/api/tickets/inspect", Some(json!({"ticket": "x"}))),
+        ("GET", "/api/me/tokens", None),
+        ("POST", "/api/me/tokens", None),
+        ("DELETE", "/api/me/tokens/x", None),
+        ("GET", &format!("/blobs/va/{}", hex64('a')), None),
+        ("PUT", &format!("/blobs/va/{}", hex64('a')), None),
+    ];
+    for (method, path, body) in routes {
+        for token in ["", "rp_00000000000000000000000000000000", "garbage"] {
+            let (code, _) = api_raw(&server, token, method, path, body.clone());
+            assert_eq!(code, 401, "{method} {path} with token {token:?} must be 401");
+        }
+    }
+    // The WebSocket upgrade is refused before the upgrade when the token is wrong.
+    let (code, _) = api_raw(&server, "", "GET", "/ws/va?token=rp_00000000000000000000000000000000", None);
+    assert_eq!(code, 401);
+    // Public routes stay public but reveal nothing sensitive.
+    let (code, body) = api_raw(&server, "", "GET", "/health", None);
+    assert_eq!(code, 200);
+    assert!(!body.contains("rp_"));
+    assert!(server.errors().is_empty(), "{:?}", server.errors());
+}
+
+#[test]
+fn tokens_and_secrets_never_appear_in_server_logs() {
+    let dir = tmp("sec-logs");
+    let server = Server::start(&dir, "s", &[]);
+    let owner = server.owner_token.clone();
+    // Use the token in every way a client would: header, query string, WebSocket query.
+    api_raw(&server, &owner, "GET", "/me", None);
+    api_raw(&server, "", "GET", &format!("/me?token={owner}"), None);
+    api_raw(&server, "", "GET", &format!("/ws/va?token={owner}"), None);
+    let c = Client::start(&server, &owner, "va", &dir.join("A"), "A");
+    c.write("a.md", "x\n");
+    eventually!(10, c.proc.log_contains("reconcile done"), "client up", c.proc);
+    let r = api_json(&server, &owner, "POST", "/api/vaults/va/shares", Some(json!({"path": "a.md", "name": "A"})));
+    let ticket = r["ticket"].as_str().unwrap().to_string();
+    let secret = ticket_secret(&ticket);
+    api_raw(&server, "", "GET", &format!("/guest/shares/{}?secret={secret}", r["share"]["id"].as_str().unwrap()), None);
+    sleep(0.5);
+    let log = server.proc.log_text();
+    // The first-start token is printed exactly once, deliberately; nothing else may leak it.
+    assert_eq!(log.matches(&owner).count(), 1, "owner token appears more than once in the log");
+    assert!(!log.contains(&secret), "ticket secret in the log");
+    assert!(!log.contains("token="), "query string logged");
+    assert!(!log.contains("secret="), "query string logged");
+}
+
+#[test]
+fn malformed_input_is_rejected_not_crashing() {
+    let dir = tmp("sec-malformed");
+    let server = Server::start(&dir, "s", &[]);
+    let owner = server.owner_token.clone();
+    for name in ["../x", ".hidden", "a/b", "", &"a".repeat(65), "a b", "x\u{0}"] {
+        let (code, _) = api_raw(&server, &owner, "GET", &format!("/api/vaults/{}/sharing", urlenc(name)), None);
+        assert!(code == 400 || code == 404, "vault name {name:?} -> {code}");
+    }
+    for hash in ["abc", &hex64('g'), &"a".repeat(63), "../../etc/passwd"] {
+        let (code, _) = api_raw(&server, &owner, "GET", &format!("/blobs/va/{}", urlenc(hash)), None);
+        assert!(code == 400 || code == 404, "hash {hash:?} -> {code}");
+    }
+    // Hash mismatch on upload.
+    let (code, _) = api_raw_bytes(&server, &owner, "PUT", &format!("/blobs/va/{}", hex64('a')), b"not matching");
+    assert_eq!(code, 400);
+    // Share paths that could escape a vault folder on a client.
+    let c = Client::start(&server, &owner, "va", &dir.join("A"), "A");
+    c.write("Notes/a.md", "x\n");
+    eventually!(10, c.proc.log_contains("reconcile done"), "client up", c.proc);
+    // (A leading slash is merely normalised away; it cannot escape anything.)
+    for path in ["../Notes", "Notes/../..", "Notes//a.md", "Notes\u{0}"] {
+        let (code, body) = api_raw(&server, &owner, "POST", "/api/vaults/va/shares", Some(json!({"path": path})));
+        assert!(code == 400 || code == 404, "share path {path:?} -> {code} {body}");
+    }
+    let r = api_json(&server, &owner, "POST", "/api/vaults/va/shares", Some(json!({"path": "Notes", "name": "N"})));
+    let ticket = r["ticket"].as_str().unwrap().to_string();
+    let bob = server.add_user("bob");
+    Client::start(&server, &bob, "vb", &dir.join("B"), "B");
+    sleep(2.0);
+    for mp in ["../x", ".obsidian/plugins/evil", "a/../../x", "a//b"] {
+        let (code, body) = api_raw(&server, &bob, "POST", "/api/vaults/vb/mounts", Some(json!({"ticket": ticket, "mount_path": mp})));
+        assert_eq!(code, 400, "mount path {mp:?} -> {code} {body}");
+    }
+    // Garbage tickets.
+    for t in ["", "replica", "replica!!!", &format!("replica{}", "a".repeat(5000)), "x"] {
+        let (code, _) = api_raw(&server, &bob, "POST", "/api/vaults/vb/mounts", Some(json!({"ticket": t})));
+        assert_eq!(code, 400, "ticket {t:?}");
+    }
+    // Oversized JSON body is refused by the framework, not by running out of memory.
+    let big = "x".repeat(3 * 1024 * 1024);
+    let (code, _) = api_raw(&server, &owner, "POST", "/api/vaults/va/shares", Some(json!({"path": big})));
+    assert!(code == 413 || code == 400, "3 MB json -> {code}");
+    assert!(server.errors().is_empty(), "{:?}", server.errors());
+}
+
+#[test]
+fn websocket_survives_garbage_and_enforces_size_limit() {
+    let dir = tmp("sec-ws");
+    let server = Server::start(&dir, "s", &[]);
+    let owner = server.owner_token.clone();
+    let url = format!("ws://127.0.0.1:{}/ws/va?token={owner}", server.port);
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        use futures::{SinkExt, StreamExt};
+        use tokio_tungstenite::tungstenite::Message;
+        let (mut ws, _) = tokio_tungstenite::connect_async(&url).await.expect("connect");
+        // Random bytes, truncated varints, a huge declared length.
+        for payload in [vec![0xffu8; 10], vec![0x00, 0x00, 0xff, 0xff, 0xff, 0xff, 0x0f], vec![1, 2, 3], vec![]] {
+            ws.send(Message::Binary(payload.into())).await.expect("send");
+        }
+        // Still alive: the server answers a proper sync step 1.
+        let hello = {
+            use yrs::sync::{Message as M, SyncMessage};
+            use yrs::updates::encoder::Encode;
+            use yrs::{ReadTxn, Transact};
+            let doc = yrs::Doc::new();
+            let sv = doc.transact().state_vector();
+            M::Sync(SyncMessage::SyncStep1(sv)).encode_v1()
+        };
+        ws.send(Message::Binary(hello.into())).await.expect("send");
+        let got = tokio::time::timeout(Duration::from_secs(5), async {
+            while let Some(Ok(m)) = ws.next().await {
+                if let Message::Binary(_) = m {
+                    return true;
+                }
+            }
+            false
+        })
+        .await
+        .unwrap_or(false);
+        assert!(got, "server stopped answering after garbage");
+        // A frame above the limit closes the connection instead of being buffered.
+        let (mut ws2, _) = tokio_tungstenite::connect_async(&url).await.expect("connect");
+        let huge = vec![0u8; 300 * 1024 * 1024];
+        let _ = ws2.send(Message::Binary(huge.into())).await;
+        let closed = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                match ws2.next().await {
+                    None | Some(Err(_)) | Some(Ok(Message::Close(_))) => return true,
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .unwrap_or(false);
+        assert!(closed, "oversized message was accepted");
+    });
+    let (code, _) = api_raw(&server, "", "GET", "/health", None);
+    assert_eq!(code, 200, "server died");
+    assert!(server.errors().is_empty(), "{:?}", server.errors());
+}
+
+// ------------------------------------------------------------------ wrong user
+
+#[test]
+fn users_cannot_reach_each_others_vaults_shares_or_mounts() {
+    let dir = tmp("sec-scope");
+    let server = Server::start(&dir, "s", &[]);
+    let alice = server.owner_token.clone();
+    let bob = server.add_user("bob");
+    let a = Client::start(&server, &alice, "notes", &dir.join("A"), "A");
+    a.write("Projects/X/a.md", "alice's\n");
+    a.write_bytes("Projects/X/p.png", b"\x89PNG alice");
+    eventually!(10, a.proc.log_contains("reconcile done"), "alice up", a.proc);
+    let meta = api_json(&server, &alice, "GET", "/api/vaults/notes/sharing", None);
+    assert!(meta["shares"].as_array().unwrap().is_empty());
+
+    // Same vault name as bob resolves to bob's own (empty) vault, never alice's.
+    let (code, body) = api_raw(&server, &bob, "POST", "/api/vaults/notes/shares", Some(json!({"path": "Projects/X"})));
+    assert_eq!(code, 404, "bob shared alice's folder: {body}");
+    // Alice's blob by hash is not readable by bob even though the hash is known.
+    let hash = hex::encode(sha2::Sha256::digest(b"\x89PNG alice"));
+    let (code, _) = api_raw(&server, &alice, "GET", &format!("/blobs/notes/{hash}"), None);
+    assert_eq!(code, 200);
+    let (code, _) = api_raw(&server, &bob, "GET", &format!("/blobs/notes/{hash}"), None);
+    assert_eq!(code, 404, "bob read alice's blob");
+
+    // Alice's share and ticket; bob cannot manage them.
+    let r = api_json(&server, &alice, "POST", "/api/vaults/notes/shares", Some(json!({"path": "Projects/X", "name": "X"})));
+    let share_id = r["share"]["id"].as_str().unwrap().to_string();
+    for (method, path, body) in [
+        ("DELETE", format!("/api/shares/{share_id}"), None),
+        ("PATCH", format!("/api/shares/{share_id}"), Some(json!({"path": "Y"}))),
+        ("POST", format!("/api/shares/{share_id}/tickets"), None),
+        ("DELETE", format!("/api/shares/{share_id}/grants/ticket-1"), None),
+        ("POST", format!("/api/shares/{share_id}/grants/ticket-1/restore"), None),
+    ] {
+        let (code, _) = api_raw(&server, &bob, method, &path, body);
+        assert_eq!(code, 404, "bob could {method} {path}");
+    }
+    // Bob mounts with the ticket (legitimate), alice cannot touch bob's mount.
+    let bc = Client::start(&server, &bob, "notes", &dir.join("B"), "B");
+    eventually!(10, bc.proc.log_contains("reconcile done"), "bob up", bc.proc);
+    let m = api_json(&server, &bob, "POST", "/api/vaults/notes/mounts", Some(json!({"ticket": r["ticket"]})));
+    assert_eq!(m["access"], "rw", "{m}");
+    let mid = api_json(&server, &bob, "GET", "/api/vaults/notes/sharing", None)["mounts"][0]["id"].as_str().unwrap().to_string();
+    for (method, body) in [("DELETE", None), ("PATCH", Some(json!({"path": "Z"})))] {
+        let (code, _) = api_raw(&server, &alice, method, &format!("/api/mounts/{mid}"), body);
+        assert_eq!(code, 404, "alice could {method} bob's mount");
+    }
+    // A ticket mounted into a vault only exposes the shared subtree, never alice's other files.
+    a.write("private.md", "secret\n");
+    eventually!(10, bc.exists("Shared/X/a.md"), "bob mounted", bc.proc);
+    sleep(2.0);
+    assert!(!bc.exists("private.md") && !bc.exists("Shared/X/private.md"));
+    // Tokens are per user: revoking a label only touches the caller's own tokens. Both users
+    // have a token labelled "initial"; bob revoking it kills bob's, not alice's.
+    let (code, _) = api_raw(&server, &bob, "DELETE", "/api/me/tokens/initial", None);
+    assert_eq!(code, 204);
+    let (code, _) = api_raw(&server, &alice, "GET", "/me", None);
+    assert_eq!(code, 200, "alice's token revoked by bob");
+    let (code, _) = api_raw(&server, &bob, "GET", "/me", None);
+    assert_eq!(code, 401, "bob's own token should be gone");
+    let (code, _) = api_raw(&server, &alice, "DELETE", "/api/me/tokens/does-not-exist", None);
+    assert_eq!(code, 404);
+    assert!(server.errors().is_empty(), "{:?}", server.errors());
+}
+
+// ------------------------------------------------------------------ ticket holder
+
+#[test]
+fn guest_routes_do_not_leak_and_rate_limit_without_trusting_forged_headers() {
+    let dir = tmp("sec-guest");
+    let port = free_port();
+    let url = format!("http://127.0.0.1:{port}");
+    let server = Server::start_at(dir.join("data"), dir.join("server.log"), port, &["--no-p2p", "--public-url", &url]);
+    let owner = server.owner_token.clone();
+    let c = Client::start(&server, &owner, "va", &dir.join("A"), "A");
+    c.write("S/a.md", "x\n");
+    eventually!(10, c.proc.log_contains("reconcile done"), "client up", c.proc);
+    let r = api_json(&server, &owner, "POST", "/api/vaults/va/shares", Some(json!({"path": "S", "name": "S"})));
+    let share_id = r["share"]["id"].as_str().unwrap().to_string();
+    let ro = api_json(&server, &owner, "POST", &format!("/api/shares/{share_id}/tickets"), Some(json!({"label": "ro", "access": "ro"})));
+    let ro_secret = ticket_secret(ro["ticket"].as_str().unwrap());
+
+    // Wrong secret, unknown share, wrong length: identical answers.
+    let bad = hex64('b');
+    let mut bodies = std::collections::HashSet::new();
+    for path in [format!("/guest/shares/{share_id}?secret={bad}"), format!("/guest/shares/zzz?secret={bad}"), format!("/guest/shares/{share_id}?secret=short")] {
+        let (code, body) = api_raw(&server, "", "GET", &path, None);
+        assert_eq!(code, 403, "{path}");
+        bodies.insert(body);
+    }
+    assert_eq!(bodies.len(), 1, "guest failures are distinguishable: {bodies:?}");
+    // Forged X-Forwarded-For does not reset the limiter (server runs without --trust-proxy).
+    let client = reqwest::blocking::Client::new();
+    for i in 0..7 {
+        let _ = client.get(format!("{url}/guest/shares/{share_id}?secret={bad}")).header("x-forwarded-for", format!("10.0.0.{i}")).send();
+    }
+    let res = client.get(format!("{url}/guest/shares/{share_id}?secret={bad}")).header("x-forwarded-for", "10.9.9.9").send().unwrap();
+    assert_eq!(res.status().as_u16(), 429, "limiter bypassed with a forged X-Forwarded-For");
+    // The limiter also blocks a *valid* secret from the same address now (brute force stays blocked).
+    let (code, _) = api_raw(&server, "", "GET", &format!("/guest/shares/{share_id}?secret={ro_secret}"), None);
+    assert_eq!(code, 429);
+    assert!(!server.proc.log_contains(&bad) && !server.proc.log_contains(&ro_secret), "secret in log");
+    drop(server);
+
+    // Fresh server: read-only ticket cannot write, session is bound to its share.
+    let server = Server::start_at(dir.join("data"), dir.join("server2.log"), port, &["--no-p2p", "--public-url", &url]);
+    let blob = hex::encode(sha2::Sha256::digest(b"payload"));
+    let (code, _) = api_raw_bytes(&server, &ro_secret, "PUT", &format!("/guest/blobs/{share_id}/{blob}"), b"payload");
+    assert_eq!(code, 403, "read-only ticket uploaded a blob");
+    let (code, body) = api_raw(&server, &ro_secret, "POST", &format!("/guest/session/{share_id}"), None);
+    assert_eq!(code, 200, "{body}");
+    let session = serde_json::from_str::<serde_json::Value>(&body).unwrap()["session"].as_str().unwrap().to_string();
+    let (code, _) = api_raw(&server, &session, "GET", "/me", None);
+    assert_eq!(code, 401, "a guest session is not a user token");
+    let (code, _) = api_raw(&server, &session, "GET", "/api/vaults/va/sharing", None);
+    assert_eq!(code, 401);
+    // Revoking the ticket kills the session immediately.
+    let (code, _) = api_raw(&server, &owner, "DELETE", &format!("/api/shares/{share_id}/grants/ro"), None);
+    assert_eq!(code, 204);
+    let (code, _) = api_raw(&server, "", "GET", &format!("/guest/shares/{share_id}?session={session}"), None);
+    assert_eq!(code, 403, "revoked ticket's session still valid");
+    assert!(server.errors().is_empty(), "{:?}", server.errors());
+}
+
+// ------------------------------------------------------------------ malicious collaborator
+
+/// A collaborator controls the keys in a shared document. Keys that could escape the sync
+/// directory must never reach disk on the headless client, and the server must not even
+/// forward them across a share.
+#[test]
+fn hostile_document_keys_never_escape_the_sync_directory() {
+    let dir = tmp("sec-keys");
+    let server = Server::start(&dir, "s", &[]);
+    let owner = server.owner_token.clone();
+    let bob = server.add_user("bob");
+    // Owner shares a folder; bob mounts it and runs a headless client on his vault.
+    let a = Client::start(&server, &owner, "va", &dir.join("A"), "A");
+    a.write("Projects/X/ok.md", "fine\n");
+    eventually!(10, a.proc.log_contains("reconcile done"), "owner up", a.proc);
+    let r = api_json(&server, &owner, "POST", "/api/vaults/va/shares", Some(json!({"path": "Projects/X", "name": "X"})));
+    let ticket = r["ticket"].as_str().unwrap().to_string();
+    let b = Client::start(&server, &bob, "vb", &dir.join("B"), "B");
+    eventually!(10, b.proc.log_contains("reconcile done"), "bob up", b.proc);
+    api_json(&server, &bob, "POST", "/api/vaults/vb/mounts", Some(json!({"ticket": ticket, "mount_path": "Shared/X"})));
+    eventually!(15, b.exists("Shared/X/ok.md"), "mount works", b.proc);
+
+    // The owner (as a hostile collaborator would) injects evil keys straight into the vault
+    // document over the WebSocket, bypassing any client-side checks.
+    let evil_keys = [
+        "/tmp/replica-evil-abs.md",
+        "Projects/X/../../../replica-evil-dotdot.md",
+        "Projects/X/..\\\\replica-evil-backslash.md",
+        "Projects/X/sub//replica-evil-empty.md",
+        "Projects/X/\u{0}replica-evil-nul.md",
+    ];
+    let canary = "/tmp/replica-evil-abs.md";
+    let _ = std::fs::remove_file(canary);
+    let url = format!("ws://127.0.0.1:{}/ws/va?token={owner}", server.port);
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        use futures::SinkExt;
+        use tokio_tungstenite::tungstenite::Message;
+        use yrs::sync::{Message as M, SyncMessage};
+        use yrs::updates::encoder::Encode;
+        use yrs::{Map, ReadTxn, Text, Transact};
+        let (mut ws, _) = tokio_tungstenite::connect_async(&url).await.expect("connect");
+        let doc = yrs::Doc::new();
+        let texts = doc.get_or_insert_map("texts");
+        {
+            let mut txn = doc.transact_mut();
+            for k in evil_keys {
+                let t = texts.insert(&mut txn, k, yrs::TextPrelim::new(""));
+                t.insert(&mut txn, 0, "evil\n");
+            }
+            // Also a legitimate key, to prove the update itself was applied.
+            let t = texts.insert(&mut txn, "Projects/X/from-ws.md", yrs::TextPrelim::new(""));
+            t.insert(&mut txn, 0, "legit\n");
+        }
+        let update = doc.transact().encode_state_as_update_v1(&yrs::StateVector::default());
+        ws.send(Message::Binary(M::Sync(SyncMessage::Update(update)).encode_v1().into())).await.expect("send");
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    });
+    eventually!(15, b.exists("Shared/X/from-ws.md"), "legitimate key arrives at bob", b.proc, server.proc);
+    sleep(3.0);
+    // Nothing escaped, on either client.
+    assert!(!std::path::Path::new(canary).exists(), "absolute key written outside the sync dir");
+    for root in [dir.join("A"), dir.join("B")] {
+        for e in walkdir::WalkDir::new(&root).into_iter().flatten() {
+            let p = e.path().to_string_lossy().to_string();
+            assert!(!p.contains("replica-evil"), "evil key reached disk: {p}");
+        }
+    }
+    for p in ["replica-evil-dotdot.md", "replica-evil-backslash.md"] {
+        assert!(!dir.join(p).exists() && !dir.parent().unwrap().join(p).exists(), "{p} escaped");
+    }
+    // The server refused to forward the evil keys into bob's document at all.
+    assert!(server.proc.log_contains("refusing to bridge invalid key"), "server forwarded invalid keys");
+    assert!(server.errors().is_empty(), "{:?}", server.errors());
+}
+
+// ------------------------------------------------------------------ helpers
+
+fn urlenc(s: &str) -> String {
+    let mut out = String::new();
+    for b in s.bytes() {
+        match b {
+            b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' | b'/' => out.push(b as char),
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
+}
+
+fn api_raw_bytes(server: &Server, token: &str, method: &str, path: &str, body: &[u8]) -> (u16, String) {
+    let client = reqwest::blocking::Client::builder().timeout(Duration::from_secs(40)).build().unwrap();
+    let url = format!("{}{}", server.url(), path);
+    let req = match method {
+        "PUT" => client.put(&url),
+        "POST" => client.post(&url),
+        m => panic!("method {m}"),
+    };
+    let mut req = req.body(body.to_vec());
+    if !token.is_empty() {
+        req = req.bearer_auth(token);
+    }
+    let res = req.send().expect("http");
+    (res.status().as_u16(), res.text().unwrap_or_default())
+}
+
+/// Pull the secret out of a ticket the way the plugin does.
+fn ticket_secret(ticket: &str) -> String {
+    let body = ticket.trim().strip_prefix("replica").unwrap().to_ascii_uppercase();
+    let bytes = data_encoding::BASE32_NOPAD.decode(body.as_bytes()).unwrap();
+    let mut pos = 1;
+    let mut read_str = || {
+        let mut len = 0usize;
+        let mut shift = 0;
+        loop {
+            let b = bytes[pos];
+            pos += 1;
+            len |= ((b & 0x7f) as usize) << shift;
+            if b & 0x80 == 0 {
+                break;
+            }
+            shift += 7;
+        }
+        let s = String::from_utf8(bytes[pos..pos + len].to_vec()).unwrap();
+        pos += len;
+        s
+    };
+    let _share = read_str();
+    let _name = read_str();
+    let _node = read_str();
+    read_str()
+}
+
+use sha2::Digest;

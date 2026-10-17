@@ -99,11 +99,17 @@ impl GuestLimiter {
     }
 }
 
-fn client_ip(headers: &HeaderMap, peer: SocketAddr) -> IpAddr {
+/// The client's address for rate limiting. `X-Forwarded-For` is only believed when the
+/// operator says there is a proxy (`--trust-proxy`); otherwise anyone could spoof it and dodge
+/// the limiter. With a proxy the *last* entry is the one our proxy appended.
+fn client_ip(state: &SharedState, headers: &HeaderMap, peer: SocketAddr) -> IpAddr {
+    if !state.serve.trust_proxy {
+        return peer.ip();
+    }
     headers
         .get("x-forwarded-for")
         .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.split(',').next())
+        .and_then(|v| v.split(',').next_back())
         .and_then(|v| v.trim().parse().ok())
         .unwrap_or(peer.ip())
 }
@@ -121,7 +127,7 @@ pub struct Guest {
 
 /// Validate `(share_id, secret)`; the secret comes as `?secret=` or `Authorization: Bearer`.
 fn authenticate(state: &SharedState, share_id: &str, headers: &HeaderMap, query: &HashMap<String, String>, peer: SocketAddr) -> Result<Guest, Response> {
-    let ip = client_ip(headers, peer);
+    let ip = client_ip(state, headers, peer);
     if state.guest_limiter.lock().unwrap().blocked(ip) {
         return Err((StatusCode::TOO_MANY_REQUESTS, "too many failed attempts; try again later").into_response());
     }
@@ -234,7 +240,9 @@ pub async fn ws(
     tracing::info!(share = %g.share.name, label = %g.label, access = %g.access, "guest connected");
     let writable = g.access == "rw";
     let revoke = Some((g.share.id.clone(), g.secret.clone()));
-    ws.on_upgrade(move |socket| crate::ws::handle_socket(socket, state, doc, writable, revoke))
+    ws.max_message_size(crate::ws::MAX_WS_MESSAGE)
+        .max_frame_size(crate::ws::MAX_WS_MESSAGE)
+        .on_upgrade(move |socket| crate::ws::handle_socket(socket, state, doc, writable, revoke))
 }
 
 // ------------------------------------------------------------------ blobs

@@ -159,6 +159,9 @@ pub async fn create_share(
     if path.is_empty() {
         return err(StatusCode::BAD_REQUEST, "path is required (a folder or a note)");
     }
+    if !crate::ids::valid_key(&path) {
+        return err(StatusCode::BAD_REQUEST, "path contains '..', empty or control-character segments");
+    }
     let access = body.access.unwrap_or_else(|| "rw".into());
     if access != "rw" && access != "ro" {
         return err(StatusCode::BAD_REQUEST, "access must be rw or ro");
@@ -443,7 +446,10 @@ pub async fn create_mount(
     let access = if grant_access == "ro" || ticket.access == "ro" { "ro" } else { "rw" };
 
     let mount_path = clean_path(&body.mount_path.unwrap_or_default());
-    let mount_path = if mount_path.is_empty() { format!("Shared/{share_name}") } else { mount_path };
+    let mount_path = if mount_path.is_empty() { format!("Shared/{}", share_name.replace('/', "-")) } else { mount_path };
+    if !crate::ids::valid_key(&mount_path) || mount_path.split('/').any(|s| s.starts_with('.')) {
+        return err(StatusCode::BAD_REQUEST, "mount path contains '..', hidden, empty or control-character segments");
+    }
     let prefix = format!("{mount_path}/");
     let _admin = state.docs.share_admin.lock().unwrap();
     match taken_prefixes(&state, &info.id) {
@@ -538,6 +544,9 @@ pub async fn move_mount(
     if new_path.is_empty() {
         return err(StatusCode::BAD_REQUEST, "path is required");
     }
+    if !crate::ids::valid_key(&new_path) || new_path.split('/').any(|s| s.starts_with('.')) {
+        return err(StatusCode::BAD_REQUEST, "path contains '..', hidden, empty or control-character segments");
+    }
     let new_prefix = format!("{new_path}/");
     if new_prefix == mount.mount_prefix {
         return Json(serde_json::json!({ "mount_path": new_path })).into_response();
@@ -587,6 +596,9 @@ pub async fn move_share(
     let new_path = clean_path(&body.path);
     if new_path.is_empty() {
         return err(StatusCode::BAD_REQUEST, "path is required");
+    }
+    if !crate::ids::valid_key(&new_path) {
+        return err(StatusCode::BAD_REQUEST, "path contains '..', empty or control-character segments");
     }
     let (new_prefix, new_file) = if share.only_file.is_some() {
         match new_path.rsplit_once('/') {

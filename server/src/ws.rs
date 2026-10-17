@@ -25,6 +25,10 @@ use crate::storage::User;
 use crate::vault::encode_message;
 use crate::SharedState;
 
+/// Largest y-sync message accepted from a client. A full vault state is one message, so this
+/// bounds vault size over WebSocket; it also bounds what one client can make us allocate.
+pub const MAX_WS_MESSAGE: usize = 256 * 1024 * 1024;
+
 /// Shared auth for ws + blob routes.
 pub fn authenticate(state: &SharedState, headers: &HeaderMap, query: &HashMap<String, String>) -> Result<User, Response> {
     let token = extract_token(headers, query.get("token").map(String::as_str));
@@ -75,7 +79,7 @@ pub async fn ws_handler(
         }
     };
     let _ = user;
-    ws.on_upgrade(move |socket| handle_socket(socket, state, vault, true, None))
+    ws.max_message_size(MAX_WS_MESSAGE).max_frame_size(MAX_WS_MESSAGE).on_upgrade(move |socket| handle_socket(socket, state, vault, true, None))
 }
 
 /// Pump y-sync between one WebSocket and a live document. `writable == false` drops the
