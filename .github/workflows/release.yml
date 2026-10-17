@@ -1,0 +1,64 @@
+name: Plugin release
+
+# Prepares an Obsidian plugin release. Tag the commit with the version number
+# (Obsidian convention: the tag must match the version in manifest.json, e.g.
+# `0.1.0`, no `v` prefix), push the tag, and this builds the plugin and creates a
+# DRAFT GitHub release with the three files Obsidian loads: main.js,
+# manifest.json, styles.css. Review the draft and publish it by hand.
+
+on:
+  push:
+    tags: ["*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Version to release (must match manifest.json, no 'v' prefix)"
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: plugin/package-lock.json
+
+      - name: Build plugin
+        working-directory: plugin
+        run: |
+          npm ci
+          npm run build
+          npm test
+
+      - name: Check tag matches manifest version
+        working-directory: plugin
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then TAG="${{ inputs.tag }}"; fi
+          TAG="${TAG#v}"
+          MANIFEST=$(node -p "require('./manifest.json').version")
+          echo "tag=$TAG manifest=$MANIFEST"
+          if [ "$TAG" != "$MANIFEST" ]; then
+            echo "::error::Tag '$TAG' does not match manifest.json version '$MANIFEST'"
+            exit 1
+          fi
+          echo "VERSION=$TAG" >> "$GITHUB_ENV"
+
+      - name: Create draft release
+        uses: softprops/action-gh-release@v2
+        with:
+          draft: true
+          tag_name: ${{ env.VERSION }}
+          name: ${{ env.VERSION }}
+          files: |
+            plugin/main.js
+            plugin/manifest.json
+            plugin/styles.css
+          fail_on_unmatched_files: true

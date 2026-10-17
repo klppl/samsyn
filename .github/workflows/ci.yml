@@ -1,0 +1,72 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+  schedule:
+    # Weekly fuzz run (Mondays 04:00 UTC).
+    - cron: "0 4 * * 1"
+
+jobs:
+  server-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: server
+      # The sharing scenarios spawn servers and headless clients inside the job;
+      # relays are disabled, so no network is needed.
+      - name: cargo test
+        working-directory: server
+        run: cargo test
+
+  server-audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: cargo audit
+        working-directory: server
+        run: |
+          cargo install cargo-audit --locked
+          cargo audit
+
+  plugin-build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: plugin/package-lock.json
+      - working-directory: plugin
+        run: |
+          npm ci
+          npm run build
+          npm test
+          npm audit --omit=dev --audit-level=high
+
+  fuzz:
+    # Slow sanitizer build; only on manual runs and the weekly schedule.
+    if: github.event_name == 'workflow_dispatch' || github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - name: cargo fuzz
+        working-directory: server/fuzz
+        run: |
+          cargo install cargo-fuzz --locked
+          # Our own decoders run with debug assertions (catch overflow); ysync goes
+          # through yrs, whose assertions are debug-only, so it runs in release to
+          # match the shipped build.
+          for t in ticket_decode p2p_hello keys_and_hashes text_delta_replay; do
+            cargo fuzz run "$t" -- -max_total_time=90 -max_len=4096
+          done
+          cargo fuzz run -O ysync_payload -- -max_total_time=90 -max_len=8192 -rss_limit_mb=2048 -malloc_limit_mb=2048
