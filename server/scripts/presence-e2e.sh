@@ -2,11 +2,11 @@
 # One server, owner shares Projects/X, bob mounts at Shared/X, then presence-e2e.mjs checks that
 # awareness crosses the bridge. Needs a debug build and plugin/node_modules (npm install in plugin/).
 set -u
-S=${REPLICA_E2E_DIR:-$(mktemp -d)}
+S=${SAMSYN_E2E_DIR:-$(mktemp -d)}
 ROOT=$(cd "$(dirname "$0")/../.." && pwd)
-BIN=${REPLICA_BIN:-$ROOT/server/target/debug/replica-server}
-PORT=${REPLICA_E2E_PORT:-8797}
-pkill -f "replica-server --data-dir $S/pdata" ; sleep 0.3
+BIN=${SAMSYN_BIN:-$ROOT/server/target/debug/samsyn}
+PORT=${SAMSYN_E2E_PORT:-8797}
+pkill -f "samsyn --data-dir $S/pdata" ; sleep 0.3
 rm -rf "${S:?}/pdata" "${S:?}/PA"; mkdir -p $S/PA/Projects/X/sub
 ($BIN --data-dir $S/pdata serve --bind 127.0.0.1:$PORT --no-p2p > $S/presence-server.log 2>&1 &); sleep 1.5
 OWNER=$(grep -o 'rp_[0-9a-f]*' $S/presence-server.log | head -1)
@@ -22,5 +22,5 @@ TICKET=$(api $OWNER -X POST $U/api/vaults/va/shares -d '{"path":"Projects/X","na
 api $BOB -X POST $U/api/vaults/vb/mounts -d "{\"ticket\":\"$TICKET\",\"mount_path\":\"Shared/X\"}" | j 'print(d.get("error") or "mounted")'
 cd $ROOT/plugin && node tests/presence-e2e.mjs ws://127.0.0.1:$PORT/ws $OWNER va $BOB vb
 RC=$?
-pkill -f "replica-server --data-dir $S/pdata"
+pkill -f "samsyn --data-dir $S/pdata"
 exit $RC

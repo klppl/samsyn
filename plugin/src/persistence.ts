@@ -22,7 +22,7 @@ export function deviceInstallId(app: unknown): string {
   const appId = (app as { appId?: unknown }).appId;
   if (typeof appId === "string" && appId.length > 0) return "app:" + appId;
   try {
-    const key = "replica-install-id";
+    const key = "samsyn-install-id";
     let v = globalThis.localStorage?.getItem(key);
     if (!v) {
       v = "ls:" + Math.random().toString(36).slice(2) + Date.now().toString(36);
@@ -102,7 +102,7 @@ export class Persistence {
     return `${this.dir}/state.json`;
   }
   private dbName(kind: "doc" | "state"): string {
-    return `replica-${kind}-${this.scope.replace(/[^A-Za-z0-9_.:-]/g, "_")}`;
+    return `samsyn-${kind}-${this.scope.replace(/[^A-Za-z0-9_.:-]/g, "_")}`;
   }
 
   // ------------------------------------------------------------------ document
@@ -124,7 +124,7 @@ export class Persistence {
     if (!had && (await this.adapter.exists(this.docPath))) {
       // One-time migration from the file cache; y-indexeddb persists the applied update.
       had = await this.loadDocFromFile(doc);
-      if (had) console.info("[replica] migrated doc.bin into IndexedDB");
+      if (had) console.info("[samsyn] migrated doc.bin into IndexedDB");
       await this.adapter.remove(this.docPath).catch(() => undefined);
     }
     return had;
@@ -137,7 +137,7 @@ export class Persistence {
       Y.applyUpdate(doc, new Uint8Array(buf), "persistence");
       return true;
     } catch (e) {
-      console.warn("[replica] failed to load cached doc, starting fresh", e);
+      console.warn("[samsyn] failed to load cached doc, starting fresh", e);
       return false;
     }
   }
@@ -167,16 +167,16 @@ export class Persistence {
         const [store] = idb.transact(this.stateDb, [STATE_STORE], "readonly");
         for (const { k, v } of await idb.getAllKeysValues(store)) synced[String(k)] = String(v);
       } catch (e) {
-        console.warn("[replica] failed to read sync state from IndexedDB", e);
+        console.warn("[samsyn] failed to read sync state from IndexedDB", e);
       }
       if (Object.keys(synced).length === 0 && (await this.adapter.exists(this.statePath))) {
         const legacy = await this.loadStateFromFile(installId);
         synced = legacy.synced;
         if (Object.keys(synced).length > 0) {
           await this.writeEntries(Object.entries(synced), []).catch((e) =>
-            console.warn("[replica] migrating sync state failed", e),
+            console.warn("[samsyn] migrating sync state failed", e),
           );
-          console.info(`[replica] migrated ${Object.keys(synced).length} sync entries into IndexedDB`);
+          console.info(`[samsyn] migrated ${Object.keys(synced).length} sync entries into IndexedDB`);
         }
         await this.adapter.remove(this.statePath).catch(() => undefined);
       }
@@ -193,14 +193,14 @@ export class Persistence {
         const parsed = JSON.parse(await this.adapter.read(this.statePath)) as Partial<LocalState>;
         if (parsed.installId !== installId) {
           console.warn(
-            `[replica] sync state belongs to another install (${parsed.installId ?? "none"} vs ${installId}); starting fresh`,
+            `[samsyn] sync state belongs to another install (${parsed.installId ?? "none"} vs ${installId}); starting fresh`,
           );
           return { installId, synced: {} };
         }
         return { installId, synced: parsed.synced ?? {} };
       }
     } catch (e) {
-      console.warn("[replica] failed to load sync state", e);
+      console.warn("[samsyn] failed to load sync state", e);
     }
     return { installId, synced: {} };
   }
@@ -233,7 +233,7 @@ export class Persistence {
     this.lastState = state;
     // Serialize flushes so a slow IndexedDB transaction cannot interleave with the next one.
     this.flushing = this.flushing.then(() => this.flushNow(state)).catch((e) => {
-      console.warn("[replica] saving sync state failed", e);
+      console.warn("[samsyn] saving sync state failed", e);
     });
     await this.flushing;
   }
@@ -287,7 +287,7 @@ export class Persistence {
       // closes itself on versionchange. Do not wait forever if one does not.
       for (const kind of ["doc", "state"] as const) {
         await Promise.race([
-          idb.deleteDB(this.dbName(kind)).catch((e) => console.warn("[replica] deleting cache db failed", e)),
+          idb.deleteDB(this.dbName(kind)).catch((e) => console.warn("[samsyn] deleting cache db failed", e)),
           new Promise<void>((resolve) => setTimeout(resolve, 5000)),
         ]);
       }

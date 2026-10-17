@@ -12,7 +12,7 @@
 
 ## Server crate layout
 
-`server/` is one package with a library and a thin binary. `src/lib.rs` exposes every module (`replica_server::ticket`, `ids`, `limits`, `storage`, `vault`, `bridge`, `presence`, `ws`, `guest`, `sharing`, `remote`, `client`, `app`, …); `src/main.rs` only parses the command line and calls `replica_server::serve` or the CLI/client entry points. Anything that should be reusable in another program (ticket format, path/hash validation, the headless client, the storage layer) is therefore importable with `replica-server = { path = "…" }`, and the fuzz targets in `server/fuzz/` link against it. Unit tests live in the library (`cargo test --lib`).
+`server/` is one package with a library and a thin binary. `src/lib.rs` exposes every module (`samsyn_server::ticket`, `ids`, `limits`, `storage`, `vault`, `bridge`, `presence`, `ws`, `guest`, `sharing`, `remote`, `client`, `app`, …); `src/main.rs` only parses the command line and calls `samsyn_server::serve` or the CLI/client entry points. Anything that should be reusable in another program (ticket format, path/hash validation, the headless client, the storage layer) is therefore importable with `samsyn-server = { path = "…" }`, and the fuzz targets in `server/fuzz/` link against it. Unit tests live in the library (`cargo test --lib`).
 
 ## Server
 
@@ -42,10 +42,10 @@ Obsidian loads plugins from `<vault>/.obsidian/plugins/<id>/` and needs three fi
    ```sh
    cd plugin
    npm install
-   ln -s "$(pwd)" ~/ObsidianDev/.obsidian/plugins/replica
+   ln -s "$(pwd)" ~/ObsidianDev/.obsidian/plugins/samsyn
    ```
 
-   On Windows use a junction: `mklink /J C:\path\to\vault\.obsidian\plugins\replica C:\path\to\replica\plugin`.
+   On Windows use a junction: `mklink /J C:\path\to\vault\.obsidian\plugins\samsyn C:\path\to\replica\plugin`.
 
 3. Start the watcher:
 
@@ -55,7 +55,7 @@ Obsidian loads plugins from `<vault>/.obsidian/plugins/<id>/` and needs three fi
 
    This rebuilds `main.js` on every save (with inline source maps).
 
-4. In Obsidian: Settings → Community plugins → turn off Restricted mode → enable **Replica**.
+4. In Obsidian: Settings → Community plugins → turn off Restricted mode → enable **Samsyn**.
 
 5. After each rebuild, reload the plugin. Either toggle it off/on in settings, or install the community plugin **Hot Reload** (pjeby/hot-reload), which reloads any plugin whose folder contains a `.hotreload` file:
 
@@ -63,10 +63,10 @@ Obsidian loads plugins from `<vault>/.obsidian/plugins/<id>/` and needs three fi
    touch plugin/.hotreload
    ```
 
-6. Open the developer console with `Ctrl/Cmd+Shift+I`. Replica logs with the `[replica]` prefix. To inspect the shared document from the console:
+6. Open the developer console with `Ctrl/Cmd+Shift+I`. Samsyn logs with the `[samsyn]` prefix. To inspect the shared document from the console:
 
    ```js
-   const p = app.plugins.plugins.replica;
+   const p = app.plugins.plugins.samsyn;
    p.engine.texts.toJSON();           // every synced text file
    p.engine.blobs.toJSON();           // every synced binary
    ```
@@ -87,14 +87,14 @@ This does not emulate the mobile WebView, so always test the real thing before a
 
 ## Plugin on a phone
 
-Obsidian mobile loads plugins from the same `.obsidian/plugins/replica/` folder inside the vault, but there is no symlink or watcher. You copy the built files in. Build first:
+Obsidian mobile loads plugins from the same `.obsidian/plugins/samsyn/` folder inside the vault, but there is no symlink or watcher. You copy the built files in. Build first:
 
 ```sh
 cd plugin
 npm run build      # production main.js, minified, no source map
 ```
 
-Then get `main.js`, `manifest.json` and `styles.css` into `<vault>/.obsidian/plugins/replica/` on the phone.
+Then get `main.js`, `manifest.json` and `styles.css` into `<vault>/.obsidian/plugins/samsyn/` on the phone.
 
 ### iOS
 
@@ -110,34 +110,34 @@ Copy the files there and iCloud pushes them to the phone:
 
 ```sh
 V=~/Library/Mobile\ Documents/iCloud~md~obsidian/Documents/MyVault
-mkdir -p "$V/.obsidian/plugins/replica"
-cp plugin/main.js plugin/manifest.json plugin/styles.css "$V/.obsidian/plugins/replica/"
+mkdir -p "$V/.obsidian/plugins/samsyn"
+cp plugin/main.js plugin/manifest.json plugin/styles.css "$V/.obsidian/plugins/samsyn/"
 ```
 
 Wait for the iCloud upload (Finder shows a cloud icon until done), then on the phone: Settings → Community plugins → reload (pull down or toggle the plugin). The first time, enable it from the list.
 
-**B. On-device vault, copy via Finder/USB.** Connect the phone, open Finder → iPhone → Files → Obsidian → drag the `replica` folder into the vault's `.obsidian/plugins/` folder. Finder does show dot-folders here. (On older macOS this is in iTunes → File Sharing.)
+**B. On-device vault, copy via Finder/USB.** Connect the phone, open Finder → iPhone → Files → Obsidian → drag the `samsyn` folder into the vault's `.obsidian/plugins/` folder. Finder does show dot-folders here. (On older macOS this is in iTunes → File Sharing.)
 
 **C. BRAT (once we publish pre-releases).** Install the BRAT community plugin on the phone, add this repository as a beta plugin, and it downloads `main.js`/`manifest.json`/`styles.css` from GitHub releases. This is the plan for testers before the community-list release.
 
-**D. Replica itself.** Once one device is syncing, you can tick "sync the `.obsidian` folder" in a later version and let Replica carry the plugin to the other devices. Not implemented yet, and risky for plugin files; listed for completeness.
+**D. Samsyn itself.** Once one device is syncing, you can tick "sync the `.obsidian` folder" in a later version and let Samsyn carry the plugin to the other devices. Not implemented yet, and risky for plugin files; listed for completeness.
 
 ### Android
 
-Same three files into `<vault>/.obsidian/plugins/replica/`. Any file manager that shows hidden files works (Material Files, Solid Explorer, or the built-in Files app with "Show hidden files"), or from a computer:
+Same three files into `<vault>/.obsidian/plugins/samsyn/`. Any file manager that shows hidden files works (Material Files, Solid Explorer, or the built-in Files app with "Show hidden files"), or from a computer:
 
 ```sh
 adb push plugin/main.js plugin/manifest.json plugin/styles.css \
-  /sdcard/Documents/MyVault/.obsidian/plugins/replica/
+  /sdcard/Documents/MyVault/.obsidian/plugins/samsyn/
 ```
 
 ### Debugging on a phone
 
 Obsidian mobile does not expose a developer console. Options, in order of usefulness:
 
-0. **Settings → Replica → Server tab → Status.** Live status, whether the initial sync completed, peer count, file counts, the exact WebSocket URL, last error and a hint. Also the command **Replica: Show sync status**. Check this first.
+0. **Settings → Samsyn → Server tab → Status.** Live status, whether the initial sync completed, peer count, file counts, the exact WebSocket URL, last error and a hint. Also the command **Samsyn: Show sync status**. Check this first.
 1. **Watch the server.** `RUST_LOG=debug cargo run -- serve` shows every connection, auth failure and message. Most mobile issues (wrong URL, token, mixed content) are visible there.
-2. **Use the status bar and Notices.** Replica reports connection state in the status bar and shows a Notice on errors that matter.
+2. **Use the status bar and Notices.** Samsyn reports connection state in the status bar and shows a Notice on errors that matter.
 3. **Android: Chrome remote debugging.** With USB debugging enabled, `chrome://inspect` on a desktop Chrome lists the Obsidian WebView and gives a full console. Obsidian on Android must be a debuggable build for this; recent releases are, if not, fall back to 1 and 2.
 4. **iOS: Safari Web Inspector** only works for apps built with a developer profile, which the App Store Obsidian is not. Use 1 and 2.
 
@@ -145,7 +145,7 @@ Obsidian mobile does not expose a developer console. Options, in order of useful
 
 - **iOS needs `https://`.** The WebView is a secure context, so `new WebSocket("ws://…")` is refused as insecure mixed content, while `Test connection` still passes because `requestUrl` goes through native code. Symptoms: test OK, status stays "Offline" or "Connecting", hint on the settings page mentions ws://. Fix: Tailscale serve, Caddy, or `--tls-cert/--tls-key` (see README). Android is more lenient but treat it the same.
 - Self-signed certificates: install the CA on the phone and enable full trust for it (iOS: Settings → General → About → Certificate Trust Settings). `mkcert -install` plus AirDropping `rootCA.pem` is the quickest dev setup.
-- iOS suspends the app in the background and closes the WebSocket. Replica reconnects when the app returns and the reconcile step catches up on anything missed.
+- iOS suspends the app in the background and closes the WebSocket. Samsyn reconnects when the app returns and the reconcile step catches up on anything missed.
 - `WebSocket` headers cannot be set on mobile, which is why the token also goes in the URL query string.
 
 ## Plugin settings sync
@@ -154,20 +154,20 @@ Obsidian mobile does not expose a developer console. Options, in order of useful
 
 ## Deep links
 
-`registerObsidianProtocolHandler("replica", …)` in `main.ts` handles `obsidian://replica?op=mount&ticket=…` (opens the mount dialog) and `obsidian://replica?op=setup&server=…&token=…&vid=…[&user=…]` (asks before replacing the connection settings). `vault` cannot be used as a parameter name: Obsidian reserves it for choosing a local vault and silently drops the link when no local vault has that name, which is why the server-side vault id travels as `vid`. QR codes are those links rendered with `qrcode-generator` (`src/qr.ts`). Test on desktop by pasting the link into a browser's address bar; on iOS point the camera at the QR.
+`registerObsidianProtocolHandler("samsyn", …)` in `main.ts` handles `obsidian://samsyn?op=mount&ticket=…` (opens the mount dialog) and `obsidian://samsyn?op=setup&server=…&token=…&vid=…[&user=…]` (asks before replacing the connection settings). `vault` cannot be used as a parameter name: Obsidian reserves it for choosing a local vault and silently drops the link when no local vault has that name, which is why the server-side vault id travels as `vid`. QR codes are those links rendered with `qrcode-generator` (`src/qr.ts`). Test on desktop by pasting the link into a browser's address bar; on iOS point the camera at the QR.
 
 ## Engines and scopes
 
-`SyncEngine` is instantiated once per sync target (`EngineTarget`): the *home* engine (own server, whole vault, keys == vault paths) and one *guest* engine per guest mount (owner's server, one folder, keys relative to the folder). All path mapping happens at the Obsidian boundary: `keyOf(vaultPath)` returns the document key or `null` when the path is outside this engine's scope (other engines' roots, config dir, excludes); `pathOf(key)` goes back. Everything between (observers, reconcile, conflict copies, mass-delete guard) works on keys and is identical for both kinds. `ReplicaPlugin.engines` holds them; `plugin.engine` is the home engine.
+`SyncEngine` is instantiated once per sync target (`EngineTarget`): the *home* engine (own server, whole vault, keys == vault paths) and one *guest* engine per guest mount (owner's server, one folder, keys relative to the folder). All path mapping happens at the Obsidian boundary: `keyOf(vaultPath)` returns the document key or `null` when the path is outside this engine's scope (other engines' roots, config dir, excludes); `pathOf(key)` goes back. Everything between (observers, reconcile, conflict copies, mass-delete guard) works on keys and is identical for both kinds. `SamsynPlugin.engines` holds them; `plugin.engine` is the home engine.
 
 ## Local cache on the device
 
 The plugin keeps two things per device and vault, both in **IndexedDB** (`src/persistence.ts`), never in the vault folder:
 
-- the Yjs document, via `y-indexeddb`: an append-only log of updates, compacted into one record every 500 entries. A keystroke costs one small write; nothing rewrites the whole document. Database `replica-doc-<installId>|<vaultId>`.
-- the per-path "last synced" hashes, one record per path, flushed in batches about a second after a change. Database `replica-state-…`.
+- the Yjs document, via `y-indexeddb`: an append-only log of updates, compacted into one record every 500 entries. A keystroke costs one small write; nothing rewrites the whole document. Database `samsyn-doc-<installId>|<vaultId>`.
+- the per-path "last synced" hashes, one record per path, flushed in batches about a second after a change. Database `samsyn-state-…`.
 
-Why not files in `.obsidian/plugins/replica/`: the previous `doc.bin`/`state.json` were rewritten in full on every change (a 50 MB vault meant 50 MB writes while typing), and a copied or iCloud-synced `.obsidian` carried one device's bookkeeping to another, which is how a phone once deleted a vault. Old files are migrated into IndexedDB on first start and removed. Without IndexedDB (not a case in Obsidian today) the file backend is still there as a fallback.
+Why not files in `.obsidian/plugins/samsyn/`: the previous `doc.bin`/`state.json` were rewritten in full on every change (a 50 MB vault meant 50 MB writes while typing), and a copied or iCloud-synced `.obsidian` carried one device's bookkeeping to another, which is how a phone once deleted a vault. Old files are migrated into IndexedDB on first start and removed. Without IndexedDB (not a case in Obsidian today) the file backend is still there as a fallback.
 
 "Reset local state" deletes both databases. The Status section shows the backend, the encoded document size and the browser's storage usage/quota.
 
@@ -190,18 +190,18 @@ What still costs at the high end: the first sync sends the whole state as one We
 ## Safety behaviour worth knowing while testing
 
 - **Sync state is device-bound.** The "last synced" hashes live in IndexedDB on the device (see "Local cache on the device"), never in the vault folder, so copying `.obsidian` to another device cannot carry one device's bookkeeping along. (The old `state.json` was the cause of a phone deleting a vault once; it is migrated and removed on first start.)
-- **Mass-delete guard.** If one reconcile would remove at least 5 files and more than half of the shared vault, the plugin refuses, re-downloads them, shows a Notice, and lists them under *Held back* on the settings page. The command **Replica: Apply held-back deletions** does it for real. Single and small deletions are applied normally.
+- **Mass-delete guard.** If one reconcile would remove at least 5 files and more than half of the shared vault, the plugin refuses, re-downloads them, shows a Notice, and lists them under *Held back* on the settings page. The command **Samsyn: Apply held-back deletions** does it for real. Single and small deletions are applied normally.
 - **Remote deletions go to trash**, never a hard delete (Obsidian's "Deleted files" setting decides system trash vs `.trash/`).
 
 ## Headless client
 
-`replica-server sync` lives in `server/src/client/`. It reuses the server's yrs dependency and speaks the same y-sync protocol as a client. Structure:
+`samsyn sync` lives in `server/src/client/`. It reuses the server's yrs dependency and speaks the same y-sync protocol as a client. Structure:
 
 - `mod.rs` — flags, URL building, the main `select!` loop (WebSocket events, watcher batches, 2 s housekeeping tick, `--once` exit).
 - `ws.rs` — connection task with exponential reconnect; hands the engine a per-connection sender.
 - `engine.rs` — owns the `Doc`/`Awareness`, `texts` and `blobs` maps, reconcile, local → doc pushes, doc → disk writes, three-way merge for pending local edits, mass-delete guard.
 - `diff.rs` — byte-offset single-span diff (yrs text indexes are UTF-8 bytes by default).
-- `state.rs` — `<dir>/.replica/{state.json,doc.bin,trash/}`; install id derived from hostname + absolute path.
+- `state.rs` — `<dir>/.samsyn/{state.json,doc.bin,trash/}`; install id derived from hostname + absolute path.
 
 Quick manual test with two directories:
 
@@ -223,7 +223,7 @@ Leftover `sync` processes keep watching their directory. Kill them before deleti
 - Do not hold a `vaults`/`shares` map guard across a call that locks it again (`if let Some(x) = self.map.lock()...` keeps the guard for the whole `if let`).
 - All vaults that take part in a bridge are loaded at startup (`preload_bridged`), otherwise a share can advance while one end is unloaded and the later reconcile overwrites it.
 
-Scenario test (one server, three users, headless clients as plugins): `server/scripts/share-e2e.sh`. Needs a debug build (`cargo build` in `server/`), uses port 8798 and a temp dir (`REPLICA_E2E_DIR=… ` to keep it), kills every running `replica-server` first. Covers create, overlap race, mount, both-way and concurrent edits, blobs, read-only revert and rescue copy, revoke, restart, unmount. Turning it into a Rust integration test is still on the list.
+Scenario test (one server, three users, headless clients as plugins): `server/scripts/share-e2e.sh`. Needs a debug build (`cargo build` in `server/`), uses port 8798 and a temp dir (`SAMSYN_E2E_DIR=… ` to keep it), kills every running `samsyn` first. Covers create, overlap race, mount, both-way and concurrent edits, blobs, read-only revert and rescue copy, revoke, restart, unmount. Turning it into a Rust integration test is still on the list.
 
 Guest mode: `server/scripts/guest-e2e.sh` (owner server with `--public-url`, two headless guests via `--ticket`, rw and ro, auth hygiene, revoke). Presence across a bridge: `server/scripts/presence-e2e.sh` (one server, Node y-websocket clients from `plugin/tests/presence-e2e.mjs`, needs `npm install` in `plugin/`).
 
@@ -236,7 +236,7 @@ Guest mode: `server/scripts/guest-e2e.sh` (owner server with `--public-url`, two
 - Blob bytes cross the link lazily: the metadata can reach a vault before the bytes do. Both clients retry a 404 with backoff; the server copies fetched bytes into the bridged vault store (`DocRegistry::blob_arrived`).
 - When the owner denies a hello it waits for the reply to drain before closing, otherwise the peer only sees "connection lost" and keeps retrying instead of marking the mount revoked.
 
-Scenario test: `server/scripts/remote-e2e.sh` (two servers, ports 8798/8799 + p2p 9798/9799, `REPLICA_E2E_RELAY=none|default|<url>`). Covers probe of a bad ticket, mount over p2p, blobs both ways, concurrent edits, read-only, revoke → mount revoked on the other server, restart of either server, unmount. It takes 3–4 minutes.
+Scenario test: `server/scripts/remote-e2e.sh` (two servers, ports 8798/8799 + p2p 9798/9799, `SAMSYN_E2E_RELAY=none|default|<url>`). Covers probe of a bad ticket, mount over p2p, blobs both ways, concurrent edits, read-only, revoke → mount revoked on the other server, restart of either server, unmount. It takes 3–4 minutes.
 
 ## Changing the registry schema
 

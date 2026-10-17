@@ -1,16 +1,16 @@
 #!/bin/zsh
 # Sharing scenario on one server with headless clients standing in for plugins.
 # Usage: server/scripts/share-e2e.sh   (needs a debug build: cargo build)
-# Set REPLICA_E2E_DIR to keep the work dir; otherwise a temp dir is used.
+# Set SAMSYN_E2E_DIR to keep the work dir; otherwise a temp dir is used.
 set -u
-S=${REPLICA_E2E_DIR:-$(mktemp -d)}
-BIN=${REPLICA_BIN:-$(cd "$(dirname "$0")/.." && pwd)/target/debug/replica-server}
-PORT=${REPLICA_E2E_PORT:-8798}
+S=${SAMSYN_E2E_DIR:-$(mktemp -d)}
+BIN=${SAMSYN_BIN:-$(cd "$(dirname "$0")/.." && pwd)/target/debug/samsyn}
+PORT=${SAMSYN_E2E_PORT:-8798}
 FAIL=0
 ok() { echo "ok   $1"; }
 bad() { echo "FAIL $1"; FAIL=1; }
 check() { if eval "$2"; then ok "$1"; else bad "$1"; fi }
-pkill -f "replica-server" ; sleep 0.5
+pkill -f "samsyn" ; sleep 0.5
 rm -rf "${S:?}/sdata" "${S:?}/A" "${S:?}/B" "${S:?}/C"; mkdir -p $S/A/Projects/X/sub $S/B $S/C
 ($BIN --data-dir $S/sdata serve --bind 127.0.0.1:$PORT --no-p2p > $S/share-server.log 2>&1 &); sleep 1.5
 OWNER=$(grep -o 'rp_[0-9a-f]*' $S/share-server.log | head -1)
@@ -85,13 +85,13 @@ echo "== revoke carol"; api $OWNER -X DELETE $U/api/shares/$SHARE/grants/carol -
 echo "after-revoke" >> $S/A/Projects/X/a.md; sleep 2
 check "bob still receives after carol revoke" 'grep -q after-revoke $S/B/Shared/X/a.md'
 check "carol stopped receiving" '! grep -q after-revoke $S/C/Shared/X/a.md'
-echo "== restart server, bridges reattach"; pkill -f "replica-server --data-dir"; sleep 1
+echo "== restart server, bridges reattach"; pkill -f "samsyn --data-dir"; sleep 1
 ($BIN --data-dir $S/sdata serve --bind 127.0.0.1:$PORT --no-p2p >> $S/share-server.log 2>&1 &); sleep 4
 echo "after-restart" >> $S/B/Shared/X/a.md; sleep 3
 check "edit flows after restart" 'grep -q after-restart $S/A/Projects/X/a.md'
 echo "== unmount bob (files stay)"; MID=$(api $BOB $U/api/vaults/vb/sharing | j 'print(d["mounts"][0]["id"])'); api $BOB -X DELETE $U/api/mounts/$MID -o /dev/null -w "unmount -> %{http_code}\n"
 check "bob keeps files after unmount" '[ -f $S/B/Shared/X/a.md ]'
-pkill -f "replica-server"
+pkill -f "samsyn"
 echo "== server errors:"; grep -iE " error|panick" $S/share-server.log | head -5
 if [ $FAIL = 0 ]; then echo "ALL OK ($S)"; else echo "FAILURES ($S)"; fi
 exit $FAIL

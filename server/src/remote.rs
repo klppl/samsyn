@@ -1,6 +1,6 @@
 //! Server-to-server share sync over iroh (QUIC with relay-assisted NAT traversal).
 //!
-//! The owner server accepts connections on ALPN `replica/share/1`. A mounting server opens one
+//! The owner server accepts connections on ALPN `samsyn/share/1`. A mounting server opens one
 //! connection per remote mount and, on it:
 //!
 //! * one long-lived *control* stream (first byte 0): a `Hello` with the share id and ticket
@@ -40,7 +40,7 @@ use crate::ticket::Ticket;
 use crate::vault::{DocRegistry, LiveDoc};
 use crate::ws::handle_payload;
 
-pub const ALPN: &[u8] = b"replica/share/1";
+pub const ALPN: &[u8] = b"samsyn/share/1";
 const STREAM_CONTROL: u8 = 0;
 const STREAM_BLOB: u8 = 1;
 /// Absolute backstop for authenticated y-sync frames.

@@ -2,10 +2,10 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { decodeTicket, encodeTicket } from "../src/ticket";
 
-// Issued by replica-server 0.1 (ticket v2) for share fc6634d6ac5d34e6 on a server started
+// Issued by samsyn 0.1 (ticket v2) for share fc6634d6ac5d34e6 on a server started
 // with --public-url https://sync.example.test.
 const SERVER_TICKET =
-  "replicaaiigmyzwgyztizbwmfrtkzbtgrstmbcqnrqw4qbzmfsdqyrsme2tqnjsmvtgiolbgi3dgzbwmu2dgmjwg4ytanzqgi4tiyrtgzrwkmbxmzswmojqgbsdczrxmq2dondcgu4tczlfmizgcqbsgzsdgzjvgjqtkyjtmqzgcobqmi4donlcmyydmndeheztkzlcmjrtmzrymyydentegy4demzsgnsdmm3fmzsdoodggi4tgnzrmzstaatso4abs2duoryhgorpf5zxs3tdfzsxqylnobwgkltumvzxi";
+  "samsynaiigmyzwgyztizbwmfrtkzbtgrstmbcqnrqw4qbzmfsdqyrsme2tqnjsmvtgiolbgi3dgzbwmu2dgmjwg4ytanzqgi4tiyrtgzrwkmbxmzswmojqgbsdczrxmq2dondcgu4tczlfmizgcqbsgzsdgzjvgjqtkyjtmqzgcobqmi4donlcmyydmndeheztkzlcmjrtmzrymyydentegy4demzsgnsdmm3fmzsdoodggi4tgnzrmzstaatso4abs2duoryhgorpf5zxs3tdfzsxqylnobwgkltumvzxi";
 
 test("decodes a ticket issued by the server", () => {
   const t = decodeTicket(SERVER_TICKET);
@@ -18,7 +18,7 @@ test("decodes a ticket issued by the server", () => {
   assert.deepEqual(t.addrs, []);
   assert.equal(t.url, "https://sync.example.test");
   // whitespace and case do not matter
-  assert.deepEqual(decodeTicket("  " + SERVER_TICKET.toUpperCase().replace("REPLICA", "replica") + "\n"), t);
+  assert.deepEqual(decodeTicket("  " + SERVER_TICKET.toUpperCase().replace("SAMSYN", "samsyn") + "\n"), t);
 });
 
 test("round-trips v1 and v2", () => {
@@ -38,7 +38,7 @@ test("round-trips v1 and v2", () => {
 });
 
 test("rejects garbage", () => {
-  assert.throws(() => decodeTicket("hello"), /not a replica ticket/);
-  assert.throws(() => decodeTicket("replica!!!"), /base32/);
-  assert.throws(() => decodeTicket("replicaxxxx"), /truncated|malformed|version/);
+  assert.throws(() => decodeTicket("hello"), /not a samsyn ticket/);
+  assert.throws(() => decodeTicket("samsyn!!!"), /base32/);
+  assert.throws(() => decodeTicket("samsynxxxx"), /truncated|malformed|version/);
 });

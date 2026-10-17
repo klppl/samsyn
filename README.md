@@ -1,89 +1,60 @@
-# Replica
+# Samsyn
 
 Conflict-free live sync for [Obsidian](https://obsidian.md), self-hosted.
 
-Replica is two parts:
+> **Samsyn** [ˈsamːsyːn] is a Swedish word meaning "shared view" or "common
+> understanding", the state where two people see things the same way. It's built
+> from *sam* (together, shared) and *syn* (sight, view). The name fits twice
+> over: your devices all see the same notes, and so does the friend you share a
+> vault with. It also happens to sound a lot like *sync*.
 
-- **`plugin/`** — an Obsidian plugin (TypeScript, no native code, runs on desktop, iOS and Android).
-- **`server/`** — a small Rust server that stores each vault as a CRDT document and relays changes between devices in real time. The same binary also runs as a headless client (`replica-server sync`) to keep a plain directory in sync without Obsidian.
-
-Text files (`.md`, `.txt`, …) are merged character by character with [Yjs](https://github.com/yjs/yjs) on the plugin side and [yrs](https://github.com/y-crdt/y-crdt) on the server, so two devices editing the same note at the same time converge without a conflict. Binary files (images, PDFs) are synced whole, last writer wins. Everything works offline and catches up when you reconnect.
+Run one small server on a machine you own. Every device editing the same note
+converges character by character, live, with no conflict files. Share a single
+folder with a friend and both of you edit it in real time. Works on desktop, iOS
+and Android, offline and back.
 
 > Status: early development. Not yet published to the Obsidian community plugin list.
 
+## How it compares
+
+| | Conflicts | Real-time | Self-hosted | Mobile | Share a folder | Free |
+|---|:---:|:---:|:---:|:---:|:---:|:---:|
+| **iCloud / Dropbox** | Conflicted copies | No | No | Yes | No | Yes |
+| **Obsidian Sync** | Rare | Delayed | No | Yes | No | $96/yr |
+| **Self-hosted LiveSync** | Prompts you | Yes | CouchDB | Yes | No | Yes |
+| **Syncthing** | Conflicted copies | Near | Yes | Android only | No | Yes |
+| **Samsyn** | **CRDT merge** | **Yes** | **One binary** | **iOS + Android** | **Any subfolder** | **$0** |
+
+Text merges with [Yjs](https://github.com/yjs/yjs) in the plugin and
+[yrs](https://github.com/y-crdt/y-crdt) on the server, so simultaneous edits to
+one note just merge. Binary files (images, PDFs) sync whole, last writer wins.
+
 ## Quick start
 
-### 1. Run the server
+**1. Run the server.**
 
 ```sh
 cd server
 cargo run --release -- serve
 ```
 
-On first start it creates a user named `owner` and prints a token once:
+It prints a one-time token on first start:
 
 ```
 INFO first start: created user 'owner'
 INFO   token: rp_...
 ```
 
-Data lives in `./data` by default (`--data-dir` or `REPLICA_DATA_DIR` to change). See [docs/STORAGE.md](docs/STORAGE.md) for the on-disk layout, backups and snapshots.
+That is all you need to try it on a LAN. For HTTPS (required for iOS), Docker, a
+prebuilt image, admin commands and the headless client, see
+[docs/SERVER.md](docs/SERVER.md). To run it on the public internet, see
+[docs/PUBLIC-SERVER.md](docs/PUBLIC-SERVER.md).
 
-Or with Docker:
+**2. Install the plugin.** Until it is in the community list, install it manually
+or with [BRAT](https://github.com/TfTHacker/obsidian42-brat). See
+[docs/DEVELOPMENT.md](docs/DEVELOPMENT.md) for desktop and phone instructions.
 
-```sh
-docker compose up -d
-docker compose logs server | grep token
-```
-
-Running on the public internet? Read [docs/PUBLIC-SERVER.md](docs/PUBLIC-SERVER.md). Server flags worth knowing: `--public-url` (guest tickets), `--max-user-mb` / `--max-share-mb` / `--max-doc-mb` (quotas), `--initial-token-file` (keep the first token out of logs), `--trust-proxy` (behind Caddy), `--p2p-port`/`--relay`/`--no-p2p` (server-to-server), `--tls-cert`/`--tls-key`, `--max-blob-mb`, `--snapshot-hours`. `replica-server serve --help` lists them all.
-
-Prebuilt images are published by CI (`.github/workflows`) to the
-the private tracker registry on every push to `main` and on tags:
-
-```sh
-docker pull ghcr.io/mrboatsman/samsyn:latest
-```
-
-### 1b. HTTPS (required for iOS, recommended everywhere)
-
-Obsidian on iOS runs in a secure WebKit context and refuses plain `ws://` WebSockets, so the server must be reachable over `https://` with a certificate the phone trusts. Three easy ways:
-
-**Tailscale (personal use, zero config).** Install Tailscale on the server and the phone, then:
-
-```sh
-tailscale serve --bg --https=443 http://127.0.0.1:8787
-```
-
-Server URL in the plugin: `https://<machine>.<tailnet>.ts.net`. Valid certificate, no port forwarding, works away from home.
-
-**Caddy (public hostname).** With a DNS name pointing at the server:
-
-```
-sync.example.com {
-    reverse_proxy 127.0.0.1:8787
-}
-```
-
-Caddy fetches a Let's Encrypt certificate automatically. Server URL: `https://sync.example.com`.
-
-**Built-in TLS.** If you already have a certificate (Let's Encrypt via certbot, or your own CA installed on the phone):
-
-```sh
-replica-server serve --tls-cert fullchain.pem --tls-key privkey.pem
-```
-
-Server URL: `https://host:8787`. A self-signed certificate works only if its CA is installed and trusted on the phone (Settings → General → About → Certificate Trust Settings).
-
-Desktop Obsidian accepts plain `http://` on a LAN, so you can develop without TLS and add it when you bring in a phone.
-
-### 2. Install the plugin
-
-Until it is in the community list, install it manually or with [BRAT](https://github.com/TfTHacker/obsidian42-brat). See [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md) for desktop and phone instructions.
-
-### 3. Connect
-
-Obsidian → Settings → Replica:
+**3. Connect.** Obsidian → Settings → Samsyn:
 
 | Setting    | Value                                                        |
 |------------|--------------------------------------------------------------|
@@ -91,91 +62,49 @@ Obsidian → Settings → Replica:
 | Token      | the `rp_…` token printed by the server                       |
 | Vault ID   | defaults to the vault name; use the same ID on every device  |
 
-Press **Test connection** (checks server and token), then **Reconnect**. The **Status** section at the top of the Server tab shows live state, last error and hints; on desktop the status bar shows it too. The command **Replica: Show sync status** works on every platform.
+Press **Test connection**, then **Reconnect**. Repeat on each device with the
+same server and vault ID. Easiest for a second device: Settings → Server →
+**Devices** → *Set up another device…* shows a QR code; scan it and Obsidian
+connects.
 
-Repeat on each device with the same server and vault ID. Easiest: Settings → Server → **Devices** → *Set up another device…* creates a token for that device and shows a QR code; scan it with the phone's camera and Obsidian connects (`obsidian://replica?op=setup&server=…&token=…&vid=…`). One token per device means a lost phone is one revoke. (No server of your own? You can still take part in folders others share with you: Sharing tab → *Add from ticket…*.)
+## Sharing a folder with someone else
 
-### Plugin settings between devices
+Share part of a vault, not all of it, with live editing on both sides.
 
-Settings → Replica → **Plugins** tab: tick the community plugins whose settings (`data.json`) should be the same everywhere, e.g. Iconize's icons and colours, and optionally also their files so the plugin installs itself on a new device. Per plugin, **Devices…** opens a list of every device that has synced the vault (online status, last seen) with checkboxes, or “all devices”; the selection is shared, the on/off switch is per device. Last change wins (settings are never merged line by line). A device that receives new settings gets a notice with a **Reload** button, since plugins read their settings at load time.
+1. Owner: right-click a folder or note → **Samsyn: Share…**, pick read & write or
+   read only, copy the ticket. One ticket per person so you can revoke them
+   separately.
+2. Friend: Settings → Samsyn → **Sharing** → *Add from ticket…*, paste, choose
+   where it goes, **Mount**. The files appear and stay live both ways. A QR code
+   and `obsidian://samsyn` link work too.
 
-## How it works
+The friend does not even need their own server: start yours with `--public-url`
+and the ticket lets them join directly (guest mode). Two servers sharing a folder
+connect over an encrypted [iroh](https://iroh.computer) link with no open ports.
+Full design in [docs/SHARING.md](docs/SHARING.md) and
+[docs/GUEST-MODE.md](docs/GUEST-MODE.md).
 
-The plugin caches the document and its sync bookkeeping in IndexedDB on the device (not in the vault folder), so typing costs one small write and a copied `.obsidian` never carries another device's state. See [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md#local-cache-on-the-device).
+You can also sync chosen community plugins and their settings between your own
+devices (Settings → Samsyn → **Plugins**), e.g. Iconize's icons and colours.
 
-- One Yjs document per vault, with two maps: `texts` (path → `Y.Text`) and `blobs` (path → `{hash, size, mtime}`).
-- The plugin pushes every keystroke (debounced, 150 ms by default) into the shared document and applies remote changes directly into the open editor without moving your cursor.
-- Files not open in an editor are written to disk; Obsidian's own file events feed changes back the other way.
-- On startup the plugin does a three-way reconcile (disk, shared document, last-synced hash). Genuine conflicts, for example a file edited on both sides while offline for a long time and not mergeable, keep your copy as `Note (conflict Device 2026-10-14 2130).md`.
-- The server speaks the standard [y-sync](https://github.com/yjs/y-protocols) protocol over WebSocket, persists every update to SQLite, and stores binary files content-addressed on disk.
+## Documentation
 
-## Sharing a folder or note with someone else
-
-Share part of a vault, not all of it, with live editing on both sides. The plugin stays a plain one-vault sync client; the server does the composition (see [docs/SHARING.md](docs/SHARING.md)).
-
-1. Owner: right-click a folder or note → **Replica: Share…** (or Settings → Replica → **Sharing** → *Share a folder or note…*). Pick read & write or read only, **Create share**, copy the ticket. One ticket = exactly that folder or note; issue one ticket per person so you can revoke them separately.
-2. Friend: Settings → Replica → **Sharing** → *Add from ticket…*: paste, see what it is (name, access, which server), choose where it goes (default `Shared/X`), **Mount**. The files appear and stay live in both directions. Or skip the pasting: the ticket view also shows a **QR code** and a **link** (`obsidian://replica?op=mount&ticket=…`); scanning or opening it brings up the same dialog with the ticket filled in.
-3. Reorganise inside a shared folder as you like. The shared folder itself is moved with **Move…** in the Sharing tab; dragging it in the file explorer, or dragging notes out of or into it, is reverted with a notice, because that would delete or expose files for the other people. While both edit, each sees the other's presence inside the shared folder. Revoke a ticket, or unshare, at any time; the friend is told in their Sharing tab and keeps their copy as ordinary notes.
-
-The other person does not even need a server: start yours with `--public-url https://your.server` and the ticket lets them join straight from the plugin or with `replica-server sync --ticket … --dir …` (guest mode, see [docs/SHARING.md](docs/SHARING.md#guests-no-server-of-their-own)).
-
-The two users can be on the same server or on different ones. Between servers the share travels over an encrypted [iroh](https://iroh.computer) connection: no open ports, no public address, NAT traversal through a relay (public n0 relays by default, `--relay <url>` for your own, `--relay none` for LAN only). The ticket carries the owner server's node id and addresses; the friend's server verifies the ticket with the owner before mounting, then keeps a local replica in sync. `--p2p-port` (UDP, default 8788) is worth keeping fixed; forwarding it is optional. `--no-p2p` turns all of this off.
-
-## Headless client (no Obsidian)
-
-The same binary can keep a plain directory in sync with a vault, for servers, scripts, CI, or anything that reads and writes Markdown without Obsidian:
-
-```sh
-replica-server sync --server https://sync.example.com --token rp_... --vault notes --dir /srv/notes
-```
-
-- Watches the directory; a file save is pushed within ~300 ms and merged like an editor edit. Concurrent edits to different parts of the same file merge; overlapping edits keep a `(conflict …)` copy.
-- Remote changes are written to disk; removed files go to `<dir>/.replica/trash/` instead of being deleted.
-- Works offline and catches up on reconnect. Bookkeeping lives in `<dir>/.replica/` (do not copy that folder to another machine).
-- `--once` connects, syncs, and exits when idle. Good for cron or a deploy step.
-- Same mass-delete guard as the plugin: removing most of the vault from the directory is held back unless `--allow-mass-delete` is set.
-- Folders mounted read-only from someone else's share are respected: edits there are not sent, the server's version is put back, new files move to `<mount> (read-only copy)/`, and the files are marked read-only on disk.
-- Shared folders (your shares, mounts) are protected like in the plugin: moving them on disk, or moving files out of or into them, is undone with a warning in the log; use the plugin's Move… to relocate a mount.
-- Guest mode, no account needed: `replica-server sync --ticket <ticket> --dir /srv/x` syncs one shared folder straight from the owner's server (the ticket must come from a server started with `--public-url`). A revoked ticket makes the client exit.
-
-All flags can be environment variables (`REPLICA_SERVER`, `REPLICA_TOKEN`, `REPLICA_VAULT`, `REPLICA_DIR`). A systemd unit:
-
-```ini
-[Unit]
-Description=Replica sync for /srv/notes
-After=network-online.target
-
-[Service]
-Environment=REPLICA_SERVER=https://sync.example.com
-Environment=REPLICA_TOKEN=rp_...
-Environment=REPLICA_VAULT=notes
-Environment=REPLICA_DIR=/srv/notes
-ExecStart=/usr/local/bin/replica-server sync
-Restart=always
-
-[Install]
-WantedBy=multi-user.target
-```
-
-## Server administration
-
-```sh
-replica-server user add alice          # create a user, prints their token
-replica-server user token alice --label phone
-replica-server user list
-replica-server vault list
-replica-server snapshot                # full-state snapshot of every vault + compaction
-replica-server backup --out backup.tar.gz
-replica-server backup --out - | age -r age1... > backup.tar.gz.age
-replica-server restore --from backup.tar.gz --data-dir ./restored
-```
+| Doc | What |
+|---|---|
+| [SERVER.md](docs/SERVER.md) | Running the server, HTTPS, admin CLI, headless client |
+| [PUBLIC-SERVER.md](docs/PUBLIC-SERVER.md) | Exposing a server safely: limits, firewall, hardening |
+| [SHARING.md](docs/SHARING.md) | How folder sharing and server-to-server links work |
+| [GUEST-MODE.md](docs/GUEST-MODE.md) | Joining a share with only a ticket, no account |
+| [STORAGE.md](docs/STORAGE.md) | On-disk layout, backups, snapshots |
+| [DEVELOPMENT.md](docs/DEVELOPMENT.md) | Building the plugin and server, local cache, internals |
+| [SECURITY.md](docs/SECURITY.md) | Threat model and security process |
 
 ## Layout
 
 ```
-plugin/   Obsidian plugin (esbuild → main.js)
-server/   Rust server (axum + yrs + SQLite)
-docs/     DEVELOPMENT.md, STORAGE.md
+plugin/   Obsidian plugin (TypeScript, esbuild → main.js)
+server/   Rust server + headless client (axum + yrs + SQLite)
+docs/     documentation
 ```
 
 ## License

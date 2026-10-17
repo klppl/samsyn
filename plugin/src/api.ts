@@ -1,5 +1,5 @@
 import { requestUrl } from "obsidian";
-import { ReplicaSettings, serverUrls } from "./settings";
+import { SamsynSettings, serverUrls } from "./settings";
 
 export interface Grant {
   label: string;
@@ -46,8 +46,8 @@ export interface SharingInfo {
 }
 
 /** Thin client for the server's sharing API. Everything else in the plugin is plain y-websocket. */
-export class ReplicaApi {
-  constructor(private settings: ReplicaSettings) {}
+export class SamsynApi {
+  constructor(private settings: SamsynSettings) {}
 
   private base(): string {
     const u = serverUrls(this.settings.serverUrl);

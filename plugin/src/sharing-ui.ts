@@ -1,6 +1,6 @@
 import { Notice, Setting } from "obsidian";
-import { ReplicaApi, SharingInfo } from "./api";
-import type ReplicaPlugin from "./main";
+import { SamsynApi, SharingInfo } from "./api";
+import type SamsynPlugin from "./main";
 import { ConfirmModal, MountModal, MoveMountModal, NewTicketModal, ShareModal } from "./sharing-modals";
 
 const accessText = (a: string) => (a === "ro" ? "read only" : "read & write");
@@ -20,7 +20,7 @@ function describeStatus(status: string): string {
  * without losing what the user is looking at.
  */
 export class SharingSection {
-  private api: ReplicaApi;
+  private api: SamsynApi;
   private info: SharingInfo | null = null;
   private error: string | null = null;
   private timer: ReturnType<typeof setInterval> | null = null;
@@ -28,10 +28,10 @@ export class SharingSection {
   private showRevoked = new Set<string>();
 
   constructor(
-    private plugin: ReplicaPlugin,
+    private plugin: SamsynPlugin,
     private root: HTMLElement,
   ) {
-    this.api = new ReplicaApi(plugin.settings);
+    this.api = new SamsynApi(plugin.settings);
   }
 
   /** Poll while the tab is open so link status and revocations show up on their own. */
@@ -74,12 +74,12 @@ export class SharingSection {
     for (const m of after.mounts) {
       const old = before.mounts.find((x) => x.id === m.id);
       if (old && old.status !== m.status && m.status.startsWith("revoked")) {
-        new Notice(`Replica: access to "${m.name}" (${m.mount_path}) was revoked by the owner. Your copy stays as ordinary notes.`, 10000);
+        new Notice(`Samsyn: access to "${m.name}" (${m.mount_path}) was revoked by the owner. Your copy stays as ordinary notes.`, 10000);
       }
     }
     for (const s of after.shares) {
       const old = before.shares.find((x) => x.id === s.id);
-      if (old && s.mounted_by > old.mounted_by) new Notice(`Replica: someone mounted "${s.name}"`);
+      if (old && s.mounted_by > old.mounted_by) new Notice(`Samsyn: someone mounted "${s.name}"`);
     }
   }
 
@@ -88,7 +88,7 @@ export class SharingSection {
       await fn();
       await this.load();
     } catch (e) {
-      new Notice(`Replica: ${label} failed: ${(e as Error).message}`, 8000);
+      new Notice(`Samsyn: ${label} failed: ${(e as Error).message}`, 8000);
     }
   }
 
@@ -109,13 +109,13 @@ export class SharingSection {
       return;
     }
     if (this.error) {
-      el.createDiv({ cls: "replica-diag replica-error", text: `Cannot reach the sharing API: ${this.error}` });
+      el.createDiv({ cls: "samsyn-diag samsyn-error", text: `Cannot reach the sharing API: ${this.error}` });
       new Setting(el).addButton((b) => b.setButtonText("Retry").onClick(() => void this.load()));
       this.renderGuestMounts(el, reload);
       return;
     }
     if (!this.info) {
-      el.createDiv({ cls: "replica-diag", text: "Loading…" });
+      el.createDiv({ cls: "samsyn-diag", text: "Loading…" });
       return;
     }
     const info = this.info;
@@ -133,15 +133,15 @@ export class SharingSection {
       );
 
     if (info.shares.length === 0) {
-      el.createDiv({ cls: "replica-empty", text: "Nothing shared yet. Right-click a folder or note and choose “Replica: Share…”, or use the button above." });
+      el.createDiv({ cls: "samsyn-empty", text: "Nothing shared yet. Right-click a folder or note and choose “Samsyn: Share…”, or use the button above." });
     }
     for (const s of info.shares) {
-      const card = el.createDiv({ cls: "replica-card" });
+      const card = el.createDiv({ cls: "samsyn-card" });
       const active = s.grants.filter((g) => !g.revoked_at);
       new Setting(card)
         .setName(s.name)
         .setDesc(`${s.path} · ${active.length} active ticket${active.length === 1 ? "" : "s"} · mounted by ${s.mounted_by}`)
-        .setClass("replica-card-head")
+        .setClass("samsyn-card-head")
         .addButton((b) => b.setButtonText("New ticket…").onClick(() => new NewTicketModal(this.plugin, s, reload).open()))
         .addButton((b) =>
           b
@@ -162,7 +162,7 @@ export class SharingSection {
         const uses = g.mounted_by ? ` · mounted by ${g.mounted_by}` : "";
         const seen = g.last_seen_at ? ` · last used ${g.last_seen_at.slice(0, 16).replace("T", " ")}` : "";
         new Setting(card)
-          .setClass("replica-grant")
+          .setClass("samsyn-grant")
           .setName(`ticket “${g.label}”`)
           .setDesc(`${accessText(g.access)} · issued ${g.created_at.slice(0, 10)}${uses}${seen}`)
           .addButton((b) =>
@@ -182,8 +182,8 @@ export class SharingSection {
       if (revoked.length > 0) {
         const open = this.showRevoked.has(s.id);
         const toggle = new Setting(card)
-          .setClass("replica-grant")
-          .setClass("replica-muted")
+          .setClass("samsyn-grant")
+          .setClass("samsyn-muted")
           .setName(`${revoked.length} revoked ticket${revoked.length === 1 ? "" : "s"}`)
           .addButton((b) =>
             b.setButtonText(open ? "Hide" : "Show").onClick(() => {
@@ -202,8 +202,8 @@ export class SharingSection {
           );
           for (const g of revoked) {
             new Setting(card)
-              .setClass("replica-grant")
-              .setClass("replica-revoked")
+              .setClass("samsyn-grant")
+              .setClass("samsyn-revoked")
               .setName(`ticket “${g.label}”`)
               .setDesc(`${accessText(g.access)} · revoked ${g.revoked_at!.slice(0, 10)}`)
               .addButton((b) =>
@@ -214,7 +214,7 @@ export class SharingSection {
                     "Restore",
                     async () => {
                       const r = await this.api.restoreTicket(s.id, g.label);
-                      new Notice(`Replica: ticket “${g.label}” restored${r.restored_mounts ? `, ${r.restored_mounts} mount(s) resumed` : ""}`);
+                      new Notice(`Samsyn: ticket “${g.label}” restored${r.restored_mounts ? `, ${r.restored_mounts} mount(s) resumed` : ""}`);
                     },
                   ),
                 ),
@@ -239,13 +239,13 @@ export class SharingSection {
           .onClick(() => new MountModal(this.plugin, reload).open()),
       );
     if (info.mounts.length === 0 && this.plugin.settings.guestMounts.length === 0) {
-      el.createDiv({ cls: "replica-empty", text: "Nothing mounted. Paste a ticket someone sent you with the button above." });
+      el.createDiv({ cls: "samsyn-empty", text: "Nothing mounted. Paste a ticket someone sent you with the button above." });
     }
     this.renderGuestCards(el);
     for (const m of info.mounts) {
       const revoked = m.status.startsWith("revoked");
-      const card = el.createDiv({ cls: "replica-card" + (revoked ? " replica-revoked" : "") });
-      const row = new Setting(card).setName(m.name).setClass("replica-card-head");
+      const card = el.createDiv({ cls: "samsyn-card" + (revoked ? " samsyn-revoked" : "") });
+      const row = new Setting(card).setName(m.name).setClass("samsyn-card-head");
       if (revoked) row.setDesc(`${m.mount_path} · access revoked by the owner · no longer syncing · your copy stays as ordinary notes`);
       else {
         row.setDesc(`${m.mount_path} · ${accessText(m.access)} · ${describeStatus(m.status)}`);
@@ -267,7 +267,7 @@ export class SharingSection {
       );
     }
 
-    el.createDiv({ cls: "replica-diag replica-muted", text: `This server's node id: ${info.node_id.slice(0, 16)}…` });
+    el.createDiv({ cls: "samsyn-diag samsyn-muted", text: `This server's node id: ${info.node_id.slice(0, 16)}…` });
   }
 
   /** "Shared with me" when there is no server of our own: guest mounts only. */
@@ -283,7 +283,7 @@ export class SharingSection {
           .onClick(() => new MountModal(this.plugin, reload).open()),
       );
     if (this.plugin.settings.guestMounts.length === 0) {
-      el.createDiv({ cls: "replica-empty", text: "Nothing mounted. Paste a ticket someone sent you with the button above." });
+      el.createDiv({ cls: "samsyn-empty", text: "Nothing mounted. Paste a ticket someone sent you with the button above." });
     }
     this.renderGuestCards(el);
   }
@@ -300,10 +300,10 @@ export class SharingSection {
             : d.status === "connecting"
               ? "connecting to the owner's server…"
               : `offline${d.lastError ? ` · ${d.lastError}` : ""}`;
-      const card = el.createDiv({ cls: "replica-card" });
+      const card = el.createDiv({ cls: "samsyn-card" });
       new Setting(card)
         .setName(m.name)
-        .setClass("replica-card-head")
+        .setClass("samsyn-card-head")
         .setDesc(`${m.mountPath} · ${accessText(m.access)} · guest of ${m.url.replace(/^https?:\/\//, "")} · ${status}`)
         .addButton((b) =>
           b.setButtonText("Move…").onClick(() =>

@@ -1,5 +1,5 @@
 [package]
-name = "replica-server-fuzz"
+name = "samsyn-server-fuzz"
 version = "0.0.0"
 publish = false
 edition = "2021"
@@ -13,7 +13,7 @@ arbitrary = { version = "1", features = ["derive"] }
 postcard = { version = "1", features = ["use-std"] }
 yrs = { version = "0.28", features = ["sync"] }
 
-[dependencies.replica-server]
+[dependencies.samsyn-server]
 path = ".."
 
 # Standalone: not a member of the server package's (non-existent) workspace.

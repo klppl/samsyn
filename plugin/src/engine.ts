@@ -6,7 +6,7 @@ import { diffText } from "./diff";
 import { hashText, sha256Hex } from "./hash";
 import { isSafeKey } from "./keys";
 import { LocalState, Persistence, StorageInfo, deviceInstallId } from "./persistence";
-import { ReplicaSettings } from "./settings";
+import { SamsynSettings } from "./settings";
 
 export interface BlobMeta {
   hash: string;
@@ -90,7 +90,7 @@ export class SyncEngine {
   readonly texts: Y.Map<Y.Text>;
   readonly blobs: Y.Map<BlobMeta>;
   /** Transactions we originate carry this origin so observers can ignore them. */
-  readonly localOrigin = { replica: "local" };
+  readonly localOrigin = { samsyn: "local" };
 
   private provider: WebsocketProvider | null = null;
   private blobClient: BlobClient | null = null;
@@ -115,7 +115,7 @@ export class SyncEngine {
 
   constructor(
     private app: App,
-    private settings: ReplicaSettings,
+    private settings: SamsynSettings,
     private persistence: Persistence,
     readonly target: EngineTarget,
     private events: EngineEvents,
@@ -194,7 +194,7 @@ export class SyncEngine {
       this.lastError = null;
     } catch (e) {
       this.lastError = `${this.target.label}: ${(e as Error).message}`;
-      console.warn("[replica]", this.lastError);
+      console.warn("[samsyn]", this.lastError);
     }
   }
 
@@ -228,7 +228,7 @@ export class SyncEngine {
       });
     } catch (e) {
       this.lastError = `WebSocket could not be created: ${(e as Error).message}`;
-      console.error("[replica]", this.lastError);
+      console.error("[samsyn]", this.lastError);
       this.setStatus("offline");
       return;
     }
@@ -243,7 +243,7 @@ export class SyncEngine {
     });
     provider.on("connection-error", (ev: Event) => {
       this.lastError = `WebSocket error (${ev?.type ?? "error"}) connecting to ${this.wsUrl}`;
-      console.warn("[replica]", this.lastError, ev);
+      console.warn("[samsyn]", this.lastError, ev);
       this.setStatus("offline");
     });
     provider.on("connection-close", (ev: CloseEvent | null) => {
@@ -411,9 +411,9 @@ export class SyncEngine {
     if (!this.target.readOnly) return false;
     if (!this.warnedReadOnly) {
       this.warnedReadOnly = true;
-      new Notice(`Replica: ${this.target.label} is read-only. Your edits under ${this.target.root} are not sent and will be overwritten by the shared version.`, 10_000);
+      new Notice(`Samsyn: ${this.target.label} is read-only. Your edits under ${this.target.root} are not sent and will be overwritten by the shared version.`, 10_000);
     }
-    console.info(`[replica] read-only ${this.target.label}: not pushing ${key}`);
+    console.info(`[samsyn] read-only ${this.target.label}: not pushing ${key}`);
     return true;
   }
 
@@ -504,7 +504,7 @@ export class SyncEngine {
     await this.ensureFolder(cp);
     if (typeof content === "string") await this.app.vault.create(cp, content);
     else await this.app.vault.createBinary(cp, content);
-    new Notice(`Replica: conflict on ${this.pathOf(key)}, kept your version as ${cp.split("/").pop()}`);
+    new Notice(`Samsyn: conflict on ${this.pathOf(key)}, kept your version as ${cp.split("/").pop()}`);
   }
 
   /** Editors currently showing a file, so remote changes can be applied without losing the cursor. */
@@ -552,7 +552,7 @@ export class SyncEngine {
       try {
         await this.blobClient.upload(hash, data);
       } catch (e) {
-        console.warn(`[replica] upload of ${this.pathOf(key)} failed, will retry on next change`, e);
+        console.warn(`[samsyn] upload of ${this.pathOf(key)} failed, will retry on next change`, e);
         return;
       }
     }
@@ -656,14 +656,14 @@ export class SyncEngine {
           return;
         }
       } catch (e) {
-        console.warn(`[replica] download of ${this.pathOf(key)} failed`, e);
+        console.warn(`[samsyn] download of ${this.pathOf(key)} failed`, e);
         return;
       }
       if (attempt >= delays.length) {
-        console.warn(`[replica] blob for ${this.pathOf(key)} never appeared on server, giving up`);
+        console.warn(`[samsyn] blob for ${this.pathOf(key)} never appeared on server, giving up`);
         return;
       }
-      console.warn(`[replica] blob for ${this.pathOf(key)} not on server yet, retrying in ${delays[attempt] / 1000}s`);
+      console.warn(`[samsyn] blob for ${this.pathOf(key)} not on server yet, retrying in ${delays[attempt] / 1000}s`);
       await new Promise((r) => setTimeout(r, delays[attempt]));
       if (this.blobs.get(key)?.hash !== meta.hash) return; // superseded or removed meanwhile
     }
@@ -843,7 +843,7 @@ export class SyncEngine {
         if (this.isText(key)) await this.reconcileText(key, file);
         else await this.reconcileBlob(key, file);
       } catch (e) {
-        console.error(`[replica] reconcile failed for ${this.pathOf(key)}`, e);
+        console.error(`[samsyn] reconcile failed for ${this.pathOf(key)}`, e);
       }
     }
 
@@ -873,11 +873,11 @@ export class SyncEngine {
     const massDelete = toDelete.length >= MASS_DELETE_MIN && toDelete.length > total * MASS_DELETE_RATIO;
     if (massDelete && !opts.allowMassDelete) {
       this.pendingDeletions = toDelete;
-      console.warn(`[replica] refusing to delete ${toDelete.length} of ${total} shared files; held back`, toDelete);
+      console.warn(`[samsyn] refusing to delete ${toDelete.length} of ${total} shared files; held back`, toDelete);
       new Notice(
-        `Replica: ${toDelete.length} files are missing here but exist in ${this.target.label}. ` +
+        `Samsyn: ${toDelete.length} files are missing here but exist in ${this.target.label}. ` +
           `Not deleting them for safety. They will be re-downloaded on next reconcile, or run ` +
-          `"Replica: Apply held-back deletions" if you really removed them.`,
+          `"Samsyn: Apply held-back deletions" if you really removed them.`,
         15_000,
       );
       // Bring them back locally instead, so this device matches the shared vault.

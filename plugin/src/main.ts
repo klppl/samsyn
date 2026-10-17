@@ -1,18 +1,18 @@
 import { Notice, Platform, Plugin, TAbstractFile, TFolder, setIcon } from "obsidian";
-import { ReplicaApi, SharingInfo, guestSession } from "./api";
+import { SamsynApi, SharingInfo, guestSession } from "./api";
 import { SetupConfirmModal } from "./device-modals";
 import { ConfigSync } from "./config-sync";
 import { BlobClient } from "./blobs";
 import { SyncEngine, EngineStatus, EngineTarget } from "./engine";
 import { Persistence, deviceInstallId } from "./persistence";
 import { MountModal, ShareModal } from "./sharing-modals";
-import { DEFAULT_SETTINGS, GuestMount, ReplicaSettingTab, ReplicaSettings, randomSuffix, serverUrls, slugify } from "./settings";
+import { DEFAULT_SETTINGS, GuestMount, SamsynSettingTab, SamsynSettings, randomSuffix, serverUrls, slugify } from "./settings";
 
-export default class ReplicaPlugin extends Plugin {
-  settings!: ReplicaSettings;
+export default class SamsynPlugin extends Plugin {
+  settings!: SamsynSettings;
   /** Running engines: "home" (own server, whole vault) plus one per enabled guest mount. */
   engines = new Map<string, SyncEngine>();
-  settingTab: ReplicaSettingTab | null = null;
+  settingTab: SamsynSettingTab | null = null;
   /** Plugin-settings sync, alive while the home engine runs. */
   configSync: ConfigSync | null = null;
   private statusEl!: HTMLElement;
@@ -34,7 +34,7 @@ export default class ReplicaPlugin extends Plugin {
     await this.loadSettings();
 
     this.statusEl = this.addStatusBarItem();
-    this.statusEl.addClass("replica-status");
+    this.statusEl.addClass("samsyn-status");
     this.statusEl.onClickEvent(() => {
       // @ts-expect-error setting API is not typed but exists on all platforms
       this.app.setting.open();
@@ -43,7 +43,7 @@ export default class ReplicaPlugin extends Plugin {
     });
     this.renderStatus("offline", 0);
 
-    this.settingTab = new ReplicaSettingTab(this.app, this);
+    this.settingTab = new SamsynSettingTab(this.app, this);
     this.addSettingTab(this.settingTab);
 
     this.addCommand({
@@ -82,7 +82,7 @@ export default class ReplicaPlugin extends Plugin {
       name: "Reconcile all files now",
       callback: async () => {
         await this.engine?.reconcileAll();
-        new Notice("Replica: reconcile finished");
+        new Notice("Samsyn: reconcile finished");
       },
     });
     this.addCommand({
@@ -91,7 +91,7 @@ export default class ReplicaPlugin extends Plugin {
       callback: async () => {
         const n = this.engine?.pendingDeletions.length ?? 0;
         if (!this.engine || n === 0) {
-          new Notice("Replica: nothing held back");
+          new Notice("Samsyn: nothing held back");
           return;
         }
         // The guard re-downloaded them; remove locally again first so reconcile sees them missing.
@@ -100,7 +100,7 @@ export default class ReplicaPlugin extends Plugin {
           if (f) await this.app.fileManager.trashFile(f);
         }
         await this.engine.reconcileAll({ allowMassDelete: true });
-        new Notice(`Replica: removed ${n} files from the shared vault`);
+        new Notice(`Samsyn: removed ${n} files from the shared vault`);
       },
     });
     this.addCommand({
@@ -109,7 +109,7 @@ export default class ReplicaPlugin extends Plugin {
       callback: () => {
         const diags = [...this.engines.values()].map((e) => e.getDiagnostics());
         if (diags.length === 0) {
-          new Notice("Replica: not running");
+          new Notice("Samsyn: not running");
           return;
         }
         const lines: string[] = [];
@@ -129,7 +129,7 @@ export default class ReplicaPlugin extends Plugin {
         this.settings.enabled = !this.settings.enabled;
         await this.saveSettings();
         await this.restartEngine();
-        new Notice(`Replica: sync ${this.settings.enabled ? "enabled" : "disabled"}`);
+        new Notice(`Samsyn: sync ${this.settings.enabled ? "enabled" : "disabled"}`);
       },
     });
 
@@ -139,24 +139,24 @@ export default class ReplicaPlugin extends Plugin {
         if (this.settings.guestMounts.some((m) => file.path === m.mountPath || file.path.startsWith(m.mountPath + "/"))) return;
         menu.addItem((item) =>
           item
-            .setTitle("Replica: Share…")
+            .setTitle("Samsyn: Share…")
             .setIcon("share-2")
             .onClick(() => new ShareModal(this, file.path).open()),
         );
       }),
     );
 
-    // Deep links: obsidian://replica?op=mount&ticket=…  and  obsidian://replica?op=setup&server=…&token=…&vault=…
-    this.registerObsidianProtocolHandler("replica", (params) => {
+    // Deep links: obsidian://samsyn?op=mount&ticket=…  and  obsidian://samsyn?op=setup&server=…&token=…&vault=…
+    this.registerObsidianProtocolHandler("samsyn", (params) => {
       const op = params.op ?? (params.ticket ? "mount" : params.server ? "setup" : "");
-      console.info("[replica] deep link", op, Object.keys(params));
+      console.info("[samsyn] deep link", op, Object.keys(params));
       if (op === "mount" && params.ticket) {
         new MountModal(this, () => this.settingTab?.show("sharing"), params.ticket).open();
       } else if (op === "setup" && params.server && params.token) {
         // `vault` never arrives here (Obsidian consumes it); the vault id is `vid`.
         new SetupConfirmModal(this, { server: params.server, token: params.token, vault: params.vid || params.vault || slugify(this.app.vault.getName()), user: params.user }).open();
       } else {
-        new Notice("Replica: this link is not understood (expected op=mount with a ticket, or op=setup with server and token).", 8000);
+        new Notice("Samsyn: this link is not understood (expected op=mount with a ticket, or op=setup with server and token).", 8000);
       }
     });
 
@@ -174,11 +174,11 @@ export default class ReplicaPlugin extends Plugin {
     const roots: SharedRoot[] = this.settings.guestMounts.map((m) => ({ kind: "guest", id: m.id, name: m.name, path: m.mountPath, isFile: false }));
     if (this.settings.serverUrl && this.settings.token) {
       try {
-        const data = info ?? (await new ReplicaApi(this.settings).sharing());
+        const data = info ?? (await new SamsynApi(this.settings).sharing());
         for (const s of data.shares) roots.push({ kind: "share", id: s.id, name: s.name, path: s.path, isFile: s.only_file !== null });
         for (const m of data.mounts) if (!m.status.startsWith("revoked")) roots.push({ kind: "mount", id: m.id, name: m.name, path: m.mount_path, isFile: false });
       } catch (e) {
-        console.warn("[replica] could not load shared roots", e);
+        console.warn("[samsyn] could not load shared roots", e);
       }
     }
     this.roots = roots;
@@ -226,7 +226,7 @@ export default class ReplicaPlugin extends Plugin {
       await this.app.fileManager.renameFile(f, oldPath);
       return true;
     } catch (e) {
-      console.error("[replica] moving back failed", e);
+      console.error("[samsyn] moving back failed", e);
       return false;
     } finally {
       setTimeout(() => this.ownRenames.delete(key), 5000);
@@ -257,10 +257,10 @@ export default class ReplicaPlugin extends Plugin {
           }
         }
         if (failures.length > 0) {
-          new Notice(`Replica: could not move ${movedRoots.map((r) => `“${r.name}”`).join(", ")} (${failures.join("; ")}). Moving it back.`, 12_000);
+          new Notice(`Samsyn: could not move ${movedRoots.map((r) => `“${r.name}”`).join(", ")} (${failures.join("; ")}). Moving it back.`, 12_000);
           await this.revert(f, oldPath);
         } else {
-          new Notice(`Replica: ${movedRoots.map((r) => `“${r.name}”`).join(", ")} moved; still shared.`, 6000);
+          new Notice(`Samsyn: ${movedRoots.map((r) => `“${r.name}”`).join(", ")} moved; still shared.`, 6000);
         }
         await this.refreshSharingRoots();
         return;
@@ -269,8 +269,8 @@ export default class ReplicaPlugin extends Plugin {
       const names = movedRoots.map((r) => `“${r.name}”`).join(", ");
       new Notice(
         ok
-          ? `Replica: ${names} is shared with other people and cannot be moved here. Use Settings → Replica → Sharing → Move… to move it.`
-          : `Replica: ${names} is shared with other people and must not be moved; moving it back failed. Move “${newPath}” back to “${oldPath}” by hand.`,
+          ? `Samsyn: ${names} is shared with other people and cannot be moved here. Use Settings → Samsyn → Sharing → Move… to move it.`
+          : `Samsyn: ${names} is shared with other people and must not be moved; moving it back failed. Move “${newPath}” back to “${oldPath}” by hand.`,
         ok ? 10_000 : 0,
       );
       return;
@@ -289,8 +289,8 @@ export default class ReplicaPlugin extends Plugin {
     else why = `cannot be moved from “${from!.name}” to “${to!.name}” this way, since both are shared with other people`;
     new Notice(
       ok
-        ? `Replica: the ${what} “${name}” ${why}. Moved it back. Copy it instead if you want it in both places.`
-        : `Replica: the ${what} “${name}” ${why}; moving it back failed. Move it back by hand.`,
+        ? `Samsyn: the ${what} “${name}” ${why}. Moved it back. Copy it instead if you want it in both places.`
+        : `Samsyn: the ${what} “${name}” ${why}; moving it back failed. Move it back by hand.`,
       ok ? 10_000 : 0,
     );
   }
@@ -306,7 +306,7 @@ export default class ReplicaPlugin extends Plugin {
       await this.restartEngine();
       return;
     }
-    const api = new ReplicaApi(this.settings);
+    const api = new SamsynApi(this.settings);
     if (r.kind === "mount") await api.moveMount(r.id, target);
     else await api.moveShare(r.id, target);
   }
@@ -396,8 +396,8 @@ export default class ReplicaPlugin extends Plugin {
     try {
       await engine.start();
     } catch (e) {
-      console.error(`[replica] ${target.label} failed to start`, e);
-      new Notice(`Replica: ${target.label} failed to start (${(e as Error).message})`);
+      console.error(`[samsyn] ${target.label} failed to start`, e);
+      new Notice(`Samsyn: ${target.label} failed to start (${(e as Error).message})`);
       this.renderAggregateStatus();
     }
   }
@@ -411,7 +411,7 @@ export default class ReplicaPlugin extends Plugin {
     const guests = this.settings.guestMounts.filter((m) => m.enabled);
     if (!home && guests.length === 0) {
       this.renderStatus("disabled", 0);
-      new Notice("Replica: set a server URL in settings, or add a shared folder from a ticket, to start syncing");
+      new Notice("Samsyn: set a server URL in settings, or add a shared folder from a ticket, to start syncing");
       return;
     }
     await this.refreshSharingRoots();
@@ -500,7 +500,7 @@ export default class ReplicaPlugin extends Plugin {
   // ------------------------------------------------------------- settings
 
   async loadSettings(): Promise<void> {
-    this.settings = Object.assign({}, DEFAULT_SETTINGS, (await this.loadData()) as Partial<ReplicaSettings>);
+    this.settings = Object.assign({}, DEFAULT_SETTINGS, (await this.loadData()) as Partial<SamsynSettings>);
     let dirty = false;
     if (!this.settings.vaultId) {
       this.settings.vaultId = slugify(this.app.vault.getName());
@@ -522,33 +522,33 @@ export default class ReplicaPlugin extends Plugin {
   private renderStatus(status: EngineStatus, peers: number): void {
     const el = this.statusEl;
     el.empty();
-    const icon = el.createSpan({ cls: "replica-status-icon" });
-    const label = el.createSpan({ cls: "replica-status-label" });
+    const icon = el.createSpan({ cls: "samsyn-status-icon" });
+    const label = el.createSpan({ cls: "samsyn-status-label" });
     el.removeClass("is-connected", "is-offline", "is-connecting", "is-disabled");
     switch (status) {
       case "connected":
         setIcon(icon, "refresh-cw");
-        label.setText(peers > 0 ? `Replica · ${peers} other${peers === 1 ? "" : "s"}` : "Replica");
+        label.setText(peers > 0 ? `Samsyn · ${peers} other${peers === 1 ? "" : "s"}` : "Samsyn");
         el.addClass("is-connected");
-        el.setAttr("aria-label", "Replica: connected and live");
+        el.setAttr("aria-label", "Samsyn: connected and live");
         break;
       case "connecting":
         setIcon(icon, "loader");
-        label.setText("Replica…");
+        label.setText("Samsyn…");
         el.addClass("is-connecting");
-        el.setAttr("aria-label", "Replica: connecting");
+        el.setAttr("aria-label", "Samsyn: connecting");
         break;
       case "offline":
         setIcon(icon, "cloud-off");
-        label.setText("Replica offline");
+        label.setText("Samsyn offline");
         el.addClass("is-offline");
-        el.setAttr("aria-label", "Replica: offline, changes are queued locally");
+        el.setAttr("aria-label", "Samsyn: offline, changes are queued locally");
         break;
       case "disabled":
         setIcon(icon, "pause");
-        label.setText("Replica off");
+        label.setText("Samsyn off");
         el.addClass("is-disabled");
-        el.setAttr("aria-label", "Replica: sync disabled or not configured");
+        el.setAttr("aria-label", "Samsyn: sync disabled or not configured");
         break;
     }
   }

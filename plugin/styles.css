@@ -1,93 +1,93 @@
-.replica-status {
+.samsyn-status {
   display: inline-flex;
   align-items: center;
   gap: 4px;
   cursor: pointer;
 }
-.replica-status-icon svg {
+.samsyn-status-icon svg {
   width: 14px;
   height: 14px;
 }
-.replica-status.is-connected .replica-status-icon {
+.samsyn-status.is-connected .samsyn-status-icon {
   color: var(--color-green);
 }
-.replica-status.is-offline .replica-status-icon {
+.samsyn-status.is-offline .samsyn-status-icon {
   color: var(--color-red);
 }
-.replica-status.is-connecting .replica-status-icon {
+.samsyn-status.is-connecting .samsyn-status-icon {
   color: var(--color-yellow);
 }
-.replica-status.is-disabled {
+.samsyn-status.is-disabled {
   opacity: 0.6;
 }
 
-.replica-diag {
+.samsyn-diag {
   padding: 8px 0 12px;
   font-size: var(--font-ui-small);
 }
-.replica-diag-row {
+.samsyn-diag-row {
   display: flex;
   gap: 12px;
   padding: 2px 0;
 }
-.replica-diag-label {
+.samsyn-diag-label {
   min-width: 120px;
   color: var(--text-muted);
 }
-.replica-diag-value {
+.samsyn-diag-value {
   word-break: break-all;
 }
-.replica-diag-value.is-ok {
+.samsyn-diag-value.is-ok {
   color: var(--color-green);
 }
-.replica-diag-value.is-bad {
+.samsyn-diag-value.is-bad {
   color: var(--color-red);
 }
-.replica-diag-value.is-warn {
+.samsyn-diag-value.is-warn {
   color: var(--color-orange);
 }
 
-.replica-ticket {
+.samsyn-ticket {
   border: 1px solid var(--background-modifier-border);
   border-radius: 6px;
   padding: 8px 12px;
   margin: 8px 0 12px;
 }
-.replica-ticket-label {
+.samsyn-ticket-label {
   font-size: var(--font-ui-small);
   color: var(--text-muted);
   margin-bottom: 4px;
 }
-.replica-ticket-text {
+.samsyn-ticket-text {
   width: 100%;
   font-family: var(--font-monospace);
   font-size: var(--font-ui-smaller);
   word-break: break-all;
 }
-.replica-wide input,
-.replica-wide {
+.samsyn-wide input,
+.samsyn-wide {
   min-width: 220px;
 }
-.replica-grant {
+.samsyn-grant {
   padding-left: 24px;
   border-top: none;
 }
-.replica-muted {
+.samsyn-muted {
   color: var(--text-faint);
 }
 
-.replica-revoked .setting-item-name {
+.samsyn-revoked .setting-item-name {
   color: var(--text-error);
 }
 
 /* Settings tabs */
-.replica-tabs {
+.samsyn-tabs {
   display: flex;
   gap: 4px;
   border-bottom: 1px solid var(--background-modifier-border);
   margin-bottom: 12px;
 }
-.replica-tab {
+.samsyn-tab {
   background: none;
   box-shadow: none;
   border: none;
@@ -97,46 +97,46 @@
   color: var(--text-muted);
   cursor: pointer;
 }
-.replica-tab.is-active {
+.samsyn-tab.is-active {
   color: var(--text-normal);
   border-bottom-color: var(--interactive-accent);
 }
-.replica-tab:hover {
+.samsyn-tab:hover {
   color: var(--text-normal);
 }
 
 /* Sharing cards */
-.replica-card {
+.samsyn-card {
   border: 1px solid var(--background-modifier-border);
   border-radius: 8px;
   padding: 4px 12px;
   margin: 8px 0;
 }
-.replica-card .setting-item {
+.samsyn-card .setting-item {
   border-top: none;
 }
-.replica-card-head .setting-item-name {
+.samsyn-card-head .setting-item-name {
   font-weight: 600;
 }
-.replica-empty {
+.samsyn-empty {
   color: var(--text-muted);
   font-size: var(--font-ui-small);
   padding: 8px 0 12px;
 }
-.replica-error:not(:empty) {
+.samsyn-error:not(:empty) {
   color: var(--text-error);
   font-size: var(--font-ui-small);
   padding: 4px 0;
 }
-.replica-modal .setting-item {
+.samsyn-modal .setting-item {
   border-top: none;
   padding: 8px 0;
 }
-.replica-modal textarea.replica-ticket-text {
+.samsyn-modal textarea.samsyn-ticket-text {
   width: 100%;
   margin: 4px 0 8px;
 }
-.replica-ticket-info:not(:empty) {
+.samsyn-ticket-info:not(:empty) {
   border: 1px solid var(--background-modifier-border);
   border-radius: 6px;
   padding: 8px 12px;
@@ -145,22 +145,22 @@
 }
 
 /* QR codes */
-.replica-qr {
+.samsyn-qr {
   margin: 12px 0 4px;
   text-align: center;
 }
-.replica-qr-image svg {
+.samsyn-qr-image svg {
   width: min(260px, 80vw);
   height: auto;
   background: white;
   padding: 8px;
   border-radius: 8px;
 }
-.replica-small {
+.samsyn-small {
   font-size: var(--font-ui-smaller);
 }
 
-.replica-online .setting-item-name::before {
+.samsyn-online .setting-item-name::before {
   content: "● ";
   color: var(--color-green);
 }

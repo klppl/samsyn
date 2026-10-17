@@ -65,7 +65,7 @@ impl LiveDoc {
             let label = label.clone();
             let approx = approx_bytes.clone();
             let active = last_active.clone();
-            doc.observe_update_v1("replica", move |_txn, event| {
+            doc.observe_update_v1("samsyn", move |_txn, event| {
                 if let Err(e) = store.append_update(&event.update) {
                     tracing::error!(doc = %label, "failed to persist update: {e}");
                 }
@@ -80,7 +80,7 @@ impl LiveDoc {
         let blobs = doc.get_or_insert_map("blobs");
         {
             let changes = changes.clone();
-            texts.observe_deep("replica-bridge", move |txn, events| {
+            texts.observe_deep("samsyn-bridge", move |txn, events| {
                 let from = origin_source(txn.origin());
                 let mut out = changes.lock();
                 let mut handled: Vec<String> = Vec::new();
@@ -132,7 +132,7 @@ impl LiveDoc {
         }
         {
             let changes = changes.clone();
-            blobs.observe("replica-bridge", move |txn, ev| {
+            blobs.observe("samsyn-bridge", move |txn, ev| {
                 let from = origin_source(txn.origin());
                 let mut out = changes.lock();
                 for (k, ch) in ev.keys(txn) {
@@ -150,7 +150,7 @@ impl LiveDoc {
         {
             let tx = tx.clone();
             let doc_id = id.clone();
-            awareness.on_update("replica", move |aw, event, _origin| {
+            awareness.on_update("samsyn", move |aw, event, _origin| {
                 if let Ok(update) = aw.update_with_clients(event.all_changes()) {
                     if let Some(p) = &presence {
                         let _ = p.send((doc_id.clone(), update.clone()));
@@ -442,7 +442,7 @@ impl DocRegistry {
         Ok(())
     }
 
-    /// Replica document for a remote mount, keyed by mount id in the share map.
+    /// Samsyn document for a remote mount, keyed by mount id in the share map.
     fn load_remote_replica(&self, mount: &MountInfo) -> anyhow::Result<Arc<LiveDoc>> {
         let existing = self.shares.lock().get(&mount.id).cloned();
         if let Some(s) = existing {

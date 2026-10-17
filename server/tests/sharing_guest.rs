@@ -131,7 +131,7 @@ fn guests_join_with_tickets_only() {
 /// Pull the secret out of a ticket the way the plugin does (base32, postcard: version byte, then
 /// length-prefixed strings share_id, name, node_id, secret).
 fn ticket_secret(ticket: &str) -> String {
-    let body = ticket.trim().strip_prefix("replica").unwrap().to_ascii_uppercase();
+    let body = ticket.trim().strip_prefix("samsyn").unwrap().to_ascii_uppercase();
     let bytes = data_encoding::BASE32_NOPAD.decode(body.as_bytes()).unwrap();
     let mut pos = 1;
     let mut read_str = || {

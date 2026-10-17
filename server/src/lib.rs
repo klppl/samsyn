@@ -1,5 +1,5 @@
-//! Replica: conflict-free live sync for Obsidian vaults, with sharing between users and
-//! servers. This library holds everything the `replica-server` binary does, so the pieces can
+//! Samsyn: conflict-free live sync for Obsidian vaults, with sharing between users and
+//! servers. This library holds everything the `samsyn` binary does, so the pieces can
 //! be reused (and fuzzed) on their own:
 //!
 //! - [`ticket`], [`ids`], [`limits`]: pure, dependency-light building blocks.

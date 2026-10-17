@@ -2,7 +2,7 @@
 
 Status: phases A (server, headless guest), B (plugin) and C (sessions, per-share quota, ticket activity, public-server guide in PUBLIC-SERVER.md, deep links + QR codes) implemented. Deviations from the design below: the plugin decodes tickets locally (`src/ticket.ts`) so guest mounts need no server at all; the key mapping lives at the Obsidian boundary (`SyncEngine.keyOf`/`pathOf`) rather than as a separate `EngineScope` object; persistence is namespaced through the IndexedDB scope (`guest:<share_id>`), not file names. See SHARING.md "Guests".
 
-Goal: Bob runs a replica server that is reachable on the public internet. He shares `Projects/X` and sends Alice the ticket. Alice installs the Replica plugin, pastes the ticket, picks a local folder — and is in the live sync. She has no replica server, no account on Bob's server, and nothing outside that folder ever syncs anywhere. Many-to-many: a share can have any number of guests, and one vault can carry any number of guest mounts from different servers, alongside (or instead of) its own home-server sync.
+Goal: Bob runs a Samsyn server that is reachable on the public internet. He shares `Projects/X` and sends Alice the ticket. Alice installs the Samsyn plugin, pastes the ticket, picks a local folder — and is in the live sync. She has no Samsyn server, no account on Bob's server, and nothing outside that folder ever syncs anywhere. Many-to-many: a share can have any number of guests, and one vault can carry any number of guest mounts from different servers, alongside (or instead of) its own home-server sync.
 
 ## The idea
 
@@ -26,7 +26,7 @@ A guest client is a plain WebSocket — it cannot dial an iroh node id. The tick
 
 - `TicketV2 = TicketV1 + url: String` (e.g. `https://sync.bob.example`). Empty = owner's server has no public URL; ticket works for server mounts only.
 - Postcard is not self-describing, so this is a version bump: decode dispatches on the leading version byte and accepts v1 and v2. New tickets are always v2.
-- The server learns its URL from `--public-url` / `REPLICA_PUBLIC_URL`. When unset, share creation still works; the UI notes that guests cannot use the ticket.
+- The server learns its URL from `--public-url` / `SAMSYN_PUBLIC_URL`. When unset, share creation still works; the UI notes that guests cannot use the ticket.
 
 ## Server
 
@@ -49,7 +49,7 @@ Implementation notes:
 
 ## Headless guest
 
-`replica-server sync --ticket <ticket> --dir /path` — the headless client in guest mode, same mapping as the plugin. Comes almost free once the guest WS exists (the client already speaks y-sync + blobs), and is the natural integration-test harness: two headless guests + one owner exercise the whole feature without Obsidian.
+`samsyn sync --ticket <ticket> --dir /path` — the headless client in guest mode, same mapping as the plugin. Comes almost free once the guest WS exists (the client already speaks y-sync + blobs), and is the natural integration-test harness: two headless guests + one owner exercise the whole feature without Obsidian.
 
 ## Plugin
 

@@ -5,8 +5,8 @@ use std::collections::HashSet;
 use std::time::Duration;
 
 use libfuzzer_sys::fuzz_target;
-use replica_server::limits::RequestBudget;
-use replica_server::ws::{handle_payload, PayloadLimits};
+use samsyn_server::limits::RequestBudget;
+use samsyn_server::ws::{handle_payload, PayloadLimits};
 use yrs::sync::{Awareness, DefaultProtocol};
 use yrs::Doc;
 

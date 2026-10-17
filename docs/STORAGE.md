@@ -68,38 +68,38 @@ History: v1 replaced the empty, reserved `mounts` table from the first scaffold 
 A snapshot is the entire document as one `.ybin` file plus a JSON manifest listing which blob hashes it references. They are:
 
 - taken automatically for every loaded vault every `--snapshot-hours` (default 24) and on graceful shutdown, keeping the newest `--snapshot-keep` (default 14);
-- taken on demand with `replica-server snapshot [user/vault]`;
+- taken on demand with `samsyn snapshot [user/vault]`;
 - plain files, so any file-level backup tool (restic, borg, rsync, Time Machine) picks them up without caring about SQLite.
 
 Roll a vault back with:
 
 ```sh
-replica-server restore-snapshot owner/notes path/to/2026-10-14T18-16-11Z.ybin --yes
+samsyn restore-snapshot owner/notes path/to/2026-10-14T18-16-11Z.ybin --yes
 ```
 
 A safety snapshot of the current state is written first. Because Yjs merges, clients that still hold newer state will push it back after a rollback. That includes *deletions*: a device whose cached document contains "file X was deleted" will delete it again on reconnect. So a rollback is a three-step dance:
 
 1. Stop the server, `restore-snapshot … --yes`, start the server.
-2. On **every** device: Settings → Replica → **Reset local sync state** (drops the cached document; files on disk are untouched).
+2. On **every** device: Settings → Samsyn → **Reset local sync state** (drops the cached document; files on disk are untouched).
 3. Each device reconnects, downloads the restored state, and reconciles its disk against it. Files that exist on disk but not in the snapshot are pushed up again as new files.
 
 ## Backups
 
-`replica-server backup` writes a `tar.gz` that mirrors the data dir layout exactly. SQLite files go through the online backup API, so it is **safe to run while the server is serving**. Scope it with `--user` and `--vault`.
+`samsyn backup` writes a `tar.gz` that mirrors the data dir layout exactly. SQLite files go through the online backup API, so it is **safe to run while the server is serving**. Scope it with `--user` and `--vault`.
 
 Encrypt by streaming to stdout:
 
 ```sh
-replica-server backup --out - | age -r age1yourkey > replica-$(date +%F).tar.gz.age
+samsyn backup --out - | age -r age1yourkey > samsyn-$(date +%F).tar.gz.age
 # or
-replica-server backup --out - | gpg -e -r you@example.com > replica.tar.gz.gpg
+samsyn backup --out - | gpg -e -r you@example.com > samsyn.tar.gz.gpg
 ```
 
 Restore into an empty dir, or merge selected vaults into a live one:
 
 ```sh
-replica-server restore --from replica.tar.gz --data-dir /srv/replica/data
-replica-server restore --from one-vault.tar.gz --merge      # adds/overwrites vaults in the archive
+samsyn restore --from samsyn.tar.gz --data-dir /srv/samsyn/data
+samsyn restore --from one-vault.tar.gz --merge      # adds/overwrites vaults in the archive
 ```
 
 Because the archive is plain `tar`, a human can also `tar xzf` it and copy a single vault directory by hand in an emergency; `vault.json` says whose it is.

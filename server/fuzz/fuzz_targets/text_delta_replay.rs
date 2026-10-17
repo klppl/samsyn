@@ -3,7 +3,7 @@
 //! (a collaborator controls the source document); replay must never panic inside yrs.
 use arbitrary::Arbitrary;
 use libfuzzer_sys::fuzz_target;
-use replica_server::bridge::{replay_text_delta, OwnedDelta};
+use samsyn_server::bridge::{replay_text_delta, OwnedDelta};
 use yrs::{Doc, GetString, Text, Transact};
 
 #[derive(Arbitrary, Debug)]

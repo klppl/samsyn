@@ -1,9 +1,9 @@
 import { App, Notice, PluginSettingTab, Setting, requestUrl } from "obsidian";
-import type ReplicaPlugin from "./main";
+import type SamsynPlugin from "./main";
 import { SharingSection } from "./sharing-ui";
 import { DeviceSetupModal } from "./device-modals";
 import { DevicePickerModal } from "./device-picker";
-import { ReplicaApi } from "./api";
+import { SamsynApi } from "./api";
 
 /** A share mounted straight from the owner's server with a ticket (no server of our own). */
 export interface GuestMount {
@@ -19,7 +19,7 @@ export interface GuestMount {
   enabled: boolean;
 }
 
-export interface ReplicaSettings {
+export interface SamsynSettings {
   enabled: boolean;
   serverUrl: string;
   token: string;
@@ -34,7 +34,7 @@ export interface ReplicaSettings {
   configSync: { enabled: boolean };
 }
 
-export const DEFAULT_SETTINGS: ReplicaSettings = {
+export const DEFAULT_SETTINGS: SamsynSettings = {
   enabled: true,
   serverUrl: "",
   token: "",
@@ -87,14 +87,14 @@ const TABS: Array<{ id: SettingsTabName; label: string }> = [
   { id: "advanced", label: "Advanced" },
 ];
 
-export class ReplicaSettingTab extends PluginSettingTab {
+export class SamsynSettingTab extends PluginSettingTab {
   private statusTimer: ReturnType<typeof setInterval> | null = null;
   private sharing: SharingSection | null = null;
   private active: SettingsTabName = "server";
 
   constructor(
     app: App,
-    private plugin: ReplicaPlugin,
+    private plugin: SamsynPlugin,
   ) {
     super(app, plugin);
   }
@@ -124,15 +124,15 @@ export class ReplicaSettingTab extends PluginSettingTab {
     containerEl.empty();
     this.clearTimers();
 
-    const bar = containerEl.createDiv({ cls: "replica-tabs" });
+    const bar = containerEl.createDiv({ cls: "samsyn-tabs" });
     for (const t of TABS) {
-      const btn = bar.createEl("button", { text: t.label, cls: "replica-tab" + (t.id === this.active ? " is-active" : "") });
+      const btn = bar.createEl("button", { text: t.label, cls: "samsyn-tab" + (t.id === this.active ? " is-active" : "") });
       btn.onclick = () => {
         this.active = t.id;
         this.display();
       };
     }
-    const body = containerEl.createDiv({ cls: "replica-tab-body" });
+    const body = containerEl.createDiv({ cls: "samsyn-tab-body" });
     switch (this.active) {
       case "server":
         this.renderServerTab(body);
@@ -155,7 +155,7 @@ export class ReplicaSettingTab extends PluginSettingTab {
     const s = this.plugin.settings;
 
     new Setting(containerEl).setName("Status").setHeading();
-    const statusEl = containerEl.createDiv({ cls: "replica-diag" });
+    const statusEl = containerEl.createDiv({ cls: "samsyn-diag" });
     this.renderStatus(statusEl);
     this.statusTimer = setInterval(() => this.renderStatus(statusEl), 2000);
 
@@ -174,7 +174,7 @@ export class ReplicaSettingTab extends PluginSettingTab {
 
     new Setting(containerEl)
       .setName("Server URL")
-      .setDesc("Address of your replica-server, e.g. https://sync.example.com or http://192.168.1.10:8787")
+      .setDesc("Address of your samsyn, e.g. https://sync.example.com or http://192.168.1.10:8787")
       .addText((t) =>
         t
           .setPlaceholder("http://localhost:8787")
@@ -187,7 +187,7 @@ export class ReplicaSettingTab extends PluginSettingTab {
 
     new Setting(containerEl)
       .setName("Token")
-      .setDesc("Your user token (rp_…). The server prints one on first start; admins create more with `replica-server user add`.")
+      .setDesc("Your user token (rp_…). The server prints one on first start; admins create more with `samsyn user add`.")
       .addText((t) => {
         t.inputEl.type = "password";
         t.setValue(s.token).onChange(async (v) => {
@@ -223,7 +223,7 @@ export class ReplicaSettingTab extends PluginSettingTab {
         b.setButtonText("Test connection").onClick(async () => {
           const urls = serverUrls(s.serverUrl);
           if (!urls) {
-            new Notice("Replica: enter a server URL first");
+            new Notice("Samsyn: enter a server URL first");
             return;
           }
           try {
@@ -232,11 +232,11 @@ export class ReplicaSettingTab extends PluginSettingTab {
               headers: { Authorization: `Bearer ${s.token}` },
               throw: false,
             });
-            if (res.status === 200) new Notice(`Replica: server OK, token valid for user "${res.json?.user ?? "?"}"`);
-            else if (res.status === 401) new Notice("Replica: server reachable but token rejected");
-            else new Notice(`Replica: server responded ${res.status}`);
+            if (res.status === 200) new Notice(`Samsyn: server OK, token valid for user "${res.json?.user ?? "?"}"`);
+            else if (res.status === 401) new Notice("Samsyn: server reachable but token rejected");
+            else new Notice(`Samsyn: server responded ${res.status}`);
           } catch (e) {
-            new Notice(`Replica: cannot reach server (${(e as Error).message})`);
+            new Notice(`Samsyn: cannot reach server (${(e as Error).message})`);
           }
         }),
       )
@@ -246,7 +246,7 @@ export class ReplicaSettingTab extends PluginSettingTab {
           .setCta()
           .onClick(async () => {
             await this.plugin.restartEngine();
-            new Notice("Replica: reconnecting");
+            new Notice("Samsyn: reconnecting");
           }),
       );
 
@@ -297,11 +297,11 @@ export class ReplicaSettingTab extends PluginSettingTab {
   private renderConfigSync(containerEl: HTMLElement): void {
     const s = this.plugin.settings;
     containerEl.createEl("p", {
-      cls: "replica-muted",
+      cls: "samsyn-muted",
       text: "Keep chosen plugins' settings (their data.json) the same on your devices, e.g. Iconize's icons and colours. Optionally the plugin's files too, so it installs itself on a new device. Last change wins. The selection and the device list are shared between devices; the switch below is per device.",
     });
     if (!s.serverUrl || !s.token) {
-      containerEl.createDiv({ cls: "replica-empty", text: "Needs a server connection (Server tab)." });
+      containerEl.createDiv({ cls: "samsyn-empty", text: "Needs a server connection (Server tab)." });
       return;
     }
     new Setting(containerEl)
@@ -323,7 +323,7 @@ export class ReplicaSettingTab extends PluginSettingTab {
     if (!cs) {
       const d = this.plugin.engine?.getDiagnostics();
       containerEl.createDiv({
-        cls: "replica-empty",
+        cls: "samsyn-empty",
         text: d ? "Starting…" : s.enabled ? "Not connected: press Reconnect on the Server tab, then come back." : "Sync is disabled (Server tab).",
       });
       // The engine is being (re)started; try again shortly.
@@ -332,7 +332,7 @@ export class ReplicaSettingTab extends PluginSettingTab {
     }
     const known = cs.knownDevices();
     containerEl.createDiv({
-      cls: "replica-muted replica-small",
+      cls: "samsyn-muted samsyn-small",
       text: `Known devices: ${known.map((d) => `${d.info.name}${d.online ? " (online)" : ""}`).join(", ") || "none yet"}. This device is “${s.deviceName}” (rename it under Connection).`,
     });
 
@@ -340,14 +340,14 @@ export class ReplicaSettingTab extends PluginSettingTab {
     const ids = new Set<string>(Object.keys(manifests));
     for (const [id] of cs.entries()) ids.add(id);
     ids.delete(this.plugin.manifest.id);
-    if (ids.size === 0) containerEl.createDiv({ cls: "replica-empty", text: "No community plugins installed." });
+    if (ids.size === 0) containerEl.createDiv({ cls: "samsyn-empty", text: "No community plugins installed." });
     for (const id of [...ids].sort()) {
       const entry = cs.get(id);
       const name = manifests[id]?.name ?? id;
       const installed = !!manifests[id];
       const mine = entry ? cs.participating(id) : false;
       const row = new Setting(containerEl)
-        .setClass("replica-grant")
+        .setClass("samsyn-grant")
         .setName(name + (installed ? "" : " (not installed here)"))
         .setDesc(
           entry
@@ -380,27 +380,27 @@ export class ReplicaSettingTab extends PluginSettingTab {
   private async renderDevices(el: HTMLElement): Promise<void> {
     el.empty();
     try {
-      const r = await new ReplicaApi(this.plugin.settings).listTokens();
-      if (r.tokens.length === 0) el.createDiv({ cls: "replica-empty", text: "No tokens listed." });
+      const r = await new SamsynApi(this.plugin.settings).listTokens();
+      if (r.tokens.length === 0) el.createDiv({ cls: "samsyn-empty", text: "No tokens listed." });
       for (const t of r.tokens) {
         new Setting(el)
-          .setClass("replica-grant")
+          .setClass("samsyn-grant")
           .setName(`token “${t.label}”`)
           .setDesc(`issued ${t.created_at.slice(0, 10)}${t.last_used_at ? ` · last used ${t.last_used_at.slice(0, 16).replace("T", " ")}` : " · never used"}`)
           .addButton((b) =>
             b.setButtonText("Revoke").onClick(async () => {
               try {
-                await new ReplicaApi(this.plugin.settings).revokeToken(t.label);
-                new Notice(`Replica: token “${t.label}” revoked. If that was this device's token, enter a new one.`);
+                await new SamsynApi(this.plugin.settings).revokeToken(t.label);
+                new Notice(`Samsyn: token “${t.label}” revoked. If that was this device's token, enter a new one.`);
                 await this.renderDevices(el);
               } catch (e) {
-                new Notice(`Replica: ${(e as Error).message}`);
+                new Notice(`Samsyn: ${(e as Error).message}`);
               }
             }),
           );
       }
     } catch (e) {
-      el.createDiv({ cls: "replica-empty", text: `Cannot list tokens: ${(e as Error).message}` });
+      el.createDiv({ cls: "samsyn-empty", text: `Cannot list tokens: ${(e as Error).message}` });
     }
   }
 
@@ -419,9 +419,9 @@ export class ReplicaSettingTab extends PluginSettingTab {
       return;
     }
     const line = (label: string, value: string, cls?: string) => {
-      const row = el.createDiv({ cls: "replica-diag-row" });
-      row.createSpan({ cls: "replica-diag-label", text: label });
-      row.createSpan({ cls: "replica-diag-value" + (cls ? " " + cls : ""), text: value });
+      const row = el.createDiv({ cls: "samsyn-diag-row" });
+      row.createSpan({ cls: "samsyn-diag-label", text: label });
+      row.createSpan({ cls: "samsyn-diag-value" + (cls ? " " + cls : ""), text: value });
     };
     const statusText: Record<string, string> = {
       connected: "Connected, live",
@@ -456,11 +456,11 @@ export class ReplicaSettingTab extends PluginSettingTab {
   private renderSharingTab(containerEl: HTMLElement): void {
     const s = this.plugin.settings;
     containerEl.createEl("p", {
-      cls: "replica-muted",
+      cls: "samsyn-muted",
       text: "Share one folder or note, not the whole vault. The other person pastes a ticket and gets the same folder in their vault, live in both directions. Tickets can be read-only and can be revoked at any time.",
     });
     if (!s.serverUrl || !s.token) {
-      containerEl.createDiv({ cls: "replica-empty", text: "Sharing your own folders needs a server connection (Server tab). Folders others share with you can still be added below with their ticket." });
+      containerEl.createDiv({ cls: "samsyn-empty", text: "Sharing your own folders needs a server connection (Server tab). Folders others share with you can still be added below with their ticket." });
     }
     const sharingEl = containerEl.createDiv();
     const section = new SharingSection(this.plugin, sharingEl);
@@ -495,7 +495,7 @@ export class ReplicaSettingTab extends PluginSettingTab {
       .addButton((b) =>
         b.setButtonText("Reconcile now").onClick(async () => {
           await this.plugin.engine?.reconcileAll();
-          new Notice("Replica: reconcile finished");
+          new Notice("Samsyn: reconcile finished");
         }),
       );
 
@@ -508,7 +508,7 @@ export class ReplicaSettingTab extends PluginSettingTab {
           .setWarning()
           .onClick(async () => {
             await this.plugin.resetLocalState();
-            new Notice("Replica: local state reset, reconnecting");
+            new Notice("Samsyn: local state reset, reconnecting");
           }),
       );
   }

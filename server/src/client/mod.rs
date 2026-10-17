@@ -1,4 +1,4 @@
-//! Headless sync client: keeps a plain directory in sync with a vault on a replica server.
+//! Headless sync client: keeps a plain directory in sync with a vault on a Samsyn server.
 //! Same document model and reconcile rules as the Obsidian plugin, driven by a filesystem
 //! watcher instead of editor events.
 
@@ -20,24 +20,24 @@ use self::ws::WsEvent;
 #[command(name = "sync")]
 pub struct SyncArgs {
     /// Server base URL, e.g. https://sync.example.com or http://127.0.0.1:8787
-    #[arg(long, env = "REPLICA_SERVER", required_unless_present = "ticket")]
+    #[arg(long, env = "SAMSYN_SERVER", required_unless_present = "ticket")]
     pub server: Option<String>,
 
     /// User token (rp_...).
-    #[arg(long, env = "REPLICA_TOKEN", required_unless_present = "ticket")]
+    #[arg(long, env = "SAMSYN_TOKEN", required_unless_present = "ticket")]
     pub token: Option<String>,
 
     /// Vault name on the server (same "Vault ID" as in the plugin).
-    #[arg(long, env = "REPLICA_VAULT", required_unless_present = "ticket")]
+    #[arg(long, env = "SAMSYN_VAULT", required_unless_present = "ticket")]
     pub vault: Option<String>,
 
     /// Guest mode: sync one shared folder or note using a ticket instead of a server account.
     /// The ticket must come from a server started with --public-url.
-    #[arg(long, env = "REPLICA_TICKET", conflicts_with_all = ["server", "token", "vault"])]
+    #[arg(long, env = "SAMSYN_TICKET", conflicts_with_all = ["server", "token", "vault"])]
     pub ticket: Option<String>,
 
     /// Guest mode with the ticket read from a file (keeps it out of the process list).
-    #[arg(long, env = "REPLICA_TICKET_FILE", conflicts_with_all = ["server", "token", "vault", "ticket"])]
+    #[arg(long, env = "SAMSYN_TICKET_FILE", conflicts_with_all = ["server", "token", "vault", "ticket"])]
     pub ticket_file: Option<PathBuf>,
 
     /// Session id obtained from the owner's server at start (guest mode); never set by hand.
@@ -45,14 +45,14 @@ pub struct SyncArgs {
     pub session: Option<String>,
 
     /// Local directory to keep in sync.
-    #[arg(long, env = "REPLICA_DIR", default_value = ".")]
+    #[arg(long, env = "SAMSYN_DIR", default_value = ".")]
     pub dir: PathBuf,
 
     /// Comma separated extensions merged as text; everything else is a whole-file blob.
-    #[arg(long, env = "REPLICA_TEXT_EXT", default_value = "md,txt")]
+    #[arg(long, env = "SAMSYN_TEXT_EXT", default_value = "md,txt")]
     pub text_ext: String,
 
-    /// Path prefixes to skip (repeatable). Dotfiles and .replica/ are always skipped.
+    /// Path prefixes to skip (repeatable). Dotfiles and .samsyn/ are always skipped.
     #[arg(long)]
     pub exclude: Vec<String>,
 
@@ -69,7 +69,7 @@ pub struct SyncArgs {
     pub allow_mass_delete: bool,
 
     /// Name shown to other devices.
-    #[arg(long, env = "REPLICA_DEVICE")]
+    #[arg(long, env = "SAMSYN_DEVICE")]
     pub device: Option<String>,
 
     /// Sync once (connect, reconcile, flush) and exit. Handy for cron.
@@ -114,7 +114,7 @@ impl SyncArgs {
             let t = crate::ticket::Ticket::decode(&t)?;
             anyhow::ensure!(
                 !t.url.is_empty(),
-                "this ticket has no server URL (the owner's server runs without --public-url); it can only be mounted through a replica server"
+                "this ticket has no server URL (the owner's server runs without --public-url); it can only be mounted through a Samsyn server"
             );
             return Ok(Target::Guest { http: normalize_http(&t.url), share_id: t.share_id, secret: t.secret, name: t.name });
         }

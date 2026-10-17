@@ -3,10 +3,10 @@
 # (direct connection, relays disabled), headless clients standing in for plugins.
 # Usage: server/scripts/remote-e2e.sh   (needs a debug build: cargo build)
 set -u
-S=${REPLICA_E2E_DIR:-$(mktemp -d)}
-BIN=${REPLICA_BIN:-$(cd "$(dirname "$0")/.." && pwd)/target/debug/replica-server}
-PA=${REPLICA_E2E_PORT_A:-8798}; PB=${REPLICA_E2E_PORT_B:-8799}
-RELAY=${REPLICA_E2E_RELAY:-none}   # "none" = direct only, "default" = n0 public relays, or a relay URL
+S=${SAMSYN_E2E_DIR:-$(mktemp -d)}
+BIN=${SAMSYN_BIN:-$(cd "$(dirname "$0")/.." && pwd)/target/debug/samsyn}
+PA=${SAMSYN_E2E_PORT_A:-8798}; PB=${SAMSYN_E2E_PORT_B:-8799}
+RELAY=${SAMSYN_E2E_RELAY:-none}   # "none" = direct only, "default" = n0 public relays, or a relay URL
 RELAYFLAG=(--relay $RELAY); [ "$RELAY" = default ] && RELAYFLAG=()
 FAIL=0
 ok() { echo "ok   $1"; }
@@ -14,7 +14,7 @@ bad() { echo "FAIL $1"; FAIL=1; }
 check() { if eval "$2"; then ok "$1"; else bad "$1"; fi }
 waitfor() { # waitfor <seconds> <cond>
   local n=$(( $1 * 2 )); while [ $n -gt 0 ]; do if eval "$2"; then return 0; fi; sleep 0.5; n=$((n-1)); done; return 1; }
-pkill -f "replica-server" ; sleep 0.5
+pkill -f "samsyn" ; sleep 0.5
 rm -rf "${S:?}/sA" "${S:?}/sB" "${S:?}/A" "${S:?}/B" "${S:?}/C"; mkdir -p $S/A/Projects/X/sub $S/B $S/C; : > $S/serverA.log; : > $S/serverB.log
 startA() { ($BIN --data-dir $S/sA serve --bind 127.0.0.1:$PA $RELAYFLAG --p2p-port $((PA+1000)) >> $S/serverA.log 2>&1 &); }
 startB() { ($BIN --data-dir $S/sB serve --bind 127.0.0.1:$PB $RELAYFLAG --p2p-port $((PB+1000)) >> $S/serverB.log 2>&1 &); }
@@ -38,7 +38,7 @@ check "share created" '[ -n "$SHARE" ]'
 echo "ticket: ${TICKET:0:40}…"
 
 echo "== bad ticket is refused fast by B"
-BAD=$(api $BOB -X POST $UB/api/vaults/vb/mounts -d "{\"ticket\":\"replicaxxxx\",\"mount_path\":\"Shared/X\"}" -o /dev/null -w '%{http_code}')
+BAD=$(api $BOB -X POST $UB/api/vaults/vb/mounts -d "{\"ticket\":\"samsynxxxx\",\"mount_path\":\"Shared/X\"}" -o /dev/null -w '%{http_code}')
 check "garbage ticket -> 400" '[ "$BAD" = "400" ]'
 
 echo "== bob (server B) mounts over p2p"
@@ -91,10 +91,10 @@ check "bob still receives" 'grep -q after-revoke $S/B/Shared/X/a.md'
 check "carol stopped receiving" '! grep -q after-revoke $S/C/Shared/X/a.md'
 check "carol keeps her files" '[ -f $S/C/Shared/X/a.md ]'
 
-echo "== restart B: link reconnects"; pkill -f "replica-server --data-dir $S/sB"; sleep 1; startB; sleep 3
+echo "== restart B: link reconnects"; pkill -f "samsyn --data-dir $S/sB"; sleep 1; startB; sleep 3
 echo "while-b-down" >> $S/A/Projects/X/a.md
 waitfor 30 'grep -q while-b-down $S/B/Shared/X/a.md'; check "edit flows after B restart" 'grep -q while-b-down $S/B/Shared/X/a.md'
-echo "== restart A: link reconnects"; pkill -f "replica-server --data-dir $S/sA"; sleep 1
+echo "== restart A: link reconnects"; pkill -f "samsyn --data-dir $S/sA"; sleep 1
 echo "while-a-down" >> $S/B/Shared/X/a.md; sleep 1; startA; sleep 3
 waitfor 60 'grep -q while-a-down $S/A/Projects/X/a.md'; check "edit made while A was down arrives after A restart" 'grep -q while-a-down $S/A/Projects/X/a.md'
 echo "after-a-restart" >> $S/A/Projects/X/a.md; waitfor 30 'grep -q after-a-restart $S/B/Shared/X/a.md'
@@ -103,7 +103,7 @@ check "edit flows after A restart" 'grep -q after-a-restart $S/B/Shared/X/a.md'
 echo "== unmount bob (files stay)"; MID=$(api $BOB $UB/api/vaults/vb/sharing | j 'print(d["mounts"][0]["id"])'); api $BOB -X DELETE $UB/api/mounts/$MID -o /dev/null -w "unmount -> %{http_code}\n"
 check "bob keeps files after unmount" '[ -f $S/B/Shared/X/a.md ]'
 check "replica dir removed" '! ls -d $S/sB/users/*/mounts/$MID >/dev/null 2>&1'
-pkill -f "replica-server"
+pkill -f "samsyn"
 echo "== server errors:"; grep -iE " error|panick" $S/serverA.log $S/serverB.log | grep -v 'p2p link failed' | head -5
 if [ $FAIL = 0 ]; then echo "ALL OK ($S)"; else echo "FAILURES ($S)"; fi
 exit $FAIL

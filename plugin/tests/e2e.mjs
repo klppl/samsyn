@@ -1,4 +1,4 @@
-// End-to-end: two clients sync through replica-server. Usage: node tests/e2e.mjs <ws-base> <token>
+// End-to-end: two clients sync through samsyn. Usage: node tests/e2e.mjs <ws-base> <token>
 import * as Y from "yjs";
 import { WebsocketProvider } from "y-websocket";
 import WebSocket from "ws";

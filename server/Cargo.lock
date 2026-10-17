@@ -3089,45 +3089,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 
 [[package]]
-name = "replica-server"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "axum",
- "axum-server",
- "base64 0.22.1",
- "bytes",
- "chacha20poly1305",
- "chrono",
- "clap",
- "data-encoding",
- "flate2",
- "futures",
- "gethostname",
- "hex",
- "iroh",
- "iroh-base",
- "notify-debouncer-mini",
- "parking_lot",
- "postcard",
- "rand 0.10.3",
- "reqwest",
- "rusqlite",
- "serde",
- "serde_json",
- "sha2",
- "tar",
- "tempfile",
- "tokio",
- "tokio-tungstenite 0.30.0",
- "tower-http 0.7.1",
- "tracing",
- "tracing-subscriber",
- "walkdir",
- "yrs",
-]
-
-[[package]]
 name = "reqwest"
 version = "0.13.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3333,6 +3294,45 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "93fc1dc3aaa9bfed95e02e6eadabb4baf7e3078b0bd1b4d7b6b0b68378900502"
 dependencies = [
  "winapi-util",
+]
+
+[[package]]
+name = "samsyn-server"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "axum",
+ "axum-server",
+ "base64 0.22.1",
+ "bytes",
+ "chacha20poly1305",
+ "chrono",
+ "clap",
+ "data-encoding",
+ "flate2",
+ "futures",
+ "gethostname",
+ "hex",
+ "iroh",
+ "iroh-base",
+ "notify-debouncer-mini",
+ "parking_lot",
+ "postcard",
+ "rand 0.10.3",
+ "reqwest",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tar",
+ "tempfile",
+ "tokio",
+ "tokio-tungstenite 0.30.0",
+ "tower-http 0.7.1",
+ "tracing",
+ "tracing-subscriber",
+ "walkdir",
+ "yrs",
 ]
 
 [[package]]

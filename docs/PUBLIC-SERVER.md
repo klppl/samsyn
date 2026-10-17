@@ -1,4 +1,4 @@
-# Running a replica server that strangers can reach
+# Running a Samsyn server that strangers can reach
 
 You need this when you use **guest mode** (people join your shares with only a ticket) or when your own phone connects from outside your network. Server-to-server sharing over iroh does *not* need any of it.
 
@@ -10,7 +10,7 @@ You need this when you use **guest mode** (people join your shares with only a t
 | `/guest/session/{share}`, `/guest/ws/{share}`, `/guest/shares/{share}`, `/guest/blobs/{share}/…` | anyone holding a ticket | ticket secret, or a session id obtained with it |
 | `/health`, `/` | anyone | nothing (no data beyond the node id) |
 
-Everything else is 404. There is no admin interface over HTTP; users and tokens are created on the host (`replica-server user add`) or by a logged-in user for their own devices (`POST /api/me/tokens`).
+Everything else is 404. There is no admin interface over HTTP; users and tokens are created on the host (`samsyn user add`) or by a logged-in user for their own devices (`POST /api/me/tokens`).
 
 ## What a leaked ticket can and cannot do
 
@@ -35,7 +35,7 @@ Everything that user can do: read and write all their vaults, create shares, iss
 
 ## Limits and their defaults
 
-Every limit is a flag (or `REPLICA_*` env var); the defaults are chosen so a server that nobody tuned is still safe and stable, and generous enough that normal use never hits them.
+Every limit is a flag (or `SAMSYN_*` env var); the defaults are chosen so a server that nobody tuned is still safe and stable, and generous enough that normal use never hits them.
 
 | Flag | Default | Protects against |
 |---|---|---|
@@ -71,7 +71,7 @@ Secrets at rest: user tokens and ticket secrets are stored hashed; mount secrets
    Caddy forwards WebSockets and sets `X-Forwarded-For` by default. Start the server bound to localhost and with the public URL that goes into tickets:
 
    ```sh
-   replica-server serve --bind 127.0.0.1:8787 --public-url https://sync.example.com
+   samsyn serve --bind 127.0.0.1:8787 --public-url https://sync.example.com
    ```
 
 3. **Rate limiting at the proxy** on top of the built-in one, if the host is a shared box. Caddy: the `rate_limit` plugin; nginx: `limit_req_zone`. Limit `/guest/*` harder than the rest.

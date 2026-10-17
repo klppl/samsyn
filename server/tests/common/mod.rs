@@ -1,4 +1,4 @@
-//! Helpers for the sharing scenarios: spawn `replica-server serve` and `replica-server sync`
+//! Helpers for the sharing scenarios: spawn `samsyn serve` and `samsyn sync`
 //! processes from the test binary's own build, talk to the HTTP API, and poll the filesystem.
 //! Everything lives in a temp dir and is killed on drop, so a failing test leaves nothing behind.
 #![allow(dead_code)]
@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
-pub const BIN: &str = env!("CARGO_BIN_EXE_replica-server");
+pub const BIN: &str = env!("CARGO_BIN_EXE_samsyn");
 
 pub fn free_port() -> u16 {
     TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port()
@@ -51,7 +51,7 @@ fn spawn(args: &[&str], log: &Path) -> Proc {
         .stdout(Stdio::from(out))
         .stderr(Stdio::from(err))
         .spawn()
-        .expect("spawn replica-server");
+        .expect("spawn samsyn");
     Proc { child, log: log.to_path_buf() }
 }
 
@@ -271,7 +271,7 @@ pub fn sleep(secs: f64) {
 }
 
 pub fn tmp(name: &str) -> PathBuf {
-    let d = std::env::temp_dir().join(format!("replica-test-{name}-{}", std::process::id()));
+    let d = std::env::temp_dir().join(format!("samsyn-test-{name}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&d);
     std::fs::create_dir_all(&d).unwrap();
     d

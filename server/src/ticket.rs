@@ -1,4 +1,4 @@
-//! Share tickets: `replica` + base32(postcard(Ticket)). Self-contained: tells the receiving
+//! Share tickets: `samsyn` + base32(postcard(Ticket)). Self-contained: tells the receiving
 //! side which share, on which node, with which secret and access level, and (v2) the owner
 //! server's public URL so a plugin without its own server can join directly ("guest mode").
 //!
@@ -8,7 +8,7 @@
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
 
-pub const PREFIX: &str = "replica";
+pub const PREFIX: &str = "samsyn";
 pub const CURRENT_VERSION: u8 = 2;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -58,7 +58,7 @@ impl Ticket {
 
     pub fn decode(s: &str) -> anyhow::Result<Self> {
         let s = s.trim();
-        let body = s.strip_prefix(PREFIX).context("not a replica ticket")?;
+        let body = s.strip_prefix(PREFIX).context("not a samsyn ticket")?;
         let bytes = data_encoding::BASE32_NOPAD
             .decode(body.to_ascii_uppercase().as_bytes())
             .context("ticket is not valid base32")?;
@@ -104,9 +104,9 @@ mod tests {
     fn round_trip_v2() {
         let t = sample();
         let s = t.encode().unwrap();
-        assert!(s.starts_with("replica"));
+        assert!(s.starts_with("samsyn"));
         assert_eq!(Ticket::decode(&s).unwrap(), t);
-        assert_eq!(Ticket::decode(&format!("  {}\n", s.to_ascii_uppercase().replacen("REPLICA", "replica", 1))).unwrap(), t);
+        assert_eq!(Ticket::decode(&format!("  {}\n", s.to_ascii_uppercase().replacen("SAMSYN", "samsyn", 1))).unwrap(), t);
     }
 
     #[test]

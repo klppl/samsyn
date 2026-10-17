@@ -3,7 +3,7 @@ import process from "process";
 import builtins from "builtin-modules";
 
 const banner = `/*
-Replica — conflict-free live sync for Obsidian.
+Samsyn — conflict-free live sync for Obsidian.
 This is a generated bundle; see https://github.com/mrboatsman/samsyn for sources.
 */
 `;

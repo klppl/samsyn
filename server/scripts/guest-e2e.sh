@@ -2,15 +2,15 @@
 # Guest mode: owner shares a folder from a server with --public-url; two headless guests join
 # with tickets only (rw and ro), no server of their own. Needs a debug build.
 set -u
-S=${REPLICA_E2E_DIR:-$(mktemp -d)}
-BIN=${REPLICA_BIN:-$(cd "$(dirname "$0")/.." && pwd)/target/debug/replica-server}
-PORT=${REPLICA_E2E_PORT:-8796}
+S=${SAMSYN_E2E_DIR:-$(mktemp -d)}
+BIN=${SAMSYN_BIN:-$(cd "$(dirname "$0")/.." && pwd)/target/debug/samsyn}
+PORT=${SAMSYN_E2E_PORT:-8796}
 FAIL=0
 ok() { echo "ok   $1"; }
 bad() { echo "FAIL $1"; FAIL=1; }
 check() { if eval "$2"; then ok "$1"; else bad "$1"; fi }
 waitfor() { local n=$(( $1 * 2 )); while [ $n -gt 0 ]; do if eval "$2"; then return 0; fi; sleep 0.5; n=$((n-1)); done; return 1; }
-pkill -f "replica-server --data-dir $S/gdata"; pkill -f "replica-server sync --ticket"; sleep 0.3
+pkill -f "samsyn --data-dir $S/gdata"; pkill -f "samsyn sync --ticket"; sleep 0.3
 rm -rf "${S:?}/gdata" "${S:?}/O" "${S:?}/G1" "${S:?}/G2"; mkdir -p $S/O/Projects/X/sub $S/G1 $S/G2; : > $S/guest-server.log
 U=http://127.0.0.1:$PORT
 start() { ($BIN --data-dir $S/gdata serve --bind 127.0.0.1:$PORT --no-p2p --public-url $U >> $S/guest-server.log 2>&1 &); }
@@ -38,7 +38,7 @@ for i in {1..9}; do curl -s -m 5 -o /dev/null "$U/guest/shares/$SHARE?secret=$(p
 C=$(curl -s -m 5 -o /dev/null -w '%{http_code}' "$U/guest/shares/$SHARE?secret=$(printf 'cd%.0s' {1..32})")
 check "11th failure from one ip -> 429" '[ "$C" = "429" ]'
 # the limiter is per ip; the real guests below come from the same loopback ip, so restart to clear it
-pkill -f "replica-server --data-dir $S/gdata"; sleep 1; start; sleep 2
+pkill -f "samsyn --data-dir $S/gdata"; sleep 1; start; sleep 2
 check "server log never contains a secret" '! grep -q "secret=" $S/guest-server.log'
 
 echo "== guests join with tickets only"
@@ -81,7 +81,7 @@ echo "after-revoke" >> $S/O/Projects/X/a.md; waitfor 10 'grep -q after-revoke $S
 check "rw guest still receives" 'grep -q after-revoke $S/G1/a.md'
 check "revoked guest does not" '! grep -q after-revoke $S/G2/a.md'
 
-pkill -f "replica-server sync"; pkill -f "replica-server --data-dir $S/gdata"
+pkill -f "samsyn sync"; pkill -f "samsyn --data-dir $S/gdata"
 echo "== server errors:"; grep -iE " error|panick" $S/guest-server.log | head -5
 if [ $FAIL = 0 ]; then echo "ALL OK ($S)"; else echo "FAILURES ($S)"; fi
 exit $FAIL

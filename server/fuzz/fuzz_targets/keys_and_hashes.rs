@@ -2,7 +2,7 @@
 //! Everything that becomes a path goes through these; they must never panic and must never
 //! accept something that escapes a directory.
 use libfuzzer_sys::fuzz_target;
-use replica_server::ids::{valid_hash, valid_key};
+use samsyn_server::ids::{valid_hash, valid_key};
 
 fuzz_target!(|data: &[u8]| {
     let s = String::from_utf8_lossy(data);

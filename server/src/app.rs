@@ -50,7 +50,7 @@ pub async fn serve(args: ServeArgs, storage: Storage) -> anyhow::Result<()> {
                 tracing::info!("========================================================");
                 tracing::info!("  token: {token}");
                 tracing::info!("  paste the server URL and this token into the plugin");
-                tracing::info!("  add more users with: replica-server user add <name>");
+                tracing::info!("  add more users with: samsyn user add <name>");
                 tracing::info!("  (this is the only copy; --initial-token-file keeps it out of logs)");
                 tracing::info!("========================================================");
             }
@@ -186,14 +186,14 @@ pub async fn serve(args: ServeArgs, storage: Storage) -> anyhow::Result<()> {
             let tls = axum_server::tls_rustls::RustlsConfig::from_pem_file(cert, key)
                 .await
                 .with_context(|| format!("loading TLS cert {} / key {}", cert.display(), key.display()))?;
-            tracing::info!("replica-server listening on https://{} (TLS)", state.serve.bind);
+            tracing::info!("samsyn listening on https://{} (TLS)", state.serve.bind);
             axum_server::bind_rustls(state.serve.bind, tls)
                 .handle(handle)
                 .serve(app.into_make_service_with_connect_info::<std::net::SocketAddr>())
                 .await?;
         }
         _ => {
-            tracing::info!("replica-server listening on http://{}", state.serve.bind);
+            tracing::info!("samsyn listening on http://{}", state.serve.bind);
             tracing::info!("note: iOS needs https; put this behind Caddy/Tailscale or pass --tls-cert/--tls-key");
             axum_server::bind(state.serve.bind)
                 .handle(handle)
@@ -272,7 +272,7 @@ async fn require_user(
 }
 
 async fn index() -> &'static str {
-    "replica-server is running. Connect the Obsidian Replica plugin to this URL."
+    "samsyn is running. Connect the Obsidian Samsyn plugin to this URL."
 }
 
 async fn health(State(state): State<SharedState>) -> (StatusCode, Json<serde_json::Value>) {

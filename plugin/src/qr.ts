@@ -1,7 +1,7 @@
 import qrcode from "qrcode-generator";
 
-/** Deep links handled by the plugin (`registerObsidianProtocolHandler("replica", …)`). */
-export const PROTOCOL = "obsidian://replica";
+/** Deep links handled by the plugin (`registerObsidianProtocolHandler("samsyn", …)`). */
+export const PROTOCOL = "obsidian://samsyn";
 
 export function mountLink(ticket: string): string {
   return `${PROTOCOL}?op=mount&ticket=${encodeURIComponent(ticket.trim())}`;
@@ -28,13 +28,13 @@ export function qrSvg(text: string): string {
 /** Render a QR for `text` into `el` with a caption; falls back to text when it is too long. */
 export function renderQr(el: HTMLElement, text: string, caption: string): void {
   el.empty();
-  el.addClass("replica-qr");
+  el.addClass("samsyn-qr");
   try {
-    const box = el.createDiv({ cls: "replica-qr-image" });
+    const box = el.createDiv({ cls: "samsyn-qr-image" });
     // The SVG comes from a local library with our own text; no remote content involved.
     box.innerHTML = qrSvg(text);
   } catch (e) {
-    el.createDiv({ cls: "replica-error", text: `Too much data for a QR code (${(e as Error).message}); use the link instead.` });
+    el.createDiv({ cls: "samsyn-error", text: `Too much data for a QR code (${(e as Error).message}); use the link instead.` });
   }
-  el.createDiv({ cls: "replica-muted replica-small", text: caption });
+  el.createDiv({ cls: "samsyn-muted samsyn-small", text: caption });
 }

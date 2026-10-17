@@ -1,6 +1,6 @@
 /**
  * Share tickets, decoded locally so the plugin can read one without any server:
- * `replica` + lowercase base32 (no padding) of a postcard-encoded struct.
+ * `samsyn` + lowercase base32 (no padding) of a postcard-encoded struct.
  * Mirrors server/src/ticket.rs; v1 has no url, v2 appends it.
  */
 export interface Ticket {
@@ -15,7 +15,7 @@ export interface Ticket {
   url: string;
 }
 
-const PREFIX = "replica";
+const PREFIX = "samsyn";
 const ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
 
 function base32Decode(s: string): Uint8Array {
@@ -102,7 +102,7 @@ class Writer {
 
 export function decodeTicket(raw: string): Ticket {
   const s = raw.trim();
-  if (!s.toLowerCase().startsWith(PREFIX)) throw new Error("not a replica ticket");
+  if (!s.toLowerCase().startsWith(PREFIX)) throw new Error("not a samsyn ticket");
   const r = new Reader(base32Decode(s.slice(PREFIX.length)));
   const version = r.u8();
   if (version !== 1 && version !== 2) throw new Error(`unsupported ticket version ${version}; update the plugin`);

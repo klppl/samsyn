@@ -11,10 +11,10 @@ RUN cargo build --release --bin samsyn
 
 FROM debian:bookworm-slim
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates && rm -rf /var/lib/apt/lists/*
-COPY --from=build /src/target/release/replica-server /usr/local/bin/replica-server
-ENV REPLICA_DATA_DIR=/data REPLICA_BIND=0.0.0.0:8787
+COPY --from=build /src/server/target/release/samsyn /usr/local/bin/samsyn
+ENV SAMSYN_DATA_DIR=/data SAMSYN_BIND=0.0.0.0:8787
 VOLUME ["/data"]
 EXPOSE 8787
 EXPOSE 8788/udp
-ENTRYPOINT ["replica-server"]
+ENTRYPOINT ["samsyn"]
 CMD ["serve"]

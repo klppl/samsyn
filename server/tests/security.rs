@@ -134,7 +134,7 @@ fn malformed_input_is_rejected_not_crashing() {
         assert_eq!(code, 400, "mount path {mp:?} -> {code} {body}");
     }
     // Garbage tickets.
-    for t in ["", "replica", "replica!!!", &format!("replica{}", "a".repeat(5000)), "x"] {
+    for t in ["", "samsyn", "samsyn!!!", &format!("samsyn{}", "a".repeat(5000)), "x"] {
         let (code, _) = api_raw(&server, &bob, "POST", "/api/vaults/vb/mounts", Some(json!({"ticket": t})));
         assert_eq!(code, 400, "ticket {t:?}");
     }
@@ -352,13 +352,13 @@ fn hostile_document_keys_never_escape_the_sync_directory() {
     // The owner (as a hostile collaborator would) injects evil keys straight into the vault
     // document over the WebSocket, bypassing any client-side checks.
     let evil_keys = [
-        "/tmp/replica-evil-abs.md",
-        "Projects/X/../../../replica-evil-dotdot.md",
-        "Projects/X/..\\\\replica-evil-backslash.md",
-        "Projects/X/sub//replica-evil-empty.md",
-        "Projects/X/\u{0}replica-evil-nul.md",
+        "/tmp/samsyn-evil-abs.md",
+        "Projects/X/../../../samsyn-evil-dotdot.md",
+        "Projects/X/..\\\\samsyn-evil-backslash.md",
+        "Projects/X/sub//samsyn-evil-empty.md",
+        "Projects/X/\u{0}samsyn-evil-nul.md",
     ];
-    let canary = "/tmp/replica-evil-abs.md";
+    let canary = "/tmp/samsyn-evil-abs.md";
     let _ = std::fs::remove_file(canary);
     let url = format!("ws://127.0.0.1:{}/ws/va?token={owner}", server.port);
     let rt = tokio::runtime::Runtime::new().unwrap();
@@ -392,10 +392,10 @@ fn hostile_document_keys_never_escape_the_sync_directory() {
     for root in [dir.join("A"), dir.join("B")] {
         for e in walkdir::WalkDir::new(&root).into_iter().flatten() {
             let p = e.path().to_string_lossy().to_string();
-            assert!(!p.contains("replica-evil"), "evil key reached disk: {p}");
+            assert!(!p.contains("samsyn-evil"), "evil key reached disk: {p}");
         }
     }
-    for p in ["replica-evil-dotdot.md", "replica-evil-backslash.md"] {
+    for p in ["samsyn-evil-dotdot.md", "samsyn-evil-backslash.md"] {
         assert!(!dir.join(p).exists() && !dir.parent().unwrap().join(p).exists(), "{p} escaped");
     }
     // The server refused to forward the evil keys into bob's document at all.
@@ -744,7 +744,7 @@ fn api_raw_bytes(server: &Server, token: &str, method: &str, path: &str, body: &
 
 /// Pull the secret out of a ticket the way the plugin does.
 fn ticket_secret(ticket: &str) -> String {
-    let body = ticket.trim().strip_prefix("replica").unwrap().to_ascii_uppercase();
+    let body = ticket.trim().strip_prefix("samsyn").unwrap().to_ascii_uppercase();
     let bytes = data_encoding::BASE32_NOPAD.decode(body.as_bytes()).unwrap();
     let mut pos = 1;
     let mut read_str = || {

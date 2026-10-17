@@ -208,5 +208,5 @@ fn move_path(src: &Path, dst: &Path) -> anyhow::Result<()> {
 }
 
 pub fn default_backup_name() -> PathBuf {
-    PathBuf::from(format!("replica-backup-{}.tar.gz", chrono::Utc::now().format("%Y%m%d-%H%M%S")))
+    PathBuf::from(format!("samsyn-backup-{}.tar.gz", chrono::Utc::now().format("%Y%m%d-%H%M%S")))
 }

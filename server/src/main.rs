@@ -1,12 +1,12 @@
-//! Replica server binary: parses the command line and hands over to the library.
+//! Samsyn server binary: parses the command line and hands over to the library.
 
 use anyhow::Context;
 use clap::Parser;
 use tracing_subscriber::EnvFilter;
 
-use replica_server::config::{Cli, Command, ServeArgs};
-use replica_server::storage::Storage;
-use replica_server::{cli, client};
+use samsyn_server::config::{Cli, Command, ServeArgs};
+use samsyn_server::storage::Storage;
+use samsyn_server::{cli, client};
 
 fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
@@ -25,7 +25,7 @@ fn main() -> anyhow::Result<()> {
             tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
                 .build()?
-                .block_on(replica_server::serve(args, storage))
+                .block_on(samsyn_server::serve(args, storage))
         }
         Command::Sync(args) => tokio::runtime::Builder::new_multi_thread()
             .enable_all()

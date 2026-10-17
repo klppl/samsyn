@@ -31,7 +31,7 @@ owner's vault doc  ──bridge──  share doc  ══iroh══  share doc re
 - **Share**: `{ id, owner, vault, name, prefix, only_file? }`. `prefix` is the folder (`Projects/X/`); `only_file` narrows it to one note (`prefix = Notes/`, `only_file = a.md`). Share keys are relative to `prefix`.
 - **Grant** (= ticket): `{ share, secret_hash, label, access: rw|ro, revoked_at }`. Many grants per share; revoke one without affecting others.
 - **Mount**: `{ id, user, vault, share, mount_prefix, access, home_node, home_addrs, only_file, secret }`. A mount bridges the share into the friend's vault at `mount_prefix`. `home_node` is the owner's server; when it equals this server the share is local (two users on one server) and no network is involved. Otherwise the server keeps a local *replica* of the share document and links it to the owner's server (below).
-- **Ticket**: `replica` + base32 of `{ v, share_id, name, node_id, secret, access, addrs }`. `addrs` are the owner server's relay URL and direct addresses at the time the ticket was made (`relay:https://…`, `ip:host:port`); the node id alone is enough when a relay is in use.
+- **Ticket**: `samsyn` + base32 of `{ v, share_id, name, node_id, secret, access, addrs }`. `addrs` are the owner server's relay URL and direct addresses at the time the ticket was made (`relay:https://…`, `ip:host:port`); the node id alone is enough when a relay is in use.
 
 Overlapping shares or mounts (nested prefixes) in one vault are refused. A mount prefix must be empty in the vault when mounted, so nothing is overwritten.
 
@@ -50,7 +50,7 @@ Blobs: when a blob entry crosses a bridge the bytes are copied into the target s
 
 ## Server to server (phase 2)
 
-Every server binds an [iroh](https://iroh.computer) endpoint with its identity key (UDP, `--p2p-port`, default 8788) and accepts connections on ALPN `replica/share/1`. Connections are QUIC, end-to-end encrypted and authenticated by the node ids; iroh dials through a relay first and upgrades to a direct path when NAT traversal succeeds. Neither server needs an open port or a public address. The default relays are the public n0 ones; `--relay <url>` selects your own ([self-hosting a relay](https://github.com/n0-computer/iroh/tree/main/iroh-relay)), `--relay none` disables relays (LAN / VPN only), `--no-p2p` turns the endpoint off.
+Every server binds an [iroh](https://iroh.computer) endpoint with its identity key (UDP, `--p2p-port`, default 8788) and accepts connections on ALPN `samsyn/share/1`. Connections are QUIC, end-to-end encrypted and authenticated by the node ids; iroh dials through a relay first and upgrades to a direct path when NAT traversal succeeds. Neither server needs an open port or a public address. The default relays are the public n0 ones; `--relay <url>` selects your own ([self-hosting a relay](https://github.com/n0-computer/iroh/tree/main/iroh-relay)), `--relay none` disables relays (LAN / VPN only), `--no-p2p` turns the endpoint off.
 
 When a ticket from another server is mounted:
 
@@ -79,7 +79,7 @@ Limits on the link (the node id is public, so everything before the hello must b
 
 ## Guests (no server of their own)
 
-A person without a replica server can still join a share: the plugin (*Add from ticket…* → **Mount as guest**, or simply **Mount** when no server is configured) or the headless client (`replica-server sync --ticket <ticket> --dir …`) connects straight to the **owner's** server and syncs the share document, authenticated by the ticket secret. In the plugin each guest mount is its own engine with its own document, scoped to one folder; the home engine excludes those folders, so nothing from a guest folder ever reaches your own server and nothing else in your vault reaches the owner. Read-only guests never push; their local edits are overwritten by the shared version (kept as a conflict copy when they differ at reconcile time). The owner's server must be reachable over HTTPS and started with `--public-url https://…`, which is embedded in every ticket it issues (ticket v2; v1 tickets still decode). Full design in `GUEST-MODE.md`.
+A person without a Samsyn server can still join a share: the plugin (*Add from ticket…* → **Mount as guest**, or simply **Mount** when no server is configured) or the headless client (`samsyn sync --ticket <ticket> --dir …`) connects straight to the **owner's** server and syncs the share document, authenticated by the ticket secret. In the plugin each guest mount is its own engine with its own document, scoped to one folder; the home engine excludes those folders, so nothing from a guest folder ever reaches your own server and nothing else in your vault reaches the owner. Read-only guests never push; their local edits are overwritten by the shared version (kept as a conflict copy when they differ at reconcile time). The owner's server must be reachable over HTTPS and started with `--public-url https://…`, which is embedded in every ticket it issues (ticket v2; v1 tickets still decode). Full design in `GUEST-MODE.md`.
 
 Guest routes, all authenticated by `(share id, secret)` given as `?secret=` or `Authorization: Bearer`:
 
@@ -90,7 +90,7 @@ Guest routes, all authenticated by `(share id, secret)` given as `?secret=` or `
 | GET | `/guest/ws/{id}` | y-sync WebSocket on the share document; read-only grants have their document updates dropped server-side |
 | GET/PUT | `/guest/blobs/{id}/{hash}` | share-scoped blobs; PUT only for read & write and within `--max-share-mb` |
 
-Tickets travel as text, as a deep link (`obsidian://replica?op=mount&ticket=…`) or as a QR code of that link; scanning it opens Obsidian with the mount dialog filled in. Running a server on the public internet is covered in `PUBLIC-SERVER.md`.
+Tickets travel as text, as a deep link (`obsidian://samsyn?op=mount&ticket=…`) or as a QR code of that link; scanning it opens Obsidian with the mount dialog filled in. Running a server on the public internet is covered in `PUBLIC-SERVER.md`.
 
 Hygiene on these public routes: unknown share and bad secret answer identically (403), more than 10 failures per IP in 10 minutes gives 429, and the request log carries the path only, never the query string. The owner re-checks the grant every 30 s on open guest sockets and closes them when the ticket is revoked or the share deleted; the headless client then exits with a clear message. Each guest connection stamps `last_seen_at` on its ticket, shown to the owner.
 
@@ -112,10 +112,10 @@ Hygiene on these public routes: unknown share and bad secret answer identically 
 
 ## Plugin UI
 
-Settings → **Sharing**: *Shared by me* (create from folder/note path, list with ticket copy, new ticket, revoke, unshare) and *Shared with me* (paste ticket + mount path, list, unmount). File explorer context menu: **Replica: Share…**. Nothing else in the plugin changes.
+Settings → **Sharing**: *Shared by me* (create from folder/note path, list with ticket copy, new ticket, revoke, unshare) and *Shared with me* (paste ticket + mount path, list, unmount). File explorer context menu: **Samsyn: Share…**. Nothing else in the plugin changes.
 
 ## Phases
 
 1. **One server** (done). Share docs, bridges, reconcile, API, tickets with local `node_id`, plugin Sharing UI. Two users on the same server collaborate on a folder.
-2. **iroh** (done). Endpoint, accept loop, `replica/share/1` protocol (y-sync framed over a QUIC stream + blob fetch), remote mounts with local replicas, reconnect, relay config. Scenario: `server/scripts/remote-e2e.sh`.
+2. **iroh** (done). Endpoint, accept loop, `samsyn/share/1` protocol (y-sync framed over a QUIC stream + blob fetch), remote mounts with local replicas, reconnect, relay config. Scenario: `server/scripts/remote-e2e.sh`.
 3. **Polish** (done except the relay guide). Presence across the bridge (`server/src/presence.rs`: awareness states of clients inside a shared subtree are mirrored into the share and every mounting vault under a synthetic client id with the path remapped and a `_via` marker; scenario `server/scripts/presence-e2e.sh`), headless client refuses edits under read-only mounts and marks those files read-only on disk, sharing UI reworked (tabs, modals, ticket inspection via `POST /api/tickets/inspect`, revocation notices).

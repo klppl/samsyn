@@ -2,7 +2,7 @@ import { App, Notice, Platform } from "obsidian";
 import * as Y from "yjs";
 import type { BlobMeta, SyncEngine } from "./engine";
 import { sha256Hex } from "./hash";
-import type { ReplicaSettings } from "./settings";
+import type { SamsynSettings } from "./settings";
 
 /**
  * Which plugins' settings travel between devices, and to which devices. Lives in the shared
@@ -42,11 +42,11 @@ export class ConfigSync {
   private seen = new Map<string, { mtime: number; hash: string }>();
   private busy = false;
   private stopped = false;
-  private readonly origin = { replica: "config" };
+  private readonly origin = { samsyn: "config" };
 
   constructor(
     private app: App,
-    private settings: ReplicaSettings,
+    private settings: SamsynSettings,
     private engine: SyncEngine,
   ) {
     this.config = engine.doc.getMap<ConfigEntry>("config");
@@ -252,13 +252,13 @@ export class ConfigSync {
     try {
       await client.upload(hash, data);
     } catch (e) {
-      console.warn(`[replica] uploading ${key} failed`, e);
+      console.warn(`[samsyn] uploading ${key} failed`, e);
       return;
     }
     this.engine.doc.transact(() => {
       this.engine.blobs.set(key, { hash, size: data.byteLength, mtime: stat.mtime });
     }, this.origin);
-    console.info(`[replica] plugin settings pushed: ${key} (${id})`);
+    console.info(`[samsyn] plugin settings pushed: ${key} (${id})`);
   }
 
   private async pull(key: string, meta: BlobMeta, id: string): Promise<void> {
@@ -274,7 +274,7 @@ export class ConfigSync {
     try {
       data = await client.download(meta.hash);
     } catch (e) {
-      console.warn(`[replica] downloading ${key} failed`, e);
+      console.warn(`[samsyn] downloading ${key} failed`, e);
       return;
     }
     if (!data) return; // not on the server yet; the next reconcile or poll retries
@@ -283,7 +283,7 @@ export class ConfigSync {
     await this.app.vault.adapter.writeBinary(key, data);
     const stat = await this.app.vault.adapter.stat(key).catch(() => null);
     this.seen.set(key, { mtime: stat?.mtime ?? meta.mtime, hash: meta.hash });
-    console.info(`[replica] plugin settings pulled: ${key} (${id})`);
+    console.info(`[samsyn] plugin settings pulled: ${key} (${id})`);
     this.offerReload(id, key.endsWith(SETTINGS_FILE));
   }
 
@@ -299,11 +299,11 @@ export class ConfigSync {
     const installed = !!plugins?.manifests?.[id];
     const frag = document.createDocumentFragment();
     if (!installed) {
-      frag.createDiv({ text: `Replica: files for the plugin “${id}” arrived from another device. Restart Obsidian, then enable it under Community plugins.` });
+      frag.createDiv({ text: `Samsyn: files for the plugin “${id}” arrived from another device. Restart Obsidian, then enable it under Community plugins.` });
       new Notice(frag, 12_000);
       return;
     }
-    frag.createDiv({ text: `Replica: ${settingsChanged ? "settings" : "files"} for “${name}” updated from another device. Reload it to apply.` });
+    frag.createDiv({ text: `Samsyn: ${settingsChanged ? "settings" : "files"} for “${name}” updated from another device. Reload it to apply.` });
     const btn = frag.createEl("button", { text: `Reload ${name}` });
     btn.onclick = async () => {
       notice.hide();
@@ -312,9 +312,9 @@ export class ConfigSync {
           await plugins.disablePlugin(id);
           await plugins.enablePlugin(id);
         }
-        new Notice(`Replica: ${name} reloaded`);
+        new Notice(`Samsyn: ${name} reloaded`);
       } catch (e) {
-        new Notice(`Replica: reloading ${name} failed (${(e as Error).message}); restart Obsidian.`);
+        new Notice(`Samsyn: reloading ${name} failed (${(e as Error).message}); restart Obsidian.`);
       }
     };
     const notice = new Notice(frag, 20_000);

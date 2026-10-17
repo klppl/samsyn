@@ -79,7 +79,7 @@ impl Engine {
         {
             let conn = conn.clone();
             let doc_dirty = doc_dirty.clone();
-            doc.observe_update_v1("replica-client", move |txn, ev| {
+            doc.observe_update_v1("samsyn-client", move |txn, ev| {
                 *doc_dirty.lock() = true;
                 if is_local(txn.origin()) {
                     if let Some(tx) = conn.lock().as_ref() {
@@ -91,7 +91,7 @@ impl Engine {
         // Remote changes are collected by path and written to disk after the message is handled.
         {
             let dirty = dirty_remote.clone();
-            texts.observe_deep("replica-client", move |txn, events| {
+            texts.observe_deep("samsyn-client", move |txn, events| {
                 if is_local(txn.origin()) {
                     return;
                 }
@@ -114,7 +114,7 @@ impl Engine {
         }
         {
             let dirty = dirty_remote.clone();
-            blobs.observe("replica-client", move |txn, ev| {
+            blobs.observe("samsyn-client", move |txn, ev| {
                 if is_local(txn.origin()) {
                     return;
                 }
@@ -609,7 +609,7 @@ impl Engine {
         if let Some(meta) = self.blob_of(rel) {
             return self.download_blob(rel, &meta).await;
         }
-        // Gone from the document: move the local file to .replica/trash.
+        // Gone from the document: move the local file to .samsyn/trash.
         self.trash_local(rel)?;
         Ok(())
     }

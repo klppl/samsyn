@@ -1,10 +1,15 @@
 [package]
-name = "replica-server"
+name = "samsyn-server"
 version = "0.1.0"
 edition = "2021"
-description = "CRDT sync server for the Replica Obsidian plugin"
+description = "CRDT sync server for the Samsyn Obsidian plugin"
 license = "MIT"
 exclude = ["fuzz/"]
+
+# Library crate stays `samsyn_server` (reusable); the CLI binary is just `samsyn`.
+[[bin]]
+name = "samsyn"
+path = "src/main.rs"
 
 [dependencies]
 anyhow = "1"

@@ -31,7 +31,7 @@ fn p2p_mount_edit_revoke_restart() {
     let ticket = r["ticket"].as_str().expect("ticket").to_string();
 
     // Garbage is refused fast; a real ticket is probed against the owner before anything is stored.
-    let (code, _) = api_raw(&sb, &bob_tok, "POST", "/api/vaults/vb/mounts", Some(json!({"ticket": "replicaxxxx", "mount_path": "Shared/X"})));
+    let (code, _) = api_raw(&sb, &bob_tok, "POST", "/api/vaults/vb/mounts", Some(json!({"ticket": "samsynxxxx", "mount_path": "Shared/X"})));
     assert_eq!(code, 400);
     let r = api_json(&sb, &bob_tok, "POST", "/api/vaults/vb/mounts", Some(json!({"ticket": ticket, "mount_path": "Shared/X"})));
     assert_eq!(r["access"], "rw", "mount: {r}");
