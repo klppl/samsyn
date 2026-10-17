@@ -4,8 +4,7 @@ This is an unmodified copy of `yrs` 0.28.0 (from crates.io) with one security fi
 pulled in via `[patch.crates-io]` in `server/Cargo.toml` and `server/fuzz/Cargo.toml`.
 
 The exact diff against pristine yrs 0.28.0 is `0001-cap-decode-counts.patch` in this directory
-(`git format-patch` form; `git am` or `git apply` it on a yrs checkout). Attach it to the
-upstream issue.
+(`git format-patch` form; `git am` or `git apply` it on a yrs checkout).
 
 ## The change
 
@@ -26,9 +25,20 @@ Diff is limited to:
 - `src/updates/decoder.rs` — `remaining()` + `check_len()` on the trait, `remaining()` for `DecoderV1`.
 - `src/update.rs`, `src/id_set.rs`, `src/state_vector.rs` — a `check_len(...)?` before each count use.
 
-## Why vendored, not upstreamed yet
+## Upstream
 
-We want to run this in production for a while and confirm it rejects nothing legitimate before
-filing upstream. The upstream report is tracked as a private issue (base for a yrs issue + PR later). When
-upstream ships the fix, drop `third_party/yrs` and the two `[patch]` stanzas and bump the `yrs`
-version.
+This is the same problem as y-crdt/y-crdt#675 ("Decoding reserves what the input claims"),
+which is open and matches this fix's approach (cap each count by the bytes remaining). We
+confirmed it there and posted this diff:
+https://github.com/y-crdt/y-crdt/issues/675#issuecomment-6232787802
+
+Scope vs #675: this diff caps the client / block / range / state-vector counts only. It does
+**not** cap the string and `Any`-value reservations, nor bound `Any` nesting depth (a separate
+stack-overflow path) that #675 also lists; our fuzzing is clean because the reachable large
+allocations were the counts capped here. Related and already in flight upstream: #679/#685
+(client ids >= 2^53, our F-31, handled by catch_unwind + release build here), #680/#684
+(clock+len overflow), #690 (v2 decoder panics).
+
+When upstream ships a fix (likely wider than this one), drop `third_party/yrs` and the two
+`[patch.crates-io]` stanzas and bump the `yrs` version. Until then we run this vendored copy to
+confirm it rejects nothing legitimate.
