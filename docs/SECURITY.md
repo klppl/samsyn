@@ -46,5 +46,5 @@ Adding a finding → add a test here first that fails, then fix. Name the test a
 |---|---|---|
 | 2026-10-17 | First audit: dependencies, secrets, auth design, memory safety, all public routes, p2p, clients | 18 findings; fixes in the same commit as the test suite |
 | 2026-10-17 | Mitigation batches 1–2 from the plan: document and connection limits, idle unload, presence whitelist, CORS allow-list, token file, auth failure budget, per-user quota, sealed mount secrets, headless guest sessions | 6 more tests; defaults documented in PUBLIC-SERVER.md |
-| 2026-10-17 | Library/binary split and fuzz targets for every network decoder (F-18) | 5 targets, each run ≥ 45 s without findings on day one |
+| 2026-10-17 | Library/binary split and fuzz targets for every network decoder (F-18) | 5 targets; fuzzing found a delta byte-offset panic (fixed) and the yrs decode-allocation OOM (F-32, fixed by a vendored yrs patch) |
 | 2026-10-17 | Independent second pass over the same surface | 12 more findings (3 high: panics under the apply lock, token revocation not ending sockets); fixed in a second commit with 3 more tests; non-poisoning locks everywhere |

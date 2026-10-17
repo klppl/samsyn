@@ -6,6 +6,10 @@
 - Rust stable (1.80+) with cargo
 - Obsidian desktop, and a phone with Obsidian mobile for mobile testing
 
+## Vendored dependency: yrs
+
+`third_party/yrs` is a copy of `yrs` 0.28.0 with one security fix (decode count caps; see `third_party/yrs/PATCH.md` and the upstream report, y-crdt/y-crdt#675), pulled in via `[patch.crates-io]` in `server/Cargo.toml` and `server/fuzz/Cargo.toml`. It is temporary: when the fix lands upstream, delete the directory and both `[patch]` stanzas and bump the `yrs` version. Do not make unrelated local edits to it.
+
 ## Server crate layout
 
 `server/` is one package with a library and a thin binary. `src/lib.rs` exposes every module (`replica_server::ticket`, `ids`, `limits`, `storage`, `vault`, `bridge`, `presence`, `ws`, `guest`, `sharing`, `remote`, `client`, `app`, …); `src/main.rs` only parses the command line and calls `replica_server::serve` or the CLI/client entry points. Anything that should be reusable in another program (ticket format, path/hash validation, the headless client, the storage layer) is therefore importable with `replica-server = { path = "…" }`, and the fuzz targets in `server/fuzz/` link against it. Unit tests live in the library (`cargo test --lib`).

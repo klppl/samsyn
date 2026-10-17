@@ -45,3 +45,7 @@ base64 = "0.22"
 lto = true
 codegen-units = 1
 strip = true
+
+[patch.crates-io]
+# F-32: vendored yrs 0.28.0 with decode count caps (see third_party/yrs, docs/yrs-decode-oom.md).
+yrs = { path = "../third_party/yrs" }
