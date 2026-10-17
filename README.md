@@ -20,14 +20,24 @@ and Android, offline and back.
 | | Conflicts | Real-time | Self-hosted | Mobile | Share a folder | Free |
 |---|:---:|:---:|:---:|:---:|:---:|:---:|
 | **iCloud / Dropbox** | Conflicted copies | No | No | Yes | No | Yes |
-| **Obsidian Sync** | Rare | Delayed | No | Yes | No | $96/yr |
-| **Self-hosted LiveSync** | Prompts you | Yes | CouchDB | Yes | No | Yes |
+| **Obsidian Sync** | Rare | Delayed | No (hosted) | Yes | No | $96/yr |
+| **[Remotely Save](https://github.com/remotely-save/remotely-save)** | Conflicted copies | No | S3 / WebDAV / … | Yes | No | Yes |
+| **[Obsidian Git](https://github.com/Vinzent03/obsidian-git)** | Manual merge | No | Any git host | Limited | No | Yes |
+| **[Self-hosted LiveSync](https://github.com/vrtmrz/obsidian-livesync)** | Prompts you | Yes | CouchDB | Yes | No | Yes |
 | **Syncthing** | Conflicted copies | Near | Yes | Android only | No | Yes |
+| **[YAOS](https://community.obsidian.md/plugins/yaos)** | CRDT merge | Yes | Cloudflare Worker | Yes | No | $0 |
+| **[Ilow Sync](https://community.obsidian.md/plugins/ilow-sync)** | CRDT merge | Yes | Go + PostgreSQL | Yes | No | Yes |
 | **Samsyn** | **CRDT merge** | **Yes** | **One binary** | **iOS + Android** | **Any subfolder** | **$0** |
 
 Text merges with [Yjs](https://github.com/yjs/yjs) in the plugin and
 [yrs](https://github.com/y-crdt/y-crdt) on the server, so simultaneous edits to
 one note just merge. Binary files (images, PDFs) sync whole, last writer wins.
+
+Samsyn shares the CRDT, real-time, self-hosted approach of YAOS and Ilow Sync.
+What sets it apart: you share **any subfolder** with another person and both edit
+it live (even across two separate servers, over an encrypted peer-to-peer link),
+and the whole server is **one binary** with no database, cloud account or runtime
+to deploy. iOS and Android are both first-class.
 
 ## Quick start
 
