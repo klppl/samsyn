@@ -41,10 +41,20 @@ pub struct ShareInfo {
 pub struct GrantInfo {
     pub label: String,
     pub access: String,
+    /// Share-relative folders (`Inbox/`) or notes (`todo.md`) a read-only ticket may still write.
+    pub rw_paths: Vec<String>,
     pub created_at: String,
     pub revoked_at: Option<String>,
     /// Last time a guest client authenticated with this ticket.
     pub last_seen_at: Option<String>,
+}
+
+/// What a valid, unrevoked ticket secret grants: who it is for and what it may write.
+#[derive(Debug, Clone)]
+pub struct GrantAccess {
+    pub label: String,
+    pub access: String,
+    pub rw_paths: Vec<String>,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -56,6 +66,8 @@ pub struct MountInfo {
     pub share_name: String,
     pub mount_prefix: String,
     pub access: String,
+    /// Share-relative paths the owner lets this (read-only) mount write; see `GrantInfo::rw_paths`.
+    pub rw_paths: Vec<String>,
     pub home_node: String,
     /// Owner server's relay/direct addresses as printed in the ticket (remote mounts).
     pub home_addrs: Vec<String>,
@@ -155,6 +167,7 @@ impl Registry {
                 secret_hash TEXT NOT NULL,
                 label       TEXT NOT NULL,
                 access      TEXT NOT NULL,
+                rw_paths    TEXT NOT NULL DEFAULT '',
                 created_at  TEXT NOT NULL,
                 revoked_at  TEXT,
                 PRIMARY KEY (share_id, label)
@@ -167,6 +180,7 @@ impl Registry {
                 share_name   TEXT NOT NULL,
                 mount_prefix TEXT NOT NULL,
                 access       TEXT NOT NULL,
+                rw_paths     TEXT NOT NULL DEFAULT '',
                 home_node    TEXT NOT NULL,
                 secret       TEXT NOT NULL,
                 created_at   TEXT NOT NULL,
@@ -475,7 +489,7 @@ impl Registry {
         Ok(conn.execute("DELETE FROM shares WHERE id = ?1", params![id])? > 0)
     }
 
-    pub fn create_grant(&self, share_id: &str, label: &str, access: &str) -> anyhow::Result<String> {
+    pub fn create_grant(&self, share_id: &str, label: &str, access: &str, rw_paths: &[String]) -> anyhow::Result<String> {
         let secret = hex::encode({
             let mut b = [0u8; 32];
             rand::Rng::fill_bytes(&mut rand::rng(), &mut b);
@@ -483,8 +497,8 @@ impl Registry {
         });
         let conn = self.conn.lock();
         conn.execute(
-            "INSERT INTO share_grants (share_id, secret_hash, label, access, created_at) VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![share_id, token_hash(&secret), label, access, Self::now()],
+            "INSERT INTO share_grants (share_id, secret_hash, label, access, rw_paths, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![share_id, token_hash(&secret), label, access, join_paths(rw_paths), Self::now()],
         )
         .with_context(|| format!("creating ticket '{label}' (label already used?)"))?;
         Ok(secret)
@@ -492,21 +506,28 @@ impl Registry {
 
     pub fn grants_for_share(&self, share_id: &str) -> anyhow::Result<Vec<GrantInfo>> {
         let conn = self.conn.lock();
-        let mut stmt = conn.prepare("SELECT label, access, created_at, revoked_at, last_seen_at FROM share_grants WHERE share_id = ?1 ORDER BY created_at")?;
+        let mut stmt = conn.prepare("SELECT label, access, created_at, revoked_at, last_seen_at, rw_paths FROM share_grants WHERE share_id = ?1 ORDER BY created_at")?;
         let rows = stmt.query_map(params![share_id], |r| {
-            Ok(GrantInfo { label: r.get(0)?, access: r.get(1)?, created_at: r.get(2)?, revoked_at: r.get(3)?, last_seen_at: r.get(4)? })
+            Ok(GrantInfo {
+                label: r.get(0)?,
+                access: r.get(1)?,
+                created_at: r.get(2)?,
+                revoked_at: r.get(3)?,
+                last_seen_at: r.get(4)?,
+                rw_paths: split_paths(&r.get::<_, String>(5)?),
+            })
         })?;
         Ok(rows.collect::<Result<_, _>>()?)
     }
 
-    /// Validate a presented share secret. Returns the grant's access level if valid and not revoked.
-    pub fn check_grant(&self, share_id: &str, secret: &str) -> anyhow::Result<Option<(String, String)>> {
+    /// Validate a presented share secret. Returns the grant if valid and not revoked.
+    pub fn check_grant(&self, share_id: &str, secret: &str) -> anyhow::Result<Option<GrantAccess>> {
         let conn = self.conn.lock();
         Ok(conn
             .query_row(
-                "SELECT label, access FROM share_grants WHERE share_id = ?1 AND secret_hash = ?2 AND revoked_at IS NULL",
+                "SELECT label, access, rw_paths FROM share_grants WHERE share_id = ?1 AND secret_hash = ?2 AND revoked_at IS NULL",
                 params![share_id, token_hash(secret)],
-                |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
+                |r| Ok(GrantAccess { label: r.get(0)?, access: r.get(1)?, rw_paths: split_paths(&r.get::<_, String>(2)?) }),
             )
             .optional()?)
     }
@@ -590,6 +611,7 @@ impl Registry {
         share_name: &str,
         mount_prefix: &str,
         access: &str,
+        rw_paths: &[String],
         home_node: &str,
         home_addrs: &[String],
         only_file: Option<&str>,
@@ -603,6 +625,7 @@ impl Registry {
             share_name: share_name.into(),
             mount_prefix: mount_prefix.into(),
             access: access.into(),
+            rw_paths: rw_paths.to_vec(),
             home_node: home_node.into(),
             home_addrs: home_addrs.to_vec(),
             only_file: only_file.map(str::to_string),
@@ -612,8 +635,8 @@ impl Registry {
         };
         let conn = self.conn.lock();
         conn.execute(
-            "INSERT INTO mounts (id, user_id, vault_id, share_id, share_name, mount_prefix, access, home_node, home_addrs, only_file, secret, created_at)              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
-            params![m.id, m.user_id, m.vault_id, m.share_id, m.share_name, m.mount_prefix, m.access, m.home_node, m.home_addrs.join(" "), m.only_file, self.protect_secret(&m.secret), m.created_at],
+            "INSERT INTO mounts (id, user_id, vault_id, share_id, share_name, mount_prefix, access, home_node, home_addrs, only_file, secret, created_at, rw_paths) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+            params![m.id, m.user_id, m.vault_id, m.share_id, m.share_name, m.mount_prefix, m.access, m.home_node, m.home_addrs.join(" "), m.only_file, self.protect_secret(&m.secret), m.created_at, join_paths(&m.rw_paths)],
         )?;
         Ok(m)
     }
@@ -708,7 +731,7 @@ impl Registry {
 // bump REGISTRY_SCHEMA_VERSION together with the new step. See docs/STORAGE.md.
 
 /// Current registry schema version (`PRAGMA user_version` after all steps ran).
-pub const REGISTRY_SCHEMA_VERSION: u32 = 3;
+pub const REGISTRY_SCHEMA_VERSION: u32 = 4;
 
 fn migrate(conn: &Connection) -> anyhow::Result<()> {
     let mut version: u32 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
@@ -767,6 +790,17 @@ fn migrate(conn: &Connection) -> anyhow::Result<()> {
         version = 3;
     }
 
+    if version < 4 {
+        // v4: read-only tickets may name share-relative paths that stay writable.
+        if !has_column(conn, "share_grants", "rw_paths")? {
+            conn.execute_batch("ALTER TABLE share_grants ADD COLUMN rw_paths TEXT NOT NULL DEFAULT ''")?;
+        }
+        if !has_column(conn, "mounts", "rw_paths")? {
+            conn.execute_batch("ALTER TABLE mounts ADD COLUMN rw_paths TEXT NOT NULL DEFAULT ''")?;
+        }
+        version = 4;
+    }
+
     if version > REGISTRY_SCHEMA_VERSION {
         anyhow::bail!(
             "registry.db schema is v{version} but this server only knows v{REGISTRY_SCHEMA_VERSION}; upgrade the server"
@@ -788,7 +822,16 @@ fn has_column(conn: &Connection, table: &str, column: &str) -> anyhow::Result<bo
 }
 
 const SHARE_COLS: &str = "SELECT id, user_id, vault_id, name, prefix, only_file, created_at FROM shares";
-const MOUNT_COLS: &str = "SELECT id, user_id, vault_id, share_id, share_name, mount_prefix, access, home_node, secret, created_at, revoked_at, home_addrs, only_file FROM mounts";
+const MOUNT_COLS: &str = "SELECT id, user_id, vault_id, share_id, share_name, mount_prefix, access, home_node, secret, created_at, revoked_at, home_addrs, only_file, rw_paths FROM mounts";
+
+/// `rw_paths` are stored newline-separated: keys pass `valid_key`, so they never contain one.
+fn join_paths(paths: &[String]) -> String {
+    paths.join("\n")
+}
+
+fn split_paths(s: &str) -> Vec<String> {
+    s.split('\n').filter(|p| !p.is_empty()).map(str::to_string).collect()
+}
 
 fn row_to_share(r: &rusqlite::Row) -> rusqlite::Result<ShareInfo> {
     Ok(ShareInfo {
@@ -817,6 +860,7 @@ fn row_to_mount(r: &rusqlite::Row) -> rusqlite::Result<MountInfo> {
         revoked_at: r.get(10)?,
         home_addrs: r.get::<_, String>(11)?.split_whitespace().map(str::to_string).collect(),
         only_file: r.get(12)?,
+        rw_paths: split_paths(&r.get::<_, String>(13)?),
     })
 }
 
@@ -878,6 +922,28 @@ mod migration_tests {
         let m = reg.mount_by_id("m1").unwrap().unwrap();
         assert!(m.home_addrs.is_empty());
         assert_eq!(m.only_file, None);
+        assert!(m.rw_paths.is_empty());
+    }
+
+    #[test]
+    fn v3_db_gets_rw_paths_columns() {
+        let (_d, reg) = open_with(
+            "CREATE TABLE users (id TEXT PRIMARY KEY, name TEXT NOT NULL UNIQUE, created_at TEXT NOT NULL);
+             CREATE TABLE vaults (id TEXT PRIMARY KEY, user_id TEXT NOT NULL, name TEXT NOT NULL, created_at TEXT NOT NULL);
+             CREATE TABLE shares (id TEXT PRIMARY KEY, user_id TEXT NOT NULL, vault_id TEXT NOT NULL, name TEXT NOT NULL, prefix TEXT NOT NULL, only_file TEXT, created_at TEXT NOT NULL);
+             CREATE TABLE share_grants (share_id TEXT NOT NULL, secret_hash TEXT NOT NULL, label TEXT NOT NULL, access TEXT NOT NULL, created_at TEXT NOT NULL, revoked_at TEXT, last_seen_at TEXT, PRIMARY KEY (share_id, label));
+             CREATE TABLE mounts (id TEXT PRIMARY KEY, user_id TEXT NOT NULL, vault_id TEXT NOT NULL, share_id TEXT NOT NULL, share_name TEXT NOT NULL, mount_prefix TEXT NOT NULL, access TEXT NOT NULL, home_node TEXT NOT NULL, secret TEXT NOT NULL, created_at TEXT NOT NULL, revoked_at TEXT, home_addrs TEXT NOT NULL DEFAULT '', only_file TEXT);
+             INSERT INTO shares VALUES ('s1','u','v','S','Projects/',NULL,'t');
+             INSERT INTO share_grants VALUES ('s1','h','ticket-1','ro','t',NULL,NULL);
+             PRAGMA user_version = 3;",
+        );
+        assert_eq!(user_version(&reg), REGISTRY_SCHEMA_VERSION);
+        let g = &reg.grants_for_share("s1").unwrap()[0];
+        assert_eq!(g.access, "ro");
+        assert!(g.rw_paths.is_empty());
+        let secret = reg.create_grant("s1", "mixed", "ro", &["Inbox/".to_string(), "todo.md".to_string()]).unwrap();
+        let ga = reg.check_grant("s1", &secret).unwrap().unwrap();
+        assert_eq!(ga.rw_paths, vec!["Inbox/", "todo.md"]);
     }
 
     #[test]

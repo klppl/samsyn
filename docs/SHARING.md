@@ -1,8 +1,9 @@
 # Sharing part of a vault with another user
 
-Share one folder or one note from your vault with another person, with live sync,
-without sharing the whole vault and without exposing either server to the
-internet. From the user's point of view: pick a folder, copy a ticket, the other
+Share one folder, one note or the whole vault with another person, with live
+sync, without exposing either server to the internet. A read-only ticket can
+leave a few paths writable, so one person can read everything and edit only an
+inbox. From the user's point of view: pick a folder, copy a ticket, the other
 person pastes it, and both see the same folder and edit it live. The two people
 can be on the same server or on two different servers, and the other person may
 have no server at all (guest mode).
@@ -20,8 +21,12 @@ Two ideas carry the whole feature:
    document*; on the other side it keeps the share document equal to the subtree
    at the mount path in the friend's vault document.
 
-A ticket grants access to exactly the folder or note it was created for. Changing
-what a ticket covers is not supported; create a new share instead.
+A ticket grants access to exactly the folder, note or vault it was created for,
+read & write or read-only. A read-only ticket may additionally list share-relative
+paths that stay writable (`rw_paths`: `Inbox/`, `todo.md`); the effective access of
+one key is "writable" when the ticket is read & write or the key lies under one of
+those paths. Changing what a ticket covers is not supported; issue a new ticket
+(or create a new share) instead.
 
 ```
 owner's vault doc  ──bridge──  share doc  ══iroh══  share doc replica  ──bridge──  friend's vault doc
@@ -58,23 +63,33 @@ nothing is lost.
 ## Data model
 
 - **Share**: `{ id, owner, vault, name, prefix, only_file? }`. `prefix` is the
-  folder (`Projects/X/`); `only_file` narrows it to one note (`prefix = Notes/`,
-  `only_file = a.md`). Share keys are relative to `prefix`.
-- **Grant** (= ticket): `{ share, secret_hash, label, access: rw|ro, revoked_at }`.
-  Many grants per share; revoke one without affecting the others.
-- **Mount**: `{ id, user, vault, share, mount_prefix, access, home_node,
+  folder (`Projects/X/`) or `""` for the whole vault; `only_file` narrows it to
+  one note (`prefix = Notes/`, `only_file = a.md`). Share keys are relative to
+  `prefix`. A whole-vault share's document is a full copy of the vault, so it
+  doubles that vault's storage.
+- **Grant** (= ticket): `{ share, secret_hash, label, access: rw|ro, rw_paths,
+  revoked_at }`. Many grants per share; revoke one without affecting the others.
+  `rw_paths` (read-only grants only, never on single-note shares, at most 32) are
+  validated against the share when the ticket is issued: an existing note stays a
+  note, anything else becomes a folder entry with a trailing `/`, so a folder that
+  does not exist yet can be made writable in advance.
+- **Mount**: `{ id, user, vault, share, mount_prefix, access, rw_paths, home_node,
   home_addrs, only_file, secret }`. A mount bridges the share into the friend's
   vault at `mount_prefix`. `home_node` is the owner's server; when it equals this
   server the share is local (two users on one server) and no network is involved.
   Otherwise the server keeps a local *replica* of the share document and links it
   to the owner's server.
 - **Ticket**: `samsyn` + base32 of `{ v, share_id, name, node_id, secret, access,
-  addrs, url }`. `addrs` are the owner server's relay URL and direct addresses at
-  the time the ticket was made (`relay:https://…`, `ip:host:port`); the node id
-  alone is enough when a relay is in use. `url` is the owner's public HTTPS URL
-  for guest mode (ticket v2; v1 tickets without it still decode).
+  addrs, url, rw_paths }`. `addrs` are the owner server's relay URL and direct
+  addresses at the time the ticket was made (`relay:https://…`, `ip:host:port`);
+  the node id alone is enough when a relay is in use. `url` is the owner's public
+  HTTPS URL for guest mode (v2). `rw_paths` is v3 and only emitted when the list
+  is non-empty, so plain tickets stay v2 and keep working with older plugins; v1,
+  v2 and v3 all decode. The ticket's `access` and `rw_paths` are for display; the
+  owner's registry (or its hello, for remote mounts) is what is enforced.
 
-Overlapping shares or mounts (nested prefixes) in one vault are refused. A mount
+Overlapping shares or mounts (nested prefixes) in one vault are refused, which
+means a whole-vault share is the only share in that vault. A mount
 prefix must be empty in the vault when mounted, so nothing is overwritten. Share
 and mount creation run under one server-wide lock (overlap check, registry
 insert, bridge attach), so two concurrent requests cannot both pass the overlap
@@ -113,15 +128,18 @@ When a ticket from another server is mounted:
 
 1. The mounting server connects and does a hello handshake (share id + ticket
    secret) before storing anything, so a bad or revoked ticket fails immediately
-   with a clear error. The owner answers with the granted access level, share
-   name and single-note flag.
+   with a clear error. The owner answers with the granted access level, writable
+   paths, share name and single-note flag (sharing protocol v2; v1 peers get
+   `VersionMismatch` until upgraded).
 2. It creates a replica document under `users/<uid>/mounts/<mount_id>/`, bridges
    it into the vault at the mount path exactly like a local share (truth =
    replica), and starts a *link* task.
 3. The link keeps one connection open with one long-lived control stream carrying
    y-sync messages both ways, framed as `u32 length + payload`. On the owner side
    this stream is treated like any WebSocket client of the share document; for a
-   read-only grant the owner drops incoming document updates. Reconnects use
+   read-only grant the owner drops incoming document updates, for a read-only
+   grant with writable paths it applies them and reverts what lies outside (see
+   *Read-only mount* below). Reconnects use
    exponential backoff (2 s … 60 s); the owner re-checks the grant every 30 s and
    closes the link when it is revoked or the share is deleted, after which the
    mounting server marks the mount revoked and removes the bridge (files stay).
@@ -159,6 +177,15 @@ so); only a real grant denial revokes the mount.
   outside the mount, `<mount> (read-only copy)/<same relative path>`, and logs a
   warning. The same happens if the owner deletes a file while the friend has local
   content for it.
+- **Read-only mount with writable paths**: the bridge decides per key. Edits under
+  a writable path flow to the share like on a read & write mount; everything else
+  is reverted and rescued as above. For peers that talk to the share document
+  directly (guests, remote servers) the owner's server applies the update first,
+  then undoes the changes on keys outside the writable paths by re-asserting the
+  owner's vault content (which has not seen them yet) and drops them from the
+  propagation queue, so no mount ever sees them. The headless client and the
+  plugin lock only the read-only part on disk and never push from it; a tampered
+  client gains nothing.
 - **Blobs**: when a bridge replays a binary file it copies the bytes into the
   target store *before* inserting the metadata, so a client that fetches the
   moment the metadata arrives finds the bytes. The plugin additionally retries a
@@ -215,9 +242,9 @@ Guest routes, all authenticated by `(share id, secret)` given as `?secret=` or
 | Method | Path | Notes |
 |---|---|---|
 | POST | `/guest/session/{id}` | secret → session id (7 days); every other guest route accepts `?session=` / Bearer session instead of the secret |
-| GET | `/guest/shares/{id}` | name, access, folder or note; validates the ticket |
-| GET | `/guest/ws/{id}` | y-sync WebSocket on the share document; read-only grants have their document updates dropped server-side |
-| GET/PUT | `/guest/blobs/{id}/{hash}` | share-scoped blobs; PUT only for read & write and within `--max-share-mb` |
+| GET | `/guest/shares/{id}` | name, access, `rw_paths`, folder or note; validates the ticket |
+| GET | `/guest/ws/{id}` | y-sync WebSocket on the share document; read-only grants have their document updates dropped server-side, read-only grants with writable paths have updates outside those paths reverted |
+| GET/PUT | `/guest/blobs/{id}/{hash}` | share-scoped blobs; PUT only when the ticket can write somewhere (blobs are content-addressed, the key check happens on the socket) and within `--max-share-mb` |
 
 Tickets travel as text, as a deep link (`obsidian://samsyn?op=mount&ticket=…`) or
 as a QR code of that link; scanning it opens Obsidian with the mount dialog filled
@@ -236,22 +263,26 @@ connection stamps `last_seen_at` on its ticket, shown to the owner.
 | Method | Path | Body → Result |
 |---|---|---|
 | GET | `/api/vaults/{vault}/sharing` | → node_id, shares (with grants), mounts |
-| POST | `/api/vaults/{vault}/shares` | `{path, name?, access?}` → share + first ticket |
-| POST | `/api/shares/{id}/tickets` | `{label?, access?}` → ticket |
+| POST | `/api/vaults/{vault}/shares` | `{path, name?, access?, rw_paths?}` → share + first ticket; `path: ""` shares the whole vault |
+| POST | `/api/shares/{id}/tickets` | `{label?, access?, rw_paths?}` → ticket (`rw_paths` only with `access: "ro"`) |
 | DELETE | `/api/shares/{id}/grants/{label}` | revoke; on an already revoked ticket: delete it from the list |
 | POST | `/api/shares/{id}/grants/{label}/restore` | un-revoke: same ticket valid again, local mounts re-attached (remote mounts must be mounted again) |
 | DELETE | `/api/shares/{id}` | unshare |
 | POST | `/api/vaults/{vault}/mounts` | `{ticket, mount_path}` → mount |
 | PATCH | `/api/mounts/{id}` | `{path}` → move the mount to another folder (keys renamed server-side, nothing deleted) |
-| PATCH | `/api/shares/{id}` | `{path}` → move the shared folder or note within the owner's vault |
+| PATCH | `/api/shares/{id}` | `{path}` → move the shared folder or note within the owner's vault (not for whole-vault shares) |
 | DELETE | `/api/mounts/{id}` | unmount |
-| POST | `/api/tickets/inspect` | `{ticket}` → name, access, same_server, valid (local tickets), from_own_vault |
+| POST | `/api/tickets/inspect` | `{ticket}` → name, access, rw_paths, same_server, valid (local tickets), from_own_vault |
+
+Grants and mounts in the `sharing` listing carry `rw_paths` too; a whole-vault
+share has `path: ""`.
 
 ## Plugin UI
 
-Settings → **Sharing**: *Shared by me* (create from folder/note path, list with
-ticket copy, new ticket, revoke, unshare) and *Shared with me* (paste ticket +
-mount path, list, unmount). File explorer context menu: **Samsyn: Share…**. The
+Settings → **Sharing**: *Shared by me* (create from folder/note path or a
+*Share the whole vault* toggle, read-only tickets with a *Still writable* list,
+list with ticket copy, new ticket, revoke, unshare) and *Shared with me* (paste
+ticket + mount path, list, unmount). File explorer context menu: **Samsyn: Share…**. The
 ticket view also shows a QR code and an `obsidian://samsyn` link. Nothing else in
 the plugin changes.
 
@@ -264,4 +295,5 @@ read-only revert and rescue copy, revoke, restart, unmount), `remote-e2e.sh`
 the replica), `presence-e2e.sh` (presence across the bridge) and `guest-e2e.sh`
 (guest mount, reconnect). The same scenarios run as Rust integration tests under
 `server/tests/` (`sharing_same_server.rs`, `sharing_remote.rs`,
-`sharing_guest.rs`).
+`sharing_guest.rs`), plus `sharing_mixed.rs` (whole-vault share, read-only ticket
+with writable paths, restart).

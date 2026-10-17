@@ -17,6 +17,7 @@ test("decodes a ticket issued by the server", () => {
   assert.equal(t.access, "rw");
   assert.deepEqual(t.addrs, []);
   assert.equal(t.url, "https://sync.example.test");
+  assert.deepEqual(t.rwPaths, []);
   // whitespace and case do not matter
   assert.deepEqual(decodeTicket("  " + SERVER_TICKET.toUpperCase().replace("SAMSYN", "samsyn") + "\n"), t);
 });
@@ -31,10 +32,13 @@ test("round-trips v1 and v2", () => {
     access: "ro",
     addrs: ["relay:https://r.example/", "ip:1.2.3.4:5"],
     url: "https://sync.example",
+    rwPaths: [],
   };
   assert.deepEqual(decodeTicket(encodeTicket(t)), t);
   const v1 = { ...t, version: 1, url: "" };
   assert.deepEqual(decodeTicket(encodeTicket(v1)), v1);
+  const v3 = { ...t, version: 3, rwPaths: ["Inbox/", "todo.md"] };
+  assert.deepEqual(decodeTicket(encodeTicket(v3)), v3);
 });
 
 test("rejects garbage", () => {

@@ -268,7 +268,7 @@ Crashes land in `fuzz/artifacts/<target>/`; turn each into a unit test next to t
 
 ## Tests
 
-Sharing scenarios also exist as Rust integration tests in `server/tests/` (`sharing_same_server`, `sharing_remote`, `sharing_guest`; helpers in `tests/common/mod.rs`). They spawn the freshly built binary as servers and headless clients in a temp dir and take 1–3 minutes each:
+Sharing scenarios also exist as Rust integration tests in `server/tests/` (`sharing_same_server`, `sharing_remote`, `sharing_guest`, `sharing_mixed`; helpers in `tests/common/mod.rs`). They spawn the freshly built binary as servers and headless clients in a temp dir and take 1–3 minutes each:
 
 ```sh
 cd server && cargo test --test sharing_same_server   # or --test sharing_remote / --test sharing_guest

@@ -41,7 +41,33 @@ class PathSuggest extends AbstractInputSuggest<TAbstractFile> {
   }
 }
 
-const accessText = (a: string) => (a === "ro" ? "read only" : "read & write");
+/** "read & write", "read only" or "read only, except Inbox/, todo.md". */
+export const accessText = (a: string, rwPaths: string[] = []) =>
+  a === "ro" ? (rwPaths.length ? `read only, except ${rwPaths.join(", ")}` : "read only") : "read & write";
+
+/** A share's path for display: "" is the whole vault. */
+export const pathText = (p: string) => (p ? p : "the whole vault");
+
+/** One path per line (or comma separated) from the writable-paths box. */
+function parsePaths(raw: string): string[] {
+  return raw
+    .split(/[\n,]/)
+    .map((p) => p.trim().replace(/^\/+/, ""))
+    .filter((p) => p.length > 0);
+}
+
+/** The "Writable paths" box shared by the share and new-ticket dialogs; visible for read-only tickets. */
+function addRwPathsSetting(el: HTMLElement, onChange: (v: string) => void): Setting {
+  const s = new Setting(el)
+    .setName("Still writable")
+    .setDesc("Optional, for read-only tickets: folders or notes (relative to what is shared) the holder may edit anyway, one per line. A folder that does not exist yet is fine.")
+    .addTextArea((t) => {
+      t.setPlaceholder("Inbox\nMeetings/2026").onChange(onChange);
+      t.inputEl.rows = 3;
+      t.inputEl.addClass("samsyn-wide");
+    });
+  return s;
+}
 
 /** Shows a freshly issued ticket. Tickets are shown once; the server only stores a hash. */
 function renderTicket(el: HTMLElement, ticket: string, title: string, hint: string): void {
@@ -65,8 +91,10 @@ function renderTicket(el: HTMLElement, ticket: string, title: string, hint: stri
 export class ShareModal extends Modal {
   private api: SamsynApi;
   private path: string;
+  private wholeVault = false;
   private name = "";
   private access = "rw";
+  private rwPaths = "";
 
   constructor(
     private plugin: SamsynPlugin,
@@ -84,44 +112,64 @@ export class ShareModal extends Modal {
     contentEl.createEl("h2", { text: "Share a folder or note" });
     contentEl.createEl("p", {
       cls: "samsyn-muted",
-      text: "Whoever gets the ticket sees exactly this path, live, in their own vault. Nothing else in your vault is visible to them. One ticket covers one path; share another path with another ticket.",
+      text: "Whoever gets the ticket sees exactly this path, live, in their own vault. Nothing else in your vault is visible to them. One ticket covers one path; share another path with another ticket. Sharing the whole vault leaves no room for other shares in it.",
     });
+    let pathInput: import("obsidian").TextComponent | null = null;
     new Setting(contentEl)
       .setName("Folder or note")
       .setDesc("A path in this vault, e.g. Projects/X or Notes/plan.md")
       .addText((t) => {
+        pathInput = t;
         t.setPlaceholder("Projects/X").setValue(this.path).onChange((v) => (this.path = v));
         t.inputEl.addClass("samsyn-wide");
         new PathSuggest(this.app, t.inputEl);
       });
     new Setting(contentEl)
+      .setName("Share the whole vault")
+      .setDesc("Everything synced in this vault, including notes added later. Combine with a read-only ticket and a few writable folders to give someone a window into your vault with an inbox.")
+      .addToggle((t) =>
+        t.setValue(this.wholeVault).onChange((v) => {
+          this.wholeVault = v;
+          pathInput?.setDisabled(v);
+        }),
+      );
+    new Setting(contentEl)
       .setName("Name")
-      .setDesc("How the other person sees it. Defaults to the folder or note name.")
+      .setDesc("How the other person sees it. Defaults to the folder, note or vault name.")
       .addText((t) => t.setPlaceholder("optional").onChange((v) => (this.name = v)));
+    let rwSetting: Setting | null = null;
     new Setting(contentEl)
       .setName("Access for the first ticket")
-      .setDesc("Read-only people see your edits but cannot change anything. You can issue more tickets later.")
-      .addDropdown((d) => d.addOptions({ rw: "Read & write", ro: "Read only" }).setValue(this.access).onChange((v) => (this.access = v)));
+      .setDesc("Read-only people see your edits but cannot change anything, except in the paths you list below. You can issue more tickets later.")
+      .addDropdown((d) =>
+        d.addOptions({ rw: "Read & write", ro: "Read only" }).setValue(this.access).onChange((v) => {
+          this.access = v;
+          rwSetting?.settingEl.toggle(v === "ro");
+        }),
+      );
+    rwSetting = addRwPathsSetting(contentEl, (v) => (this.rwPaths = v));
+    rwSetting.settingEl.toggle(this.access === "ro");
     const msg = contentEl.createDiv({ cls: "samsyn-error" });
     new Setting(contentEl).addButton((b) =>
       b
         .setButtonText("Create share")
         .setCta()
         .onClick(async () => {
-          const p = this.path.trim().replace(/^\/+|\/+$/g, "");
-          if (!p) {
-            msg.setText("Enter a path.");
+          const p = this.wholeVault ? "" : this.path.trim().replace(/^\/+|\/+$/g, "");
+          if (!p && !this.wholeVault) {
+            msg.setText("Enter a path, or switch on “Share the whole vault”.");
             return;
           }
+          const rwPaths = this.access === "ro" ? parsePaths(this.rwPaths) : [];
           b.setDisabled(true);
           try {
-            const r = await this.api.createShare(p, this.name.trim(), this.access);
+            const r = await this.api.createShare(p, this.name.trim(), this.access, rwPaths);
             this.onDone?.();
             renderTicket(
               contentEl,
               r.ticket,
-              `Sharing ${r.share.path}`,
-              `Send this ticket (${accessText(this.access)}) to the person you want to work with. It is shown once; you can always create a new one.`,
+              `Sharing ${pathText(r.path ?? p)}`,
+              `Send this ticket (${accessText(r.access ?? this.access, r.rw_paths ?? rwPaths)}) to the person you want to work with. It is shown once; you can always create a new one.`,
             );
           } catch (e) {
             msg.setText((e as Error).message);
@@ -141,6 +189,7 @@ export class NewTicketModal extends Modal {
   private api: SamsynApi;
   private label = "";
   private access = "rw";
+  private rwPaths = "";
 
   constructor(
     private plugin: SamsynPlugin,
@@ -155,14 +204,22 @@ export class NewTicketModal extends Modal {
     const { contentEl } = this;
     contentEl.addClass("samsyn-modal");
     contentEl.createEl("h2", { text: `New ticket for ${this.share.name}` });
-    contentEl.createEl("p", { cls: "samsyn-muted", text: `${this.share.path} · each person should get their own ticket, so you can revoke one without affecting the others.` });
+    contentEl.createEl("p", { cls: "samsyn-muted", text: `${pathText(this.share.path)} · each person should get their own ticket, so you can revoke one without affecting the others.` });
     new Setting(contentEl)
       .setName("Label")
       .setDesc("Who this ticket is for, e.g. the person's name.")
       .addText((t) => t.setPlaceholder("anna").onChange((v) => (this.label = v)));
-    new Setting(contentEl)
-      .setName("Access")
-      .addDropdown((d) => d.addOptions({ rw: "Read & write", ro: "Read only" }).setValue(this.access).onChange((v) => (this.access = v)));
+    let rwSetting: Setting | null = null;
+    new Setting(contentEl).setName("Access").addDropdown((d) =>
+      d.addOptions({ rw: "Read & write", ro: "Read only" }).setValue(this.access).onChange((v) => {
+        this.access = v;
+        rwSetting?.settingEl.toggle(v === "ro");
+      }),
+    );
+    if (this.share.only_file === null) {
+      rwSetting = addRwPathsSetting(contentEl, (v) => (this.rwPaths = v));
+      rwSetting.settingEl.toggle(this.access === "ro");
+    }
     const msg = contentEl.createDiv({ cls: "samsyn-error" });
     new Setting(contentEl).addButton((b) =>
       b
@@ -171,9 +228,10 @@ export class NewTicketModal extends Modal {
         .onClick(async () => {
           b.setDisabled(true);
           try {
-            const r = await this.api.newTicket(this.share.id, this.access, this.label.trim());
+            const rwPaths = this.access === "ro" ? parsePaths(this.rwPaths) : [];
+            const r = await this.api.newTicket(this.share.id, this.access, this.label.trim(), rwPaths);
             this.onDone?.();
-            renderTicket(contentEl, r.ticket, `Ticket "${r.label}"`, `${accessText(r.access)} access to ${this.share.path}. Shown once.`);
+            renderTicket(contentEl, r.ticket, `Ticket "${r.label}"`, `${accessText(r.access, r.rw_paths)} access to ${pathText(this.share.path)}. Shown once.`);
           } catch (e) {
             msg.setText((e as Error).message);
             b.setDisabled(false);
@@ -239,7 +297,7 @@ export class MountModal extends Modal {
             b.setDisabled(true);
             try {
               const r = await this.api.mount(this.ticket.trim(), this.mountPath.trim());
-              new Notice(`Samsyn: mounted at ${r.mount_path} (${accessText(r.access)}). Files arrive shortly.`, 8000);
+              new Notice(`Samsyn: mounted at ${r.mount_path} (${accessText(r.access, r.rw_paths)}). Files arrive shortly.`, 8000);
               this.onDone?.();
               this.close();
             } catch (e) {
@@ -297,7 +355,7 @@ export class MountModal extends Modal {
       }
       const local = this.local;
       row("Share", local.name);
-      row("Access", accessText(local.access));
+      row("Access", accessText(local.access, local.rwPaths));
       if (!this.mountPath.trim() && pathInput) {
         this.mountPath = `Shared/${local.name}`;
         pathInput.value = this.mountPath;
@@ -315,6 +373,9 @@ export class MountModal extends Modal {
         if (this.ticket.trim() !== t) return; // superseded
         this.info = info;
         row("Via my server", info.same_server ? "same server as the owner" : `owner is on another server (${info.node_id.slice(0, 10)}…), linked peer-to-peer`);
+        if (info.same_server && (info.access !== local.access || JSON.stringify(info.rw_paths ?? []) !== JSON.stringify(local.rwPaths))) {
+          row("Access (server)", accessText(info.access, info.rw_paths ?? []));
+        }
         if (info.from_own_vault) row("Owner", `you (vault "${info.from_own_vault}")`, "is-warn");
         if (info.valid === false) {
           row("Status", "invalid or revoked", "is-bad");
@@ -367,11 +428,12 @@ export class MountModal extends Modal {
       shareId: t.shareId,
       secret: t.secret,
       access: t.access === "ro" ? "ro" : "rw",
+      rwPaths: t.access === "ro" ? t.rwPaths : [],
       name: t.name,
       mountPath,
       enabled: true,
     });
-    new Notice(`Samsyn: “${t.name}” mounted at ${mountPath} as guest (${accessText(t.access)}). Files arrive shortly.`, 8000);
+    new Notice(`Samsyn: “${t.name}” mounted at ${mountPath} as guest (${accessText(t.access, t.rwPaths)}). Files arrive shortly.`, 8000);
   }
 
   onClose(): void {

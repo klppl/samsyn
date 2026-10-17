@@ -41,9 +41,12 @@ to deploy.
 
 ### Beyond basic sync
 
-- **Share any subfolder**, not the whole vault, with live editing on both sides.
+- **Share any subfolder, a note or the whole vault**, with live editing on both
+  sides.
 - **Read-only shares**: grant read-only access, and the other side's local edits
   are put back (kept as a conflict copy) instead of leaking upstream.
+- **Read-only with an inbox**: a read-only ticket can keep a few folders or notes
+  writable, so one person reads your whole vault and edits only `Inbox/`.
 - **Guest sharing, no account**: a friend joins a share with only a ticket, no
   user on your server, and nothing outside that one folder is ever exposed.
 - **Cross-server sharing**: two independent servers sync a shared folder over an

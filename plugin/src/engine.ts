@@ -46,14 +46,16 @@ export interface EngineTarget {
   /** "" for the home engine; "Shared/X/" (with trailing slash) for a guest mount. */
   root: string;
   readOnly: boolean;
+  /** Keys (relative to `root`, folders with trailing slash) that stay writable when `readOnly`. */
+  rwPaths: string[];
   /** Vault paths (with trailing slash) this engine must never touch: the guest mount roots. */
   excludeRoots: string[];
   /**
    * Guests: exchange the ticket secret for a session before connecting (and again when the
-   * connection keeps failing, e.g. after the session expired). Returns the WebSocket params
-   * and the blob client to use.
+   * connection keeps failing, e.g. after the session expired). Returns the WebSocket params,
+   * the blob client to use and, if the owner's server says so, the current writable paths.
    */
-  prepare?: () => Promise<{ params: Record<string, string>; blobClient: BlobClient }>;
+  prepare?: () => Promise<{ params: Record<string, string>; blobClient: BlobClient; rwPaths?: string[] }>;
 }
 
 export interface Diagnostics {
@@ -191,6 +193,7 @@ export class SyncEngine {
       const r = await this.target.prepare();
       this.target.params = r.params;
       this.blobClient = r.blobClient;
+      if (r.rwPaths) this.target.rwPaths = r.rwPaths;
       this.lastError = null;
     } catch (e) {
       this.lastError = `${this.target.label}: ${(e as Error).message}`;
@@ -406,12 +409,19 @@ export class SyncEngine {
     return this.settings.syncBinary;
   }
 
-  /** Read-only guests never write to the document; say so once. */
+  /** Is this key writable for us? Read-only targets may still allow a few paths. */
+  private canWrite(key: string): boolean {
+    if (!this.target.readOnly) return true;
+    return this.target.rwPaths.some((p) => (p.endsWith("/") ? key.startsWith(p) : key === p));
+  }
+
+  /** Read-only guests never write to the document (outside their writable paths); say so once. */
   private blockedReadOnly(key: string): boolean {
-    if (!this.target.readOnly) return false;
+    if (this.canWrite(key)) return false;
     if (!this.warnedReadOnly) {
       this.warnedReadOnly = true;
-      new Notice(`Samsyn: ${this.target.label} is read-only. Your edits under ${this.target.root} are not sent and will be overwritten by the shared version.`, 10_000);
+      const except = this.target.rwPaths.length ? ` except ${this.target.rwPaths.map((p) => this.target.root + p).join(", ")}` : "";
+      new Notice(`Samsyn: ${this.target.label} is read-only${except}. Your other edits under ${this.target.root} are not sent and will be overwritten by the shared version.`, 10_000);
     }
     console.info(`[samsyn] read-only ${this.target.label}: not pushing ${key}`);
     return true;
@@ -851,7 +861,7 @@ export class SyncEngine {
     const toDelete: string[] = [];
     for (const key of [...this.texts.keys()]) {
       if (localFiles.has(key) || !this.shouldSync(key)) continue;
-      if (this.state.synced[key] && !this.target.readOnly) {
+      if (this.state.synced[key] && this.canWrite(key)) {
         // We had it and it is gone locally: deleted while offline.
         toDelete.push(key);
       } else {
@@ -861,7 +871,7 @@ export class SyncEngine {
     }
     for (const key of [...this.blobs.keys()]) {
       if (localFiles.has(key) || !this.shouldSync(key)) continue;
-      if (this.state.synced[key] && !this.target.readOnly) {
+      if (this.state.synced[key] && this.canWrite(key)) {
         toDelete.push(key);
       } else {
         const m = this.blobs.get(key);

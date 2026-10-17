@@ -12,6 +12,7 @@ use yrs::types::{EntryChange, Event, PathSegment};
 use yrs::updates::encoder::{Encode, Encoder, EncoderV1};
 use yrs::{Any, DeepObservable, GetString, Map, Observable, Origin, Out, ReadTxn, StateVector, Transact, WriteTxn};
 
+use crate::access::Access;
 use crate::bridge::{Bridge, Change, ChangeKind, OwnedDelta, Side};
 use crate::presence::{PresenceEvent, PresenceSender};
 use crate::storage::{MountInfo, ShareInfo, Storage, User, VaultInfo, VaultStore};
@@ -395,7 +396,7 @@ impl DocRegistry {
             share: sdoc,
             vault_prefix: share.prefix.clone(),
             only_file: share.only_file.clone(),
-            access: "rw".into(),
+            access: Access::full(),
             truth: Side::Vault,
         });
         bridge.reconcile();
@@ -422,7 +423,7 @@ impl DocRegistry {
             share: sdoc.clone(),
             vault_prefix: mount.mount_prefix.clone(),
             only_file,
-            access: mount.access.clone(),
+            access: Access::new(&mount.access, &mount.rw_paths),
             truth: Side::Share,
         });
         bridge.reconcile();
@@ -610,6 +611,39 @@ impl DocRegistry {
             .collect()
     }
 
+    /// A peer with partial write access (a read-only ticket with writable paths) just had its
+    /// update applied to the share document `doc`. Its changes on writable keys stay; the rest
+    /// are undone by re-asserting the owner's vault content, which has not seen them yet, and
+    /// dropped from the propagation queue so no mount ever sees them. Must be called with
+    /// `apply_lock` held, after the apply and before `propagate`.
+    pub fn enforce_share_access(&self, doc: &Arc<LiveDoc>, access: &Access) {
+        if access.base_rw {
+            return;
+        }
+        let blocked: Vec<String> = {
+            let mut changes = doc.changes.lock();
+            let (keep, blocked): (Vec<Change>, Vec<Change>) =
+                std::mem::take(&mut *changes).into_iter().partition(|c| c.from.is_some() || access.writable(&c.key));
+            *changes = keep;
+            let mut keys: Vec<String> = blocked.into_iter().map(|c| c.key).collect();
+            keys.sort();
+            keys.dedup();
+            keys
+        };
+        if blocked.is_empty() {
+            return;
+        }
+        tracing::warn!(doc = %doc.label, "peer wrote outside its writable paths; reverting {} key(s)", blocked.len());
+        let owner = self.bridges_for(&doc.id).into_iter().find(|b| b.share.id == doc.id && b.mount_id.is_none());
+        match owner {
+            Some(b) => {
+                let vault_keys: Vec<String> = blocked.iter().filter_map(|k| b.share_to_vault_key(k)).collect();
+                b.assert_keys(&b.vault, &b.share, &vault_keys, true);
+            }
+            None => tracing::error!(doc = %doc.label, "no owner bridge loaded; cannot revert {blocked:?}"),
+        }
+    }
+
     /// Drain recorded changes of `start` and replay them across bridges until nothing is left.
     /// Must be called with `apply_lock` held.
     pub fn propagate(&self, start: &Arc<LiveDoc>) {
@@ -621,9 +655,7 @@ impl DocRegistry {
                 continue;
             }
             for bridge in self.bridges_for(&doc.id) {
-                if let Some(target) = bridge.forward(&doc, &changes) {
-                    work.push(target);
-                }
+                work.extend(bridge.forward(&doc, &changes));
             }
             rounds += 1;
             if rounds > 10_000 {

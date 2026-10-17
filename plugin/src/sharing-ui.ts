@@ -1,9 +1,7 @@
 import { Notice, Setting } from "obsidian";
 import { SamsynApi, SharingInfo } from "./api";
 import type SamsynPlugin from "./main";
-import { ConfirmModal, MountModal, MoveMountModal, NewTicketModal, ShareModal } from "./sharing-modals";
-
-const accessText = (a: string) => (a === "ro" ? "read only" : "read & write");
+import { accessText, ConfirmModal, MountModal, MoveMountModal, NewTicketModal, pathText, ShareModal } from "./sharing-modals";
 
 function describeStatus(status: string): string {
   if (status === "active") return "live, same server";
@@ -140,7 +138,7 @@ export class SharingSection {
       const active = s.grants.filter((g) => !g.revoked_at);
       new Setting(card)
         .setName(s.name)
-        .setDesc(`${s.path} · ${active.length} active ticket${active.length === 1 ? "" : "s"} · mounted by ${s.mounted_by}`)
+        .setDesc(`${pathText(s.path)} · ${active.length} active ticket${active.length === 1 ? "" : "s"} · mounted by ${s.mounted_by}`)
         .setClass("samsyn-card-head")
         .addButton((b) => b.setButtonText("New ticket…").onClick(() => new NewTicketModal(this.plugin, s, reload).open()))
         .addButton((b) =>
@@ -150,7 +148,7 @@ export class SharingSection {
             .onClick(() =>
               this.confirm(
                 `Stop sharing ${s.name}?`,
-                `Everyone who mounted ${s.path} stops receiving changes. They keep their copy as ordinary notes; your files are untouched.`,
+                `Everyone who mounted ${pathText(s.path)} stops receiving changes. They keep their copy as ordinary notes; your files are untouched.`,
                 "Unshare",
                 () => this.api.unshare(s.id),
               ),
@@ -164,7 +162,7 @@ export class SharingSection {
         new Setting(card)
           .setClass("samsyn-grant")
           .setName(`ticket “${g.label}”`)
-          .setDesc(`${accessText(g.access)} · issued ${g.created_at.slice(0, 10)}${uses}${seen}`)
+          .setDesc(`${accessText(g.access, g.rw_paths)} · issued ${g.created_at.slice(0, 10)}${uses}${seen}`)
           .addButton((b) =>
             b
               .setButtonText("Revoke")
@@ -205,7 +203,7 @@ export class SharingSection {
               .setClass("samsyn-grant")
               .setClass("samsyn-revoked")
               .setName(`ticket “${g.label}”`)
-              .setDesc(`${accessText(g.access)} · revoked ${g.revoked_at!.slice(0, 10)}`)
+              .setDesc(`${accessText(g.access, g.rw_paths)} · revoked ${g.revoked_at!.slice(0, 10)}`)
               .addButton((b) =>
                 b.setButtonText("Restore").onClick(() =>
                   this.confirm(
@@ -248,7 +246,7 @@ export class SharingSection {
       const row = new Setting(card).setName(m.name).setClass("samsyn-card-head");
       if (revoked) row.setDesc(`${m.mount_path} · access revoked by the owner · no longer syncing · your copy stays as ordinary notes`);
       else {
-        row.setDesc(`${m.mount_path} · ${accessText(m.access)} · ${describeStatus(m.status)}`);
+        row.setDesc(`${m.mount_path} · ${accessText(m.access, m.rw_paths)} · ${describeStatus(m.status)}`);
         row.addButton((b) =>
           b.setButtonText("Move…").onClick(() =>
             new MoveMountModal(this.plugin, { kind: "mount", id: m.id, name: m.name, path: m.mount_path, isFile: false }, reload).open(),
@@ -304,7 +302,7 @@ export class SharingSection {
       new Setting(card)
         .setName(m.name)
         .setClass("samsyn-card-head")
-        .setDesc(`${m.mountPath} · ${accessText(m.access)} · guest of ${m.url.replace(/^https?:\/\//, "")} · ${status}`)
+        .setDesc(`${m.mountPath} · ${accessText(m.access, m.rwPaths)} · guest of ${m.url.replace(/^https?:\/\//, "")} · ${status}`)
         .addButton((b) =>
           b.setButtonText("Move…").onClick(() =>
             new MoveMountModal(this.plugin, { kind: "guest", id: m.id, name: m.name, path: m.mountPath, isFile: false }, () => this.render()).open(),

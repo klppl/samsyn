@@ -6,6 +6,7 @@ use std::sync::Arc;
 
 use yrs::{Any, GetString, Map, Origin, Out, ReadTxn, Text, TextPrelim, Transact, WriteTxn};
 
+use crate::access::Access;
 use crate::client::diff::diff_text;
 use crate::ids::valid_key;
 use crate::vault::{LiveDoc, BRIDGE_ORIGIN_PREFIX};
@@ -48,7 +49,9 @@ pub struct Bridge {
     pub share: Arc<LiveDoc>,
     pub vault_prefix: String,
     pub only_file: Option<String>,
-    pub access: String,
+    /// What the vault side may write into the share. Owner bridges are always full access;
+    /// a mount's comes from its ticket (read & write, read-only, or read-only with writable paths).
+    pub access: Access,
     pub truth: Side,
 }
 
@@ -85,17 +88,18 @@ impl Bridge {
         }
     }
 
-    /// Replay `changes` recorded on `source` into the other side. Returns the target doc if
-    /// anything was applied there (so the caller continues propagation from it).
-    pub fn forward(&self, source: &Arc<LiveDoc>, changes: &[Change]) -> Option<Arc<LiveDoc>> {
+    /// Replay `changes` recorded on `source` into the other side. Returns every doc that was
+    /// written (so the caller continues propagation from them): the target, and/or the vault
+    /// when edits on read-only keys were undone there.
+    pub fn forward(&self, source: &Arc<LiveDoc>, changes: &[Change]) -> Vec<Arc<LiveDoc>> {
         let (target, to_share) = if source.id == self.vault.id {
             (&self.share, true)
         } else if source.id == self.share.id {
             (&self.vault, false)
         } else {
-            return None;
+            return Vec::new();
         };
-        let mapped: Vec<(String, &Change)> = changes
+        let mut mapped: Vec<(String, &Change)> = changes
             .iter()
             .filter(|c| c.from.as_deref() != Some(target.id.as_str()))
             .filter_map(|c| {
@@ -104,16 +108,25 @@ impl Bridge {
             })
             .collect();
         if mapped.is_empty() {
-            return None;
+            return Vec::new();
         }
+        let mut written = Vec::new();
 
-        if to_share && self.access == "ro" {
-            // Read-only mount: undo the vault-side edits by re-asserting the share's content.
-            tracing::info!(mount = ?self.mount_id, "reverting edits on read-only mount");
-            let keys: Vec<String> = mapped.iter().map(|(k, _)| k.clone()).collect();
-            self.rescue_unshared(&keys);
-            self.assert_keys(&self.share, &self.vault, &keys, false);
-            return Some(self.vault.clone());
+        if to_share && !self.access.base_rw {
+            // Read-only mount (possibly with writable paths): undo the vault-side edits on keys
+            // the ticket does not cover by re-asserting the share's content; the rest flows.
+            let (allowed, blocked): (Vec<_>, Vec<_>) = mapped.into_iter().partition(|(k, _)| self.access.writable(k));
+            if !blocked.is_empty() {
+                tracing::info!(mount = ?self.mount_id, "reverting {} edit(s) on the read-only part of a mount", blocked.len());
+                let keys: Vec<String> = blocked.iter().map(|(k, _)| k.clone()).collect();
+                self.rescue_unshared(&keys);
+                self.assert_keys(&self.share, &self.vault, &keys, false);
+                written.push(self.vault.clone());
+            }
+            mapped = allowed;
+            if mapped.is_empty() {
+                return written;
+            }
         }
 
         // Blob bytes go first: the metadata insert below is broadcast to clients at once and
@@ -124,7 +137,8 @@ impl Bridge {
             }
         }
         apply_changes(target, &source.id, &mapped);
-        Some(target.clone())
+        written.push(target.clone());
+        written
     }
 
     /// On a read-only mount, a key (in share terms) that the share does not have but the vault
@@ -228,7 +242,7 @@ impl Bridge {
     }
 
     /// Copy the given keys (named in `src` terms) from `src` to `dst`, making them equal.
-    fn assert_keys(&self, src: &Arc<LiveDoc>, dst: &Arc<LiveDoc>, keys: &[String], src_is_vault: bool) {
+    pub(crate) fn assert_keys(&self, src: &Arc<LiveDoc>, dst: &Arc<LiveDoc>, keys: &[String], src_is_vault: bool) {
         // Read everything from src first so we never hold two awareness locks at once.
         let mut items: Vec<(String, Option<String>, Option<Any>)> = Vec::new();
         {

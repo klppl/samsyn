@@ -74,12 +74,31 @@ fn p2p_mount_edit_revoke_restart() {
     assert!(!a.contains("Projects/X/a.md", "carol-edit"));
     eventually!(5, !c.contains("Shared/X/a.md", "carol-edit"), "ro edit reverted", c.proc);
 
+    // Dave's ticket: read-only except `inbox/` (a folder that does not exist yet) and `new.md`.
+    // Mounted on B too, so the writable paths travel in the p2p hello.
+    let mixed = api_json(&sa, &owner, "POST", &format!("/api/shares/{share_id}/tickets"), Some(json!({"label": "dave", "access": "ro", "rw_paths": ["inbox/", "new.md"]})));
+    let mixed_ticket = mixed["ticket"].as_str().unwrap().to_string();
+    let r = api_json(&sb, &carol_tok, "POST", "/api/vaults/vc/mounts", Some(json!({"ticket": mixed_ticket, "mount_path": "Mixed/X"})));
+    assert_eq!(r["access"], "ro", "dave mount: {r}");
+    assert_eq!(r["rw_paths"], json!(["inbox/", "new.md"]), "dave mount: {r}");
+    eventually!(20, c.contains("Mixed/X/a.md", "TOP") && c.exists("Mixed/X/new.md"), "mixed mount gets files", c.proc, sb.proc);
+    c.write("Mixed/X/inbox/c.md", "from carol\n");
+    c.append("Mixed/X/new.md", "carol-on-new");
+    eventually!(20, a.read("Projects/X/inbox/c.md") == "from carol\n" && a.contains("Projects/X/new.md", "carol-on-new"), "writable paths flow over p2p", a.proc, sa.proc, sb.proc);
+    c.append("Mixed/X/a.md", "carol-mixed-ro");
+    sleep(3.0);
+    assert!(!a.contains("Projects/X/a.md", "carol-mixed-ro"), "read-only part of a mixed mount reached the owner");
+    eventually!(5, !c.contains("Mixed/X/a.md", "carol-mixed-ro"), "mixed mount read-only edit reverted", c.proc);
+
     // Revoke carol on A: B's link is denied and the mount turns revoked.
     let (code, _) = api_raw(&sa, &owner, "DELETE", &format!("/api/shares/{share_id}/grants/carol"), None);
     assert_eq!(code, 204);
     eventually!(
         60,
-        api_json(&sb, &carol_tok, "GET", "/api/vaults/vc/sharing", None)["mounts"][0]["status"] == "revoked",
+        api_json(&sb, &carol_tok, "GET", "/api/vaults/vc/sharing", None)["mounts"]
+            .as_array()
+            .map(|ms| ms.iter().any(|m| m["mount_path"] == "Shared/X" && m["status"] == "revoked"))
+            .unwrap_or(false),
         "carol's mount revoked on B",
         sb.proc,
         sa.proc

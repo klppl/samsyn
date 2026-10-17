@@ -10,6 +10,7 @@
 //! - [`client`]: the headless sync client.
 //! - [`config`], [`cli`]: command-line surface.
 
+pub mod access;
 pub mod account;
 pub mod app;
 pub mod blobs;

@@ -359,6 +359,7 @@ export default class SamsynPlugin extends Plugin {
       blobClient: BlobClient.forVault(urls.http, this.settings.vaultId, this.settings.token),
       root: "",
       readOnly: false,
+      rwPaths: [],
       excludeRoots: this.guestRoots(),
     };
   }
@@ -377,10 +378,17 @@ export default class SamsynPlugin extends Plugin {
       blobClient: null,
       root: m.mountPath.replace(/\/+$/, "") + "/",
       readOnly: m.access === "ro",
+      rwPaths: m.rwPaths ?? [],
       excludeRoots: [],
       prepare: async () => {
         const s = await guestSession(urls.http, m.shareId, m.secret);
-        return { params: { session: s.session }, blobClient: BlobClient.forShare(urls.http, m.shareId, s.session) };
+        // The owner's server is authoritative for what the ticket may write.
+        const rwPaths = Array.isArray(s.rw_paths) ? s.rw_paths : (m.rwPaths ?? []);
+        if (JSON.stringify(rwPaths) !== JSON.stringify(m.rwPaths ?? [])) {
+          m.rwPaths = rwPaths;
+          void this.saveSettings();
+        }
+        return { params: { session: s.session }, blobClient: BlobClient.forShare(urls.http, m.shareId, s.session), rwPaths };
       },
     };
   }
@@ -509,6 +517,12 @@ export default class SamsynPlugin extends Plugin {
     if (!this.settings.deviceName) {
       this.settings.deviceName = `${Platform.isMobile ? "Mobile" : "Desktop"}-${randomSuffix()}`;
       dirty = true;
+    }
+    for (const m of this.settings.guestMounts) {
+      if (!Array.isArray(m.rwPaths)) {
+        m.rwPaths = [];
+        dirty = true;
+      }
     }
     if (dirty) await this.saveSettings();
   }

@@ -21,6 +21,7 @@ use axum::{
 };
 use sha2::{Digest, Sha256};
 
+use crate::access::Access;
 use crate::config::extract_token;
 use crate::storage::ShareInfo;
 use crate::vault::LiveDoc;
@@ -97,7 +98,14 @@ pub struct Guest {
     pub share: ShareInfo,
     pub label: String,
     pub access: String,
+    pub rw_paths: Vec<String>,
     pub secret: String,
+}
+
+impl Guest {
+    fn effective(&self) -> Access {
+        Access::new(&self.access, &self.rw_paths)
+    }
 }
 
 /// Validate `(share_id, secret)`; the secret comes as `?secret=` or `Authorization: Bearer`.
@@ -117,7 +125,7 @@ fn authenticate(state: &SharedState, share_id: &str, headers: &HeaderMap, query:
     let reg = state.storage.registry();
     let found = match reg.share_by_id(share_id) {
         Ok(Some(s)) if secret.len() == 64 => match reg.check_grant(&s.id, &secret) {
-            Ok(Some((label, access))) => Some(Guest { share: s, label, access, secret: secret.clone() }),
+            Ok(Some(g)) => Some(Guest { share: s, label: g.label, access: g.access, rw_paths: g.rw_paths, secret: secret.clone() }),
             _ => None,
         },
         _ => None,
@@ -164,6 +172,7 @@ pub async fn session(
         "share_id": g.share.id,
         "name": g.share.name,
         "access": g.access,
+        "rw_paths": g.rw_paths,
         "only_file": g.share.only_file,
     }))
     .into_response()
@@ -186,6 +195,7 @@ pub async fn info(
         "share_id": g.share.id,
         "name": g.share.name,
         "access": g.access,
+        "rw_paths": g.rw_paths,
         "label": g.label,
         "only_file": g.share.only_file,
         "kind": if g.share.only_file.is_some() { "note" } else { "folder" },
@@ -212,8 +222,9 @@ pub async fn ws(
         Ok(d) => d,
         Err(r) => return r,
     };
-    tracing::info!(share = %g.share.name, label = %g.label, access = %g.access, "guest connected");
-    let writable = g.access == "rw";
+    let access = g.effective();
+    tracing::info!(share = %g.share.name, label = %g.label, access = %crate::access::describe(&g.access, &g.rw_paths), "guest connected");
+    let writable = access.any_write();
     let Some(slot) = state.limits.conns.acquire(&format!("g:{}", crate::ids::token_hash(&g.secret)), state.serve.max_conns_per_ticket) else {
         return (StatusCode::TOO_MANY_REQUESTS, "too many connections for this ticket").into_response();
     };
@@ -221,7 +232,7 @@ pub async fn ws(
     let cap = if writable { crate::ws::MAX_WS_MESSAGE } else { crate::ws::MAX_WS_MESSAGE_READONLY };
     ws.max_message_size(cap)
         .max_frame_size(cap)
-        .on_upgrade(move |socket| crate::ws::handle_socket(socket, state, doc, writable, check, slot))
+        .on_upgrade(move |socket| crate::ws::handle_socket(socket, state, doc, crate::ws::Write::from_access(&access), check, slot))
 }
 
 // ------------------------------------------------------------------ blobs
@@ -270,7 +281,9 @@ pub async fn put_blob(
         Ok(g) => g,
         Err(r) => return r,
     };
-    if g.access != "rw" {
+    // Blobs are content-addressed, so the key is unknown here: any writable path is enough.
+    // The metadata that references the hash goes through the per-key check on the socket.
+    if !g.effective().any_write() {
         return (StatusCode::FORBIDDEN, "read-only ticket").into_response();
     }
     if !valid_hash(&hash) {

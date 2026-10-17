@@ -56,7 +56,8 @@ const MAX_INCOMING_CONNS: usize = 64;
 /// A peer must finish the hello this fast or the stream is dropped.
 const HELLO_TIMEOUT: Duration = Duration::from_secs(30);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(25);
-const PROTOCOL_VERSION: u8 = 1;
+/// v2 added `rw_paths` to `HelloReply::Ok` (writable paths on read-only tickets).
+const PROTOCOL_VERSION: u8 = 2;
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Hello {
@@ -67,7 +68,7 @@ pub struct Hello {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub enum HelloReply {
-    Ok { access: String, name: String, only_file: Option<String> },
+    Ok { access: String, name: String, only_file: Option<String>, rw_paths: Vec<String> },
     /// The grant is invalid or revoked: the mounting side gives up for good.
     Denied(String),
     /// Transient: the two servers speak different protocol versions; keep retrying.
@@ -195,10 +196,11 @@ async fn sync_loop(
     doc: &Arc<LiveDoc>,
     send: &mut SendStream,
     recv: &mut RecvStream,
-    writable: bool,
+    write: crate::ws::Write,
     wants: &mpsc::UnboundedSender<String>,
     revoke: Option<RevokeCheck>,
 ) -> anyhow::Result<()> {
+    let writable = write.applies();
     let protocol = DefaultProtocol;
     let mut rx = doc.tx.subscribe();
     write_frame(send, &start_message(doc)?).await?;
@@ -228,6 +230,9 @@ async fn sync_loop(
                         };
                         handle_payload(&protocol, &mut aw, &data, &mut owned, writable, &mut limits)
                     };
+                    if let crate::ws::Write::Paths(a) = &write {
+                        docs.enforce_share_access(doc, a);
+                    }
                     for h in new_blob_hashes(doc) {
                         let _ = wants.send(h);
                     }
@@ -527,7 +532,7 @@ async fn owner_stream(
                 Some(s) => reg.check_grant(&s.id, &hello.secret)?,
                 None => None,
             };
-            let (share, (label, access)) = match (share, grant) {
+            let (share, grant) = match (share, grant) {
                 (Some(s), Some(g)) => (s, g),
                 _ => {
                     limits.p2p_fails.lock().record_failure(peer_node.to_string());
@@ -544,9 +549,10 @@ async fn owner_stream(
             };
             let doc = docs.share_doc_for_link(&share)?;
             *session.doc.lock() = Some(doc.clone());
-            let reply = HelloReply::Ok { access: access.clone(), name: share.name.clone(), only_file: share.only_file.clone() };
+            let access = crate::access::Access::new(&grant.access, &grant.rw_paths);
+            let reply = HelloReply::Ok { access: grant.access.clone(), name: share.name.clone(), only_file: share.only_file.clone(), rw_paths: grant.rw_paths.clone() };
             write_frame(&mut send, &postcard::to_stdvec(&reply)?).await?;
-            tracing::info!(peer = %peer, share = %share.name, "p2p link up via {label} ({access})");
+            tracing::info!(peer = %peer, share = %share.name, "p2p link up via {} ({})", grant.label, crate::access::describe(&grant.access, &grant.rw_paths));
 
             let (wants_tx, wants_rx) = mpsc::unbounded_channel();
             let fetcher = tokio::spawn(fetch_blobs(conn.clone(), docs.clone(), doc.clone(), wants_rx));
@@ -555,7 +561,7 @@ async fn owner_stream(
                 &doc,
                 &mut send,
                 &mut recv,
-                access == "rw",
+                crate::ws::Write::from_access(&access),
                 &wants_tx,
                 Some(RevokeCheck { share_id: share.id.clone(), secret: hello.secret.clone() }),
             )
@@ -571,9 +577,18 @@ async fn owner_stream(
 
 // ------------------------------------------------------------------ mounting side (connect)
 
+/// What the owner answered to a hello: granted access, share name, single-note flag and the
+/// writable paths of a read-only ticket (already filtered, never trusted blindly).
+pub struct Granted {
+    pub access: String,
+    pub name: String,
+    pub only_file: Option<String>,
+    pub rw_paths: Vec<String>,
+}
+
 /// Connect and complete the hello handshake, returning what the owner granted. Used by the
 /// mount API before anything is stored, so a bad ticket fails fast.
-pub async fn probe(ep: &Endpoint, ticket: &Ticket) -> anyhow::Result<(String, String, Option<String>)> {
+pub async fn probe(ep: &Endpoint, ticket: &Ticket) -> anyhow::Result<Granted> {
     let addr = ticket_addr(ticket)?;
     let conn = tokio::time::timeout(CONNECT_TIMEOUT, ep.connect(addr, ALPN))
         .await
@@ -583,7 +598,7 @@ pub async fn probe(ep: &Endpoint, ticket: &Ticket) -> anyhow::Result<(String, St
     let reply = handshake(&mut send, &mut recv, ticket).await;
     conn.close(0u32.into(), b"probe");
     match reply? {
-        HelloReply::Ok { access, name, only_file } => Ok((access, name, only_file)),
+        HelloReply::Ok { access, name, only_file, rw_paths } => Ok(Granted { access, name, only_file, rw_paths: crate::access::accept_rw_paths(&rw_paths) }),
         HelloReply::Denied(msg) => anyhow::bail!("owner server refused the ticket: {msg}"),
         HelloReply::VersionMismatch { expected } => {
             anyhow::bail!("owner server speaks sharing protocol v{expected}, this server v{PROTOCOL_VERSION}; upgrade one of them")
@@ -656,6 +671,7 @@ async fn run_link(ep: &Endpoint, docs: &Arc<DocRegistry>, mount: &MountInfo, rep
         access: mount.access.clone(),
         addrs: mount.home_addrs.clone(),
         url: String::new(),
+        rw_paths: Vec::new(),
     };
     let addr = ticket_addr(&ticket)?;
     let conn = tokio::time::timeout(CONNECT_TIMEOUT, ep.connect(addr, ALPN))
@@ -680,7 +696,7 @@ async fn run_link(ep: &Endpoint, docs: &Arc<DocRegistry>, mount: &MountInfo, rep
     let server = tokio::spawn(serve_streams(conn.clone(), session));
     let (wants_tx, wants_rx) = mpsc::unbounded_channel();
     let fetcher = tokio::spawn(fetch_blobs(conn.clone(), docs.clone(), replica.clone(), wants_rx));
-    let res = sync_loop(docs, replica, &mut send, &mut recv, true, &wants_tx, None).await;
+    let res = sync_loop(docs, replica, &mut send, &mut recv, crate::ws::Write::Full, &wants_tx, None).await;
     server.abort();
     fetcher.abort();
     conn.close(0u32.into(), b"bye");

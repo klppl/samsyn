@@ -4,6 +4,8 @@ import { SamsynSettings, serverUrls } from "./settings";
 export interface Grant {
   label: string;
   access: string;
+  /** Share-relative paths a read-only ticket may still write; folders end with "/". */
+  rw_paths: string[];
   created_at: string;
   revoked_at: string | null;
   mounted_by: number;
@@ -25,12 +27,14 @@ export interface MountRow {
   name: string;
   mount_path: string;
   access: string;
+  rw_paths: string[];
   status: string;
 }
 export interface TicketInfo {
   share_id: string;
   name: string;
   access: string;
+  rw_paths: string[];
   node_id: string;
   same_server: boolean;
   p2p_available: boolean;
@@ -83,11 +87,12 @@ export class SamsynApi {
   sharing(): Promise<SharingInfo> {
     return this.call("GET", `/api/vaults/${this.vault()}/sharing`);
   }
-  createShare(path: string, name: string, access: string): Promise<{ share: ShareRow; ticket: string; label: string }> {
-    return this.call("POST", `/api/vaults/${this.vault()}/shares`, { path, name: name || undefined, access });
+  /** `path` empty = the whole vault. `rwPaths` only with access "ro". */
+  createShare(path: string, name: string, access: string, rwPaths: string[] = []): Promise<{ share: ShareRow; path: string; ticket: string; label: string; access: string; rw_paths: string[] }> {
+    return this.call("POST", `/api/vaults/${this.vault()}/shares`, { path, name: name || undefined, access, rw_paths: rwPaths.length ? rwPaths : undefined });
   }
-  newTicket(shareId: string, access: string, label?: string): Promise<{ ticket: string; label: string; access: string }> {
-    return this.call("POST", `/api/shares/${shareId}/tickets`, { access, label: label || undefined });
+  newTicket(shareId: string, access: string, label?: string, rwPaths: string[] = []): Promise<{ ticket: string; label: string; access: string; rw_paths: string[] }> {
+    return this.call("POST", `/api/shares/${shareId}/tickets`, { access, label: label || undefined, rw_paths: rwPaths.length ? rwPaths : undefined });
   }
   revoke(shareId: string, label: string): Promise<void> {
     return this.call("DELETE", `/api/shares/${shareId}/grants/${encodeURIComponent(label)}`);
@@ -102,7 +107,7 @@ export class SamsynApi {
   unshare(shareId: string): Promise<void> {
     return this.call("DELETE", `/api/shares/${shareId}`);
   }
-  mount(ticket: string, mountPath: string): Promise<{ mount_path: string; access: string }> {
+  mount(ticket: string, mountPath: string): Promise<{ mount_path: string; access: string; rw_paths: string[] }> {
     return this.call("POST", `/api/vaults/${this.vault()}/mounts`, { ticket, mount_path: mountPath || undefined });
   }
   moveMount(mountId: string, path: string): Promise<{ mount_path: string }> {
@@ -134,6 +139,7 @@ export interface GuestSession {
   share_id: string;
   name: string;
   access: string;
+  rw_paths: string[];
   only_file: string | null;
 }
 

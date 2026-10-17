@@ -34,14 +34,14 @@ New guest surface, all authenticated by `(share_id, secret)` via the existing `c
 
 | Method | Path | Notes |
 |---|---|---|
-| GET | `/guest/shares/{share_id}?secret=` | name, access, path kind; lets the plugin validate a ticket and detect revocation |
+| GET | `/guest/shares/{share_id}?secret=` | name, access, `rw_paths`, path kind; lets the plugin validate a ticket and detect revocation |
 | GET | `/guest/ws/{share_id}?secret=` | y-sync WebSocket on the share's LiveDoc |
-| GET/PUT | `/guest/blobs/{share_id}/{hash}?secret=` | share-scoped blob store; PUT only for `rw` grants and subject to `max_blob` |
+| GET/PUT | `/guest/blobs/{share_id}/{hash}?secret=` | share-scoped blob store; PUT only for grants that can write somewhere (`rw`, or `ro` with `rw_paths`) and subject to `max_blob` |
 
 Implementation notes:
 
 - **Share LiveDocs.** `DocRegistry` already loads share docs for bridges; add `get_or_load_share(share_id)` and reuse `ws::handle_socket` unchanged — it only needs a `LiveDoc`. Guest updates flow through the same server-wide apply lock and propagate across the owner bridge like any other edit.
-- **Read-only enforcement is server-side.** On an `ro` connection, incoming sync updates and awareness are parsed but **not applied**; the server replies with sync-step-1 so the client converges back to the server state. The plugin additionally behaves like the bridge does for ro mounts (reverts local edits), but the server never trusts that.
+- **Read-only enforcement is server-side.** On an `ro` connection, incoming sync updates and awareness are parsed but **not applied**; the server replies with sync-step-1 so the client converges back to the server state. On an `ro` connection with `rw_paths`, updates are applied and the changes on keys outside those paths are undone right away from the owner's vault (see SHARING.md, *Read-only mount with writable paths*). The plugin additionally behaves like the bridge does for ro mounts (reverts local edits, never pushes from the read-only part), but the server never trusts that.
 - **Revocation disconnects.** Keep a map `(share_id, grant_label) → CancellationToken` for live guest sockets; `revoke_ticket` and `delete_share` cancel them. A reconnect re-checks the grant and gets 403.
 - **No mount rows for guests.** A guest mount lives in the guest's plugin settings, not in the owner's registry. For owner visibility, add `last_seen_at` (and optionally a connected-count) to `share_grants`, updated on guest connect, surfaced in the sharing UI ("ticket-2 · last seen 5 min ago").
 - **Public-endpoint hygiene.** The secret is a bearer credential on a public server: respond identically to unknown share and bad secret; never log the query string on `/guest/*`; rate-limit failed guest auth per IP (simple in-memory bucket is enough). Browsers cannot set WS headers, so the secret rides in the query string for v1; a later hardening step can exchange the ticket for a short-lived session token via `POST /guest/session` and keep secrets out of URLs entirely.
@@ -70,11 +70,11 @@ Home engine: identity mapping, `extraExcludes` = every guest mount root (so gues
 
 ### Lifecycle and settings
 
-- `settings.guestMounts: { id, url, shareId, secret, access, name, mountPath, enabled }[]` (parsed from the ticket at paste time; the raw ticket is not kept).
+- `settings.guestMounts: { id, url, shareId, secret, access, rwPaths, name, mountPath, enabled }[]` (parsed from the ticket at paste time; the raw ticket is not kept; `rwPaths` is refreshed from the owner's `/guest/session` answer on every connect).
 - The plugin runs N+1 engines: optional home engine (server URL may now be empty — Alice's case) plus one per enabled guest mount. Status bar and `Show sync status` aggregate; per-mount state in settings.
 - Persistence is namespaced per engine (`doc-home.bin`, `doc-guest-<share_id>.bin`, same for state) instead of the current single pair.
 - Each guest engine gets a `WebsocketProvider` against `wss://<url>/guest/ws` with room `share_id` and `params: {secret}`, and a `BlobClient` against the guest blob routes.
-- `ro` mounts: local edits under the mount are reverted from the doc (same policy as the server bridge), pushes suppressed, folder marked read-only in the UI.
+- `ro` mounts: local edits under the mount are reverted from the doc (same policy as the server bridge), pushes suppressed, folder marked read-only in the UI. With `rwPaths`, keys under those paths are pushed like on an `rw` mount.
 - Mobile: the owner URL must be `https://` (same WebKit constraint as today); the UI says so when a ticket's URL is plain http.
 
 ### UI

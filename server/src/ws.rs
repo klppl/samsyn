@@ -213,7 +213,7 @@ pub async fn ws_handler(
     let _ = user;
     ws.max_message_size(MAX_WS_MESSAGE)
         .max_frame_size(MAX_WS_MESSAGE)
-        .on_upgrade(move |socket| handle_socket(socket, state, vault, true, Some(SessionCheck::User(token)), slot))
+        .on_upgrade(move |socket| handle_socket(socket, state, vault, Write::Full, Some(SessionCheck::User(token)), slot))
 }
 
 /// What keeps a socket alive; re-checked every 30 s so a revoked token or ticket ends the
@@ -225,16 +225,47 @@ pub enum SessionCheck {
     Guest(String, String),
 }
 
-/// Pump y-sync between one WebSocket and a live document. `writable == false` drops the
-/// client's document updates (read-only guests).
+/// What one connection may write to its document.
+#[derive(Debug, Clone)]
+pub enum Write {
+    /// Everything (vault owners, read & write tickets).
+    Full,
+    /// Nothing: document updates from the peer are dropped before they are applied.
+    Nothing,
+    /// Only the keys the access allows: updates are applied, then anything outside the
+    /// writable paths is undone (`DocRegistry::enforce_share_access`).
+    Paths(crate::access::Access),
+}
+
+impl Write {
+    pub fn from_access(a: &crate::access::Access) -> Self {
+        if a.base_rw {
+            Write::Full
+        } else if a.rw_paths.is_empty() {
+            Write::Nothing
+        } else {
+            Write::Paths(a.clone())
+        }
+    }
+
+    /// Whether document updates are applied at all.
+    pub fn applies(&self) -> bool {
+        !matches!(self, Write::Nothing)
+    }
+}
+
+/// Pump y-sync between one WebSocket and a live document. `Write::Nothing` drops the client's
+/// document updates (read-only guests); `Write::Paths` applies them and reverts what the
+/// ticket does not cover.
 pub async fn handle_socket(
     socket: WebSocket,
     state: SharedState,
     vault: std::sync::Arc<crate::vault::LiveDoc>,
-    writable: bool,
+    write: Write,
     check: Option<SessionCheck>,
     _slot: crate::limits::ConnSlot,
 ) {
+    let writable = write.applies();
     let (mut sink, mut stream) = socket.split();
     vault.conns.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     *vault.last_active.lock() = std::time::Instant::now();
@@ -279,6 +310,9 @@ pub async fn handle_socket(
                                 };
                                 handle_payload(&protocol, &mut aw, &data, &mut owned_clients, writable, &mut limits)
                             };
+                            if let Write::Paths(a) = &write {
+                                state.docs.enforce_share_access(&vault, a);
+                            }
                             state.docs.propagate(&vault);
                             r
                         };

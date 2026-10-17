@@ -1,7 +1,7 @@
 /**
  * Share tickets, decoded locally so the plugin can read one without any server:
  * `samsyn` + lowercase base32 (no padding) of a postcard-encoded struct.
- * Mirrors server/src/ticket.rs; v1 has no url, v2 appends it.
+ * Mirrors server/src/ticket.rs; v1 has no url, v2 appends it, v3 appends rwPaths.
  */
 export interface Ticket {
   version: number;
@@ -13,6 +13,8 @@ export interface Ticket {
   addrs: string[];
   /** Owner server's public URL (v2). Empty = guests cannot use this ticket. */
   url: string;
+  /** Share-relative paths a read-only ticket may still write (v3); folders end with "/". */
+  rwPaths: string[];
 }
 
 const PREFIX = "samsyn";
@@ -105,7 +107,7 @@ export function decodeTicket(raw: string): Ticket {
   if (!s.toLowerCase().startsWith(PREFIX)) throw new Error("not a samsyn ticket");
   const r = new Reader(base32Decode(s.slice(PREFIX.length)));
   const version = r.u8();
-  if (version !== 1 && version !== 2) throw new Error(`unsupported ticket version ${version}; update the plugin`);
+  if (version !== 1 && version !== 2 && version !== 3) throw new Error(`unsupported ticket version ${version}; update the plugin`);
   const shareId = r.string();
   const name = r.string();
   const nodeId = r.string();
@@ -115,7 +117,12 @@ export function decodeTicket(raw: string): Ticket {
   const addrs: string[] = [];
   for (let i = 0; i < n; i++) addrs.push(r.string());
   const url = version >= 2 ? r.string() : "";
-  return { version, shareId, name, nodeId, secret, access, addrs, url };
+  const rwPaths: string[] = [];
+  if (version >= 3) {
+    const m = r.varint();
+    for (let i = 0; i < m; i++) rwPaths.push(r.string());
+  }
+  return { version, shareId, name, nodeId, secret, access, addrs, url, rwPaths };
 }
 
 /** Encoder, used by tests to round-trip; the server is the only real issuer. */
@@ -130,5 +137,9 @@ export function encodeTicket(t: Ticket): string {
   w.varint(t.addrs.length);
   for (const a of t.addrs) w.string(a);
   if (t.version >= 2) w.string(t.url);
+  if (t.version >= 3) {
+    w.varint(t.rwPaths.length);
+    for (const p of t.rwPaths) w.string(p);
+  }
   return PREFIX + base32Encode(w.bytes());
 }

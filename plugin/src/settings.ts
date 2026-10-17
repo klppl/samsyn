@@ -13,6 +13,8 @@ export interface GuestMount {
   shareId: string;
   secret: string;
   access: "rw" | "ro";
+  /** Share-relative paths a read-only ticket may still write (folders end with "/"). */
+  rwPaths: string[];
   name: string;
   /** Vault folder, no trailing slash, e.g. "Shared/X". */
   mountPath: string;

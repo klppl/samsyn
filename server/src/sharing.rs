@@ -10,6 +10,7 @@ use axum::{
 };
 use serde::Deserialize;
 
+use crate::access::{clean_rw_paths, describe};
 use crate::ids::valid_name;
 use crate::storage::{ShareInfo, User};
 use crate::ticket::Ticket;
@@ -97,7 +98,7 @@ pub async fn get_sharing(
                     .iter()
                     .filter(|m| m.revoked_at.is_none() && hash.as_deref() == Some(crate::ids::token_hash(&m.secret).as_str()))
                     .count();
-                serde_json::json!({ "label": g.label, "access": g.access, "created_at": g.created_at, "revoked_at": g.revoked_at, "mounted_by": mounted_by, "last_seen_at": g.last_seen_at })
+                serde_json::json!({ "label": g.label, "access": g.access, "rw_paths": g.rw_paths, "created_at": g.created_at, "revoked_at": g.revoked_at, "mounted_by": mounted_by, "last_seen_at": g.last_seen_at })
             })
             .collect();
         shares_json.push(serde_json::json!({
@@ -119,7 +120,7 @@ pub async fn get_sharing(
             };
             serde_json::json!({
                 "id": m.id, "share_id": m.share_id, "name": m.share_name, "mount_path": m.mount_prefix.trim_end_matches('/'),
-                "access": m.access, "home_node": m.home_node, "status": status, "created_at": m.created_at,
+                "access": m.access, "rw_paths": m.rw_paths, "home_node": m.home_node, "status": status, "created_at": m.created_at,
             })
         })
         .collect();
@@ -130,12 +131,15 @@ pub async fn get_sharing(
 
 #[derive(Deserialize)]
 pub struct CreateShare {
+    /// Folder, note, or empty for the whole vault.
     pub path: String,
     pub name: Option<String>,
     pub access: Option<String>,
+    /// Share-relative paths the first ticket may write although it is read-only.
+    pub rw_paths: Option<Vec<String>>,
 }
 
-fn make_ticket(state: &SharedState, share: &ShareInfo, secret: String, access: &str) -> anyhow::Result<String> {
+fn make_ticket(state: &SharedState, share: &ShareInfo, secret: String, access: &str, rw_paths: &[String]) -> anyhow::Result<String> {
     Ticket {
         version: crate::ticket::CURRENT_VERSION,
         share_id: share.id.clone(),
@@ -145,8 +149,34 @@ fn make_ticket(state: &SharedState, share: &ShareInfo, secret: String, access: &
         access: access.to_string(),
         addrs: state.docs.endpoint.as_ref().map(crate::remote::addr_strings).unwrap_or_default(),
         url: state.serve.public_url.clone().unwrap_or_default().trim_end_matches('/').to_string(),
+        rw_paths: rw_paths.to_vec(),
     }
     .encode()
+}
+
+/// `rw` or `ro`, with the writable paths of a read-only ticket validated against the share.
+fn ticket_access(access: Option<String>, rw_paths: Option<Vec<String>>, prefix: &str, only_file: bool, keys: &[String]) -> Result<(String, Vec<String>), Response> {
+    let access = access.unwrap_or_else(|| "rw".into());
+    if access != "rw" && access != "ro" {
+        return Err(err(StatusCode::BAD_REQUEST, "access must be rw or ro"));
+    }
+    let raw = rw_paths.unwrap_or_default();
+    if access == "rw" && raw.iter().any(|p| !p.trim().is_empty()) {
+        return Err(err(StatusCode::BAD_REQUEST, "writable paths only apply to read-only tickets"));
+    }
+    let rw_paths = clean_rw_paths(&raw, only_file, |k| keys.iter().any(|x| x == &format!("{prefix}{k}"))).map_err(|m| err(StatusCode::BAD_REQUEST, m))?;
+    Ok((access, rw_paths))
+}
+
+fn share_full_path(prefix: &str, only_file: Option<&str>) -> String {
+    match only_file {
+        Some(f) => format!("{prefix}{f}"),
+        None => prefix.to_string(),
+    }
+}
+
+fn show_path(full: &str) -> String {
+    if full.is_empty() { "(whole vault)".to_string() } else { full.to_string() }
 }
 
 pub async fn create_share(
@@ -165,20 +195,16 @@ pub async fn create_share(
         Err(r) => return r,
     };
     let path = clean_path(&body.path);
-    if path.is_empty() {
-        return err(StatusCode::BAD_REQUEST, "path is required (a folder or a note)");
-    }
-    if !crate::ids::valid_key(&path) {
+    if !path.is_empty() && !crate::ids::valid_key(&path) {
         return err(StatusCode::BAD_REQUEST, "path contains '..', empty or control-character segments");
     }
-    let access = body.access.unwrap_or_else(|| "rw".into());
-    if access != "rw" && access != "ro" {
-        return err(StatusCode::BAD_REQUEST, "access must be rw or ro");
-    }
 
-    // Folder or note? A note is an existing key; a folder has keys below it.
+    // Whole vault, folder or note? An empty path is the vault root; a note is an existing key;
+    // a folder has keys below it.
     let keys = doc.keys();
-    let (prefix, only_file) = if keys.iter().any(|k| k == &path) {
+    let (prefix, only_file) = if path.is_empty() {
+        (String::new(), None)
+    } else if keys.iter().any(|k| k == &path) {
         match path.rsplit_once('/') {
             Some((dir, file)) => (format!("{dir}/"), Some(file.to_string())),
             None => (String::new(), Some(path.clone())),
@@ -190,10 +216,11 @@ pub async fn create_share(
         }
         (p, None)
     };
-    let full = match &only_file {
-        Some(f) => format!("{prefix}{f}"),
-        None => prefix.clone(),
+    let (access, rw_paths) = match ticket_access(body.access, body.rw_paths, &prefix, only_file.is_some(), &keys) {
+        Ok(a) => a,
+        Err(r) => return r,
     };
+    let full = share_full_path(&prefix, only_file.as_deref());
     // Check + insert + attach under one lock, otherwise two concurrent creates could both pass.
     let _admin = state.docs.share_admin.lock();
     match taken_prefixes(&state, &info.id) {
@@ -204,14 +231,16 @@ pub async fn create_share(
         }
         Err(e) => return internal(e),
     }
-    let name = clean_name(&body.name.filter(|n| !n.trim().is_empty()).unwrap_or_else(|| path.rsplit('/').next().unwrap_or(&path).to_string()));
+    let name = clean_name(&body.name.filter(|n| !n.trim().is_empty()).unwrap_or_else(|| {
+        if path.is_empty() { info.name.clone() } else { path.rsplit('/').next().unwrap_or(&path).to_string() }
+    }));
 
     let reg = state.storage.registry();
     let share = match reg.create_share(&user.id, &info.id, &name, &prefix, only_file.as_deref()) {
         Ok(s) => s,
         Err(e) => return internal(e),
     };
-    let secret = match reg.create_grant(&share.id, "ticket-1", &access) {
+    let secret = match reg.create_grant(&share.id, "ticket-1", &access, &rw_paths) {
         Ok(s) => s,
         Err(e) => return internal(e),
     };
@@ -219,12 +248,12 @@ pub async fn create_share(
         let _ = reg.delete_share(&share.id);
         return internal(e);
     }
-    let ticket = match make_ticket(&state, &share, secret, &access) {
+    let ticket = match make_ticket(&state, &share, secret, &access, &rw_paths) {
         Ok(t) => t,
         Err(e) => return internal(e),
     };
-    tracing::info!(user = %user.name, share = %share.name, "share created for {full}");
-    Json(serde_json::json!({ "share": share, "ticket": ticket, "label": "ticket-1" })).into_response()
+    tracing::info!(user = %user.name, share = %share.name, "share created for {} ({})", show_path(&full), describe(&access, &rw_paths));
+    Json(serde_json::json!({ "share": share, "path": full.trim_end_matches('/'), "ticket": ticket, "label": "ticket-1", "access": access, "rw_paths": rw_paths })).into_response()
 }
 
 // ------------------------------------------------------------------ POST /api/shares/{id}/tickets
@@ -233,6 +262,8 @@ pub async fn create_share(
 pub struct NewTicket {
     pub label: Option<String>,
     pub access: Option<String>,
+    /// Share-relative paths a read-only ticket may still write.
+    pub rw_paths: Option<Vec<String>>,
 }
 
 fn owned_share(state: &SharedState, user: &User, id: &str) -> Result<ShareInfo, Response> {
@@ -259,21 +290,25 @@ pub async fn new_ticket(
         Err(r) => return r,
     };
     let body = body.map(|b| b.0).unwrap_or_default();
-    let access = body.access.unwrap_or_else(|| "rw".into());
-    if access != "rw" && access != "ro" {
-        return err(StatusCode::BAD_REQUEST, "access must be rw or ro");
-    }
+    let keys = match state.docs.load_vault_by_id(&share.vault_id) {
+        Ok(d) => d.keys(),
+        Err(e) => return internal(e),
+    };
+    let (access, rw_paths) = match ticket_access(body.access, body.rw_paths, &share.prefix, share.only_file.is_some(), &keys) {
+        Ok(a) => a,
+        Err(r) => return r,
+    };
     let reg = state.storage.registry();
     let label = body.label.filter(|l| !l.trim().is_empty()).unwrap_or_else(|| {
         let n = reg.grants_for_share(&share.id).map(|g| g.len()).unwrap_or(0) + 1;
         format!("ticket-{n}")
     });
-    let secret = match reg.create_grant(&share.id, &label, &access) {
+    let secret = match reg.create_grant(&share.id, &label, &access, &rw_paths) {
         Ok(s) => s,
         Err(e) => return err(StatusCode::CONFLICT, e.to_string()),
     };
-    match make_ticket(&state, &share, secret, &access) {
-        Ok(t) => Json(serde_json::json!({ "ticket": t, "label": label, "access": access })).into_response(),
+    match make_ticket(&state, &share, secret, &access, &rw_paths) {
+        Ok(t) => Json(serde_json::json!({ "ticket": t, "label": label, "access": access, "rw_paths": rw_paths })).into_response(),
         Err(e) => internal(e),
     }
 }
@@ -425,13 +460,13 @@ pub async fn create_mount(
     };
     let reg = state.storage.registry();
     let remote = ticket.node_id != state.docs.node_id;
-    // What the owner granted: (label for the log, access, share name, single-note flag).
-    let (label, grant_access, share_name, only_file) = if remote {
+    // What the owner granted: (label for the log, access, writable paths, share name, single-note flag).
+    let (label, grant_access, rw_paths, share_name, only_file) = if remote {
         let Some(ep) = state.docs.endpoint.as_ref() else {
             return err(StatusCode::NOT_IMPLEMENTED, "this ticket is for a share on another server and p2p is disabled on this one (--no-p2p)");
         };
         match crate::remote::probe(ep, &ticket).await {
-            Ok((access, name, only_file)) => ("p2p".to_string(), access, name, only_file),
+            Ok(g) => ("p2p".to_string(), g.access, g.rw_paths, g.name, g.only_file),
             Err(e) => return err(StatusCode::BAD_GATEWAY, e.to_string()),
         }
     } else {
@@ -444,14 +479,16 @@ pub async fn create_mount(
             return err(StatusCode::BAD_REQUEST, "you cannot mount your own share into the same vault");
         }
         match reg.check_grant(&share.id, &ticket.secret) {
-            Ok(Some((label, access))) => (label, access, share.name.clone(), share.only_file.clone()),
+            Ok(Some(g)) => (g.label, g.access, g.rw_paths, share.name.clone(), share.only_file.clone()),
             Ok(None) => return err(StatusCode::FORBIDDEN, "ticket is invalid or has been revoked"),
             Err(e) => return internal(e),
         }
     };
     // Anything but an explicit "rw" from both the grant and the ticket means read-only; a
-    // peer server could answer with any string.
+    // peer server could answer with any string. The writable paths are the grant's (the
+    // registry here, the owner's hello for remote shares), never the ticket's.
     let access = if grant_access == "rw" && ticket.access == "rw" { "rw" } else { "ro" };
+    let rw_paths = if access == "rw" { Vec::new() } else { rw_paths };
     // A single-note share's file name comes from the peer too: one path segment or nothing.
     let only_file = only_file.filter(|f| crate::ids::valid_key(f) && !f.contains('/') && !f.starts_with('.'));
 
@@ -486,6 +523,7 @@ pub async fn create_mount(
         &share_name,
         &prefix,
         access,
+        &rw_paths,
         &ticket.node_id,
         &ticket.addrs,
         only_file.as_deref(),
@@ -498,8 +536,8 @@ pub async fn create_mount(
         let _ = reg.delete_mount(&mount.id);
         return internal(e);
     }
-    tracing::info!(user = %user.name, share = %share_name, remote, "mounted at {prefix} via {label} ({access})");
-    Json(serde_json::json!({ "mount": mount, "mount_path": mount_path, "access": access })).into_response()
+    tracing::info!(user = %user.name, share = %share_name, remote, "mounted at {prefix} via {label} ({})", describe(access, &rw_paths));
+    Json(serde_json::json!({ "mount": mount, "mount_path": mount_path, "access": access, "rw_paths": rw_paths })).into_response()
 }
 
 // ------------------------------------------------------------------ PATCH /api/mounts/{id}, PATCH /api/shares/{id}
@@ -609,6 +647,9 @@ pub async fn move_share(
         Ok(s) => s,
         Err(r) => return r,
     };
+    if share.prefix.is_empty() && share.only_file.is_none() {
+        return err(StatusCode::BAD_REQUEST, "the whole vault is shared; there is nothing to move");
+    }
     let new_path = clean_path(&body.path);
     if new_path.is_empty() {
         return err(StatusCode::BAD_REQUEST, "path is required");
@@ -681,20 +722,21 @@ pub async fn inspect_ticket(
         Err(e) => return err(StatusCode::BAD_REQUEST, format!("bad ticket: {e}")),
     };
     let same_server = ticket.node_id == state.docs.node_id;
-    let (valid, access, own) = if same_server {
+    let (valid, access, rw_paths, own) = if same_server {
         let reg = state.storage.registry();
         match reg.share_by_id(&ticket.share_id) {
             Ok(Some(s)) => match reg.check_grant(&s.id, &ticket.secret) {
-                Ok(Some((_, grant_access))) => {
-                    let a = if grant_access == "ro" || ticket.access == "ro" { "ro" } else { "rw" };
-                    (Some(true), a.to_string(), Some(s.vault_id))
+                Ok(Some(g)) => {
+                    let a = if g.access == "ro" || ticket.access == "ro" { "ro" } else { "rw" };
+                    let paths = if a == "rw" { Vec::new() } else { g.rw_paths };
+                    (Some(true), a.to_string(), paths, Some(s.vault_id))
                 }
-                _ => (Some(false), ticket.access.clone(), None),
+                _ => (Some(false), ticket.access.clone(), ticket.rw_paths.clone(), None),
             },
-            _ => (Some(false), ticket.access.clone(), None),
+            _ => (Some(false), ticket.access.clone(), ticket.rw_paths.clone(), None),
         }
     } else {
-        (None, ticket.access.clone(), None)
+        (None, ticket.access.clone(), ticket.rw_paths.clone(), None)
     };
     // Only tell the caller about the share's vault when it is their own vault.
     let own_vault = own
@@ -705,6 +747,7 @@ pub async fn inspect_ticket(
         "share_id": ticket.share_id,
         "name": ticket.name,
         "access": access,
+        "rw_paths": rw_paths,
         "node_id": ticket.node_id,
         "same_server": same_server,
         "p2p_available": state.docs.endpoint.is_some(),

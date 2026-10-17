@@ -49,8 +49,9 @@ pub struct Engine {
     recent_deletes: VecDeque<(Instant, usize)>,
     /// Blobs the document references but the server did not have yet: (meta, retry at, attempts).
     pending_blobs: HashMap<String, (BlobMeta, Instant, u32)>,
-    /// Mount prefixes ("Shared/X/") that are read-only for us; local edits there are not pushed.
-    ro_prefixes: Vec<String>,
+    /// Mounts ("Shared/X/") that are read-only for us, each with the vault-relative paths the
+    /// ticket still lets us write; local edits on the read-only part are not pushed.
+    ro_areas: Vec<RoArea>,
     /// Everything shared with other people (our shares and our mounts): moving these, or moving
     /// files across their boundary, is refused like the plugin does.
     shared_roots: Vec<SharedRoot>,
@@ -159,7 +160,7 @@ impl Engine {
             root_missing: false,
             recent_deletes: VecDeque::new(),
             pending_blobs: HashMap::new(),
-            ro_prefixes: Vec::new(),
+            ro_areas: Vec::new(),
             shared_roots: Vec::new(),
             synced: false,
             had_cached_doc,
@@ -293,15 +294,22 @@ impl Engine {
         };
         let Ok(body) = res.bytes().await else { return };
         let Ok(v) = serde_json::from_slice::<serde_json::Value>(&body) else { return };
-        let mut ro: Vec<String> = if self.args.is_guest() {
-            // Guest: the whole directory is the share; read-only means all of it.
-            if v["access"].as_str() == Some("ro") { vec![String::new()] } else { vec![] }
+        let rw_list = |m: &serde_json::Value, prefix: &str| -> Vec<String> {
+            m["rw_paths"].as_array().into_iter().flatten().filter_map(|p| p.as_str()).map(|p| format!("{prefix}{p}")).collect()
+        };
+        let mut ro: Vec<RoArea> = if self.args.is_guest() {
+            // Guest: the whole directory is the share; read-only means all of it (minus the
+            // ticket's writable paths).
+            if v["access"].as_str() == Some("ro") { vec![RoArea { prefix: String::new(), rw: rw_list(&v, "") }] } else { vec![] }
         } else { v["mounts"]
             .as_array()
             .map(|ms| {
                 ms.iter()
                     .filter(|m| m["access"].as_str() == Some("ro") && m["status"].as_str() != Some("revoked"))
-                    .filter_map(|m| m["mount_path"].as_str().map(|p| format!("{}/", p.trim_end_matches('/'))))
+                    .filter_map(|m| {
+                        let prefix = format!("{}/", m["mount_path"].as_str()?.trim_end_matches('/'));
+                        Some(RoArea { rw: rw_list(m, &prefix), prefix })
+                    })
                     .collect()
             })
             .unwrap_or_default() };
@@ -327,28 +335,36 @@ impl Engine {
                 }
             }
             if roots.iter().map(|r| &r.path).ne(self.shared_roots.iter().map(|r| &r.path)) {
-                let list: Vec<&str> = roots.iter().map(|r| r.path.as_str()).collect();
+                let list: Vec<&str> = roots.iter().map(|r| if r.path.is_empty() { "(whole vault)" } else { r.path.as_str() }).collect();
                 tracing::info!("shared with other people here: {list:?} (moving these on disk is undone)");
             }
             self.shared_roots = roots;
         }
-        if ro == self.ro_prefixes {
+        if ro == self.ro_areas {
             return;
         }
-        let was = std::mem::replace(&mut self.ro_prefixes, ro);
-        for p in &self.ro_prefixes {
-            if p.is_empty() {
-                tracing::info!("this share is read-only: local edits are not synced and are restored from the server");
+        let was = std::mem::replace(&mut self.ro_areas, ro);
+        for a in &self.ro_areas {
+            let except = if a.rw.is_empty() { String::new() } else { format!(" (except {})", a.rw.join(", ")) };
+            if a.prefix.is_empty() {
+                tracing::info!("this share is read-only{except}: local edits are not synced and are restored from the server");
             } else {
-                tracing::info!("{p} is a read-only share: edits there are not synced and are restored from the server");
+                tracing::info!("{} is a read-only share{except}: edits there are not synced and are restored from the server", a.prefix);
             }
         }
-        // Flip permissions on disk for prefixes that changed state.
-        for p in was.iter().chain(self.ro_prefixes.iter()) {
-            let now_ro = self.ro_prefixes.contains(p);
+        // Flip permissions on disk for every area that was or is read-only; each file follows
+        // its own effective state, so writable paths inside a read-only mount stay writable.
+        let mut prefixes: Vec<String> = was.iter().chain(self.ro_areas.iter()).map(|a| a.prefix.clone()).collect();
+        prefixes.sort();
+        prefixes.dedup();
+        for p in prefixes {
             for e in walkdir::WalkDir::new(self.abs(p.trim_end_matches('/'))).into_iter().flatten() {
                 if e.file_type().is_file() {
-                    set_readonly(e.path(), now_ro);
+                    if let Some(rel) = self.rel(e.path()) {
+                        if self.should_sync(&rel) {
+                            set_readonly(e.path(), self.is_ro(&rel));
+                        }
+                    }
                 }
             }
         }
@@ -471,13 +487,16 @@ impl Engine {
     }
 
     fn is_rescue_path(&self, rel: &str) -> bool {
-        self.ro_prefixes.iter().any(|p| rel.starts_with(Self::rescue_root(p).as_str()))
+        self.ro_areas.iter().any(|a| rel.starts_with(Self::rescue_root(&a.prefix).as_str()))
     }
 
+    /// Inside a read-only mount, outside its rescue folder and outside the ticket's writable paths.
     fn is_ro(&self, rel: &str) -> bool {
-        self.ro_prefixes
-            .iter()
-            .any(|p| rel.starts_with(p.as_str()) && !rel.starts_with(Self::rescue_root(p).as_str()))
+        self.ro_areas.iter().any(|a| {
+            rel.starts_with(a.prefix.as_str())
+                && !rel.starts_with(Self::rescue_root(&a.prefix).as_str())
+                && !a.rw.iter().any(|p| if p.ends_with('/') { rel.starts_with(p.as_str()) } else { rel == p })
+        })
     }
 
     fn protect_if_ro(&self, rel: &str) {
@@ -490,7 +509,7 @@ impl Engine {
     /// share does not have is moved to `<mount> (read-only copy)/…`, like the server does for
     /// plugin clients, so nothing the user wrote is lost.
     async fn undo_ro_edit(&mut self, rel: &str) {
-        let prefix = self.ro_prefixes.iter().find(|p| rel.starts_with(p.as_str())).cloned().unwrap_or_default();
+        let prefix = self.ro_areas.iter().find(|a| rel.starts_with(a.prefix.as_str())).map(|a| a.prefix.clone()).unwrap_or_default();
         let in_doc = {
             let txn = self.doc().transact();
             self.texts.contains_key(&txn, rel) || self.blobs.contains_key(&txn, rel)
@@ -1193,6 +1212,14 @@ fn set_readonly(path: &std::path::Path, ro: bool) {
         perm.set_readonly(ro);
         let _ = std::fs::set_permissions(path, perm);
     }
+}
+
+/// A read-only mount: its prefix ("" for a guest's whole directory) and the vault-relative paths
+/// inside it that the ticket still lets us write (folders end with '/').
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct RoArea {
+    prefix: String,
+    rw: Vec<String>,
 }
 
 /// A folder (prefix with trailing slash) or single note shared with or by other people.

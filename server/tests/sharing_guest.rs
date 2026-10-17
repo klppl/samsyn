@@ -116,6 +116,33 @@ fn guests_join_with_tickets_only() {
     eventually!(8, g2.read("read-only copy/mine.md") == "mine\n" && !g2.exists("mine.md"), "ro guest's new file moved aside", g2.proc);
     assert!(!g2.proc.log_contains("conflict"), "ro restore made a conflict copy");
 
+    // A read-only guest with a writable folder: `sub/` flows, the rest is locked.
+    let mixed = api_json(&server, &owner, "POST", &format!("/api/shares/{share_id}/tickets"), Some(json!({"label": "guest-mixed", "access": "ro", "rw_paths": ["sub"]})));
+    let mixed_ticket = mixed["ticket"].as_str().unwrap().to_string();
+    assert_eq!(mixed["rw_paths"], json!(["sub/"]), "{mixed}");
+    let msecret = ticket_secret(&mixed_ticket);
+    let (code, body) = api_raw(&server, &msecret, "GET", &format!("/guest/shares/{share_id}"), None);
+    assert_eq!(code, 200, "{body}");
+    let ginfo: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(ginfo["access"], "ro");
+    assert_eq!(ginfo["rw_paths"], json!(["sub/"]), "{ginfo}");
+    let g3 = Client::start_guest(&mixed_ticket, &dir.join("G3"), "G3");
+    eventually!(20, g3.exists("a.md") && g3.exists("sub/b.md"), "mixed guest gets files", g3.proc, server.proc);
+    eventually!(30, g3.proc.log_contains("read-only (except sub/)"), "mixed guest learns its writable path", g3.proc);
+    eventually!(5, readonly(&g3.path("a.md")), "read-only part locked", g3.proc);
+    assert!(!readonly(&g3.path("sub/b.md")), "writable folder locked");
+    g3.append("sub/b.md", "mixed-guest-edit");
+    eventually!(10, o.contains("Projects/X/sub/b.md", "mixed-guest-edit"), "owner sees the mixed guest's edit", o.proc, server.proc);
+    g3.write_bytes("sub/g3.gif", b"GIF89a g3");
+    eventually!(15, o.same_bytes("Projects/X/sub/g3.gif", &g3.path("sub/g3.gif")), "mixed guest can upload blobs", o.proc, server.proc);
+    let mut p = std::fs::metadata(g3.path("a.md")).unwrap().permissions();
+    p.set_readonly(false);
+    std::fs::set_permissions(g3.path("a.md"), p).unwrap();
+    g3.append("a.md", "mixed-ro-edit");
+    sleep(3.0);
+    assert!(!o.contains("Projects/X/a.md", "mixed-ro-edit"), "read-only edit from the mixed guest reached the owner");
+    eventually!(5, !g3.contains("a.md", "mixed-ro-edit"), "mixed guest's read-only edit restored", g3.proc);
+
     // Revoke the ro ticket: the guest is cut off and exits; the rw guest continues.
     let (code, _) = api_raw(&server, &owner, "DELETE", &format!("/api/shares/{share_id}/grants/guest-ro"), None);
     assert_eq!(code, 204);
@@ -126,6 +153,10 @@ fn guests_join_with_tickets_only() {
     assert!(!g2.contains("a.md", "after-revoke"));
 
     assert!(server.errors().is_empty(), "server errors: {:?}", server.errors());
+}
+
+fn readonly(p: &std::path::Path) -> bool {
+    std::fs::metadata(p).map(|m| m.permissions().readonly()).unwrap_or(false)
 }
 
 /// Pull the secret out of a ticket the way the plugin does (base32, postcard: version byte, then
