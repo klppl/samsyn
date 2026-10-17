@@ -6,7 +6,7 @@ Conflict-free live sync for [Obsidian](https://obsidian.md), self-hosted.
 > understanding", the state where two people see things the same way. It's built
 > from *sam* (together, shared) and *syn* (sight, view). The name fits twice
 > over: your devices all see the same notes, and so does the friend you share a
-> vault with. It also happens to sound a lot like *sync*.
+> vault with or part of a vault with. It also happens to sound a lot like *sync*.
 
 Run one small server on a machine you own. Every device editing the same note
 converges character by character, live, with no conflict files. Share a single
@@ -27,7 +27,7 @@ and Android, offline and back.
 | **Syncthing** | Conflicted copies | Near | Yes | Android only | No | Yes |
 | **[YAOS](https://community.obsidian.md/plugins/yaos)** | CRDT merge | Yes | Cloudflare Worker | Yes | No | $0 |
 | **[Ilow Sync](https://community.obsidian.md/plugins/ilow-sync)** | CRDT merge | Yes | Go + PostgreSQL | Yes | No | Yes |
-| **Samsyn** | CRDT merge | Yes | One binary | iOS + Android | Any subfolder | $0 |
+| **Samsyn** | CRDT merge | Yes | One binary | Yes | Any subfolder | Yes |
 
 Text merges with [Yjs](https://github.com/yjs/yjs) in the plugin and
 [yrs](https://github.com/y-crdt/y-crdt) on the server, so simultaneous edits to
@@ -37,7 +37,7 @@ Samsyn shares the CRDT, real-time, self-hosted approach of YAOS and Ilow Sync.
 What sets it apart: you share **any subfolder** with another person and both edit
 it live (even across two separate servers, over an encrypted peer-to-peer link),
 and the whole server is **one binary** with no database, cloud account or runtime
-to deploy. iOS and Android are both first-class.
+to deploy.
 
 ### Beyond basic sync
 
@@ -57,24 +57,37 @@ to deploy. iOS and Android are both first-class.
 
 ## Quick start
 
-**1. Run the server.**
+**1. Run the server.** With Docker Compose (`docker-compose.yml` is in the repo):
 
 ```sh
-cd server
-cargo run --release -- serve
+docker compose up -d
+docker compose logs server | grep token
 ```
 
-It prints a one-time token on first start:
+Or a single container with the prebuilt image:
+
+```sh
+docker run -d --name samsyn -p 8787:8787 -v "$PWD/data:/data" \
+  ghcr.io/mrboatsman/samsyn:latest
+docker logs samsyn | grep token
+```
+
+Or from source, no Docker:
+
+```sh
+cd server && cargo run --release -- serve
+```
+
+Each way creates a user named `owner` on first start and prints a token once:
 
 ```
 INFO first start: created user 'owner'
 INFO   token: rp_...
 ```
 
-That is all you need to try it on a LAN. For HTTPS (required for iOS), Docker, a
-prebuilt image, admin commands and the headless client, see
-[docs/SERVER.md](docs/SERVER.md). To run it on the public internet, see
-[docs/PUBLIC-SERVER.md](docs/PUBLIC-SERVER.md).
+That is all you need to try it on a LAN. For HTTPS (required for iOS), admin
+commands and the headless client, see [docs/SERVER.md](docs/SERVER.md). To run it
+on the public internet, see [docs/PUBLIC-SERVER.md](docs/PUBLIC-SERVER.md).
 
 **2. Install the plugin.** Until it is in the community list, install it manually
 or with [BRAT](https://github.com/TfTHacker/obsidian42-brat). See

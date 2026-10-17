@@ -51,16 +51,6 @@ WebSockets, so the server must be reachable over `https://` with a certificate
 the phone trusts. Desktop Obsidian accepts plain `http://` on a LAN, so you can
 develop without TLS and add it when you bring in a phone.
 
-**Tailscale (personal use, zero config).** Install Tailscale on the server and
-the phone, then:
-
-```sh
-tailscale serve --bg --https=443 http://127.0.0.1:8787
-```
-
-Server URL in the plugin: `https://<machine>.<tailnet>.ts.net`. Valid
-certificate, no port forwarding, works away from home.
-
 **Caddy (public hostname).** With a DNS name pointing at the server:
 
 ```
