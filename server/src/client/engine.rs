@@ -183,10 +183,14 @@ impl Engine {
         }
     }
 
-    /// Only ever called with keys that passed `should_sync` (which requires a safe relative
-    /// key), so the result stays under the sync directory.
+    /// Keys that become files pass `should_sync` first (safe relative keys). Prefixes ("" for a
+    /// guest's whole directory, "Shared/X") also come through here, so no assertion: an
+    /// absolute key is simply refused.
     fn abs(&self, rel: &str) -> PathBuf {
-        debug_assert!(crate::ids::valid_key(rel) || rel == META_DIR.trim_end_matches('/'), "unsafe key {rel:?}");
+        if rel.starts_with('/') {
+            tracing::error!("refusing absolute key {rel:?}");
+            return self.root.join(META_DIR).join("refused");
+        }
         self.root.join(rel)
     }
 
