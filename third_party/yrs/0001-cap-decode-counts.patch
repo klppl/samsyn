@@ -1,0 +1,123 @@
+From 44bb9d45ea19cdec7acee83a33d2759b76e6d011 Mon Sep 17 00:00:00 2001
+From: Samsyn <dev@andvision.se>
+Date: Sat, 17 Oct 2026 12:10:59 +0200
+Subject: [PATCH] Cap decoded element counts to the bytes remaining (decode
+ OOM)
+
+A sync message a few bytes long could declare an element count near
+u32::MAX; Update / StateVector / IdSet decode then try_reserve or loop
+that many times. try_reserve only avoids an abort on allocator failure,
+so under memory overcommit the kernel honours the reservation and the
+process is OOM-killed. Reproduced: a 5-byte state vector makes decode
+request ~146 GB, an 8-byte update ~103 GB.
+
+Every element costs at least one byte on the wire, so a count larger
+than the bytes still available is always malformed. Decoder gains
+remaining() (exact for the v1 byte decoder, None otherwise) and
+check_len(); each count in Update, IdSet/IdRanges and StateVector decode
+is rejected when it exceeds the remaining input. v2 decoders keep their
+behaviour (counts are spread across sub-streams). No valid update is
+affected: a real update always carries more bytes than elements.
+---
+ src/id_set.rs          |  2 ++
+ src/state_vector.rs    |  1 +
+ src/update.rs          |  2 ++
+ src/updates/decoder.rs | 24 ++++++++++++++++++++++++
+ 4 files changed, 29 insertions(+)
+
+diff --git a/src/id_set.rs b/src/id_set.rs
+index 9d3318d..bd36c50 100644
+--- a/src/id_set.rs
++++ b/src/id_set.rs
+@@ -88,6 +88,7 @@ impl Encode for IdRanges<()> {
+ impl Decode for IdRanges<()> {
+     fn decode<D: Decoder>(decoder: &mut D) -> Result<Self, Error> {
+         let len: u32 = decoder.read_var()?;
++        decoder.check_len(len as usize)?;
+         // Do NOT pre-allocate `len` entries up front: `len` is attacker-controlled (a few bytes
+         // can declare a huge count), so `SmallVec::with_capacity(len)` is an allocation bomb that
+         // aborts under a hard memory limit. `SmallVec::try_reserve` returns smallvec's own
+@@ -356,6 +357,7 @@ impl Decode for IdSet {
+     fn decode<D: Decoder>(decoder: &mut D) -> Result<Self, Error> {
+         let mut set = Self::new();
+         let client_len: u32 = decoder.read_var()?;
++        decoder.check_len(client_len as usize)?;
+         let mut i = 0;
+         while i < client_len {
+             decoder.reset_ds_cur_val();
+diff --git a/src/state_vector.rs b/src/state_vector.rs
+index d40b438..4362b65 100644
+--- a/src/state_vector.rs
++++ b/src/state_vector.rs
+@@ -117,6 +117,7 @@ impl FromIterator<(ClientID, u32)> for StateVector {
+ impl Decode for StateVector {
+     fn decode<D: Decoder>(decoder: &mut D) -> Result<Self, Error> {
+         let len = decoder.read_var::<u32>()? as usize;
++        decoder.check_len(len)?;
+         // Attempt to pre-allocate memory for the state vector. `len` is attacker-controlled
+         // (a few bytes can declare a huge count), so a fallible reservation turns an
+         // allocation bomb into a recoverable decode error instead of an abort. Mirrors the
+diff --git a/src/update.rs b/src/update.rs
+index 9404b2a..76a1647 100644
+--- a/src/update.rs
++++ b/src/update.rs
+@@ -826,12 +826,14 @@ impl Decode for Update {
+     fn decode<D: Decoder>(decoder: &mut D) -> Result<Self, Error> {
+         // read blocks
+         let clients_len: u32 = decoder.read_var()?;
++        decoder.check_len(clients_len as usize)?;
+         let mut clients = HashMap::with_hasher(BuildHasherDefault::default());
+         clients.try_reserve(clients_len as usize)?;
+ 
+         let mut blocks = BlockSet { clients };
+         for _ in 0..clients_len {
+             let blocks_len = decoder.read_var::<u32>()? as usize;
++            decoder.check_len(blocks_len)?;
+ 
+             let client = decoder.read_client()?;
+             let mut clock: u32 = decoder.read_var()?;
+diff --git a/src/updates/decoder.rs b/src/updates/decoder.rs
+index b949cd8..eada969 100644
+--- a/src/updates/decoder.rs
++++ b/src/updates/decoder.rs
+@@ -27,6 +27,25 @@ pub trait Decode: Sized {
+ ///
+ /// Both of these define a common set of operations defined in this trait.  
+ pub trait Decoder: Read {
++    /// Bytes still available to read, when the decoder knows (the v1 byte decoder does). Lets
++    /// callers reject a declared element count larger than the remaining input: every element
++    /// costs at least one byte on the wire, so such a count is always malformed. Without this,
++    /// a few bytes can declare a count of billions and drive a multi-gigabyte `try_reserve`
++    /// that the OS honours under overcommit and then OOM-kills the process.
++    fn remaining(&self) -> Option<usize> {
++        None
++    }
++
++    /// Reject a declared count that cannot be backed by the bytes still available.
++    fn check_len(&self, len: usize) -> Result<(), Error> {
++        if let Some(rem) = self.remaining() {
++            if len > rem {
++                return Err(Error::EndOfBuffer(len));
++            }
++        }
++        Ok(())
++    }
++
+     /// Reset the value of current delete set state.
+     fn reset_ds_cur_val(&mut self);
+ 
+@@ -117,6 +136,11 @@ impl<'a> Read for DecoderV1<'a> {
+ }
+ 
+ impl<'a> Decoder for DecoderV1<'a> {
++    #[inline]
++    fn remaining(&self) -> Option<usize> {
++        Some(self.cursor.buf.len().saturating_sub(self.cursor.next))
++    }
++
+     #[inline]
+     fn reset_ds_cur_val(&mut self) {
+         /* no op */
+-- 
+2.56.0
+

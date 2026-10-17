@@ -3,6 +3,10 @@
 This is an unmodified copy of `yrs` 0.28.0 (from crates.io) with one security fix applied,
 pulled in via `[patch.crates-io]` in `server/Cargo.toml` and `server/fuzz/Cargo.toml`.
 
+The exact diff against pristine yrs 0.28.0 is `0001-cap-decode-counts.patch` in this directory
+(`git format-patch` form; `git am` or `git apply` it on a yrs checkout). Attach it to the
+upstream issue.
+
 ## The change
 
 CRDT decoders (`Update`, `IdSet`/`IdRanges`, `StateVector`) read an element count as a varint
