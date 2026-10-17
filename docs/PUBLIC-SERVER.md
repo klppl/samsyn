@@ -25,7 +25,7 @@ Everything that user can do: read and write all their vaults, create shares, iss
 ## Built-in protection on `/guest/*`
 
 - Unknown share and wrong secret answer identically (`403`), so nothing can be enumerated.
-- More than 10 failed authentications from one IP address within 10 minutes → `429` for the rest of the window. Behind a reverse proxy the client IP is taken from `X-Forwarded-For`; make sure your proxy sets it, or every guest shares one bucket.
+- More than 10 failed guest authentications (30 for user tokens) from one IP address within 10 minutes → further wrong credentials from that address get `429` for the rest of the window. A correct credential always passes, and an expired guest session is not counted (every guest produces a few of those after a server restart). Behind a reverse proxy the client IP is taken from `X-Forwarded-For` with `--trust-proxy`; make sure your proxy sets it, or every client shares one bucket.
 - The request log carries the path only, never the query string, so secrets and session ids do not end up in log files.
 - Sessions: the plugin presents the secret once (`POST /guest/session/{share}`) and uses the returned session id from then on; sessions expire after 7 days and die immediately when the ticket is revoked.
 - Upload quota per share for guests: `--max-share-mb` (default 2048, `0` = unlimited). The owner's own uploads are not limited by it.

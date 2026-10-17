@@ -257,7 +257,8 @@ in. Running a server on the public internet is covered in
 [PUBLIC-SERVER.md](PUBLIC-SERVER.md).
 
 Hygiene on these public routes: unknown share and bad secret answer identically
-(403), more than 10 failures per IP in 10 minutes gives 429, and the request log
+(403), more than 10 failures per IP in 10 minutes gives 429 for further wrong
+secrets (a valid secret still passes), and the request log
 carries the path only, never the query string. The owner re-checks the grant
 every 30 s on open guest sockets and closes them when the ticket is revoked or the
 share deleted; the headless client then exits with a clear message. Each guest

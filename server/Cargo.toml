@@ -31,7 +31,7 @@ data-encoding = "2"
 postcard = { version = "1", features = ["use-std"] }
 tokio = { version = "1", features = ["full"] }
 tower-http = { version = "0.7", features = ["cors", "trace"] }
-notify-debouncer-mini = "0.7"
+notify = "8"
 # Both aws-lc-rs (hyper-rustls) and ring (tokio-tungstenite) end up linked, so rustls
 # cannot pick a process-level CryptoProvider by itself; main() installs one explicitly.
 rustls = "0.23"

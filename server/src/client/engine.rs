@@ -8,7 +8,7 @@ use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
 use anyhow::Context;
-use notify_debouncer_mini::{new_debouncer, notify::RecursiveMode, DebounceEventResult, Debouncer};
+use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use tokio::sync::mpsc;
 use yrs::sync::{Awareness, DefaultProtocol, Message, MessageReader, Protocol, SyncMessage};
 use yrs::types::{Event, PathSegment};
@@ -721,6 +721,7 @@ impl Engine {
             let local_hash = hash_bytes(&local);
             if local_hash == meta.hash {
                 self.mark_synced(rel, local_hash);
+                self.pending_blobs.remove(rel);
                 return Ok(());
             }
             if self.state.synced.get(rel).map(|h| h != &local_hash).unwrap_or(false) {
@@ -754,17 +755,58 @@ impl Engine {
 
     // ------------------------------------------------------------------ disk -> doc
 
-    pub fn start_watcher(&self, tx: mpsc::UnboundedSender<Vec<PathBuf>>) -> anyhow::Result<Debouncer<notify_debouncer_mini::notify::RecommendedWatcher>> {
-        let mut debouncer = new_debouncer(Duration::from_millis(self.args.debounce_ms), move |res: DebounceEventResult| {
-            if let Ok(events) = res {
-                let paths: Vec<PathBuf> = events.into_iter().map(|e| e.path).collect();
-                if !paths.is_empty() {
-                    let _ = tx.send(paths);
+    /// Watch the directory and hand over batches of paths that have been quiet for
+    /// `--debounce-ms`. Access events (open, read, close without write) are dropped before
+    /// debouncing: on Linux inotify reports every open, including our own hash checks and
+    /// other programs merely reading the files, and treating those as changes made the client
+    /// re-hash the whole directory in an endless loop.
+    pub fn start_watcher(&self, tx: mpsc::UnboundedSender<Vec<PathBuf>>) -> anyhow::Result<RecommendedWatcher> {
+        let debounce = Duration::from_millis(self.args.debounce_ms);
+        let (raw_tx, raw_rx) = std::sync::mpsc::channel::<Vec<PathBuf>>();
+        let mut watcher = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
+            if let Ok(ev) = res {
+                if matches!(ev.kind, EventKind::Access(_)) || ev.paths.is_empty() {
+                    return;
                 }
+                let _ = raw_tx.send(ev.paths);
             }
-        })?;
-        debouncer.watcher().watch(&self.root, RecursiveMode::Recursive).context("starting file watcher")?;
-        Ok(debouncer)
+        })
+        .context("starting file watcher")?;
+        std::thread::Builder::new()
+            .name("samsyn fs debounce".to_string())
+            .spawn(move || {
+                let mut pending: HashMap<PathBuf, Instant> = HashMap::new();
+                loop {
+                    let wait = pending
+                        .values()
+                        .min()
+                        .map(|t| (*t + debounce).saturating_duration_since(Instant::now()))
+                        .unwrap_or(Duration::from_secs(3600));
+                    match raw_rx.recv_timeout(wait) {
+                        Ok(paths) => {
+                            let now = Instant::now();
+                            for p in paths {
+                                pending.insert(p, now);
+                            }
+                        }
+                        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return,
+                    }
+                    let now = Instant::now();
+                    let due: Vec<PathBuf> = pending.iter().filter(|(_, t)| now.duration_since(**t) >= debounce).map(|(p, _)| p.clone()).collect();
+                    if !due.is_empty() {
+                        for p in &due {
+                            pending.remove(p);
+                        }
+                        if tx.send(due).is_err() {
+                            return;
+                        }
+                    }
+                }
+            })
+            .context("starting debounce thread")?;
+        watcher.watch(&self.root, RecursiveMode::Recursive).context("starting file watcher")?;
+        Ok(watcher)
     }
 
     /// Handle one debounced batch of filesystem events. Removals are counted across the whole

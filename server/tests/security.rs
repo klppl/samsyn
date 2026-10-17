@@ -301,8 +301,11 @@ fn guest_routes_do_not_leak_and_rate_limit_without_trusting_forged_headers() {
     }
     let res = client.get(format!("{url}/guest/shares/{share_id}?secret={bad}")).header("x-forwarded-for", "10.9.9.9").send().unwrap();
     assert_eq!(res.status().as_u16(), 429, "limiter bypassed with a forged X-Forwarded-For");
-    // The limiter also blocks a *valid* secret from the same address now (brute force stays blocked).
+    // A *valid* secret from the blocked address still works: the budget slows guessing, and
+    // behind a proxy one address is many guests. Wrong secrets stay blocked.
     let (code, _) = api_raw(&server, "", "GET", &format!("/guest/shares/{share_id}?secret={ro_secret}"), None);
+    assert_eq!(code, 200, "valid secret refused because of the address's failures");
+    let (code, _) = api_raw(&server, "", "GET", &format!("/guest/shares/{share_id}?secret={bad}"), None);
     assert_eq!(code, 429);
     assert!(!server.proc.log_contains(&bad) && !server.proc.log_contains(&ro_secret), "secret in log");
     drop(server);
@@ -566,12 +569,16 @@ fn per_token_connection_cap_and_auth_failure_budget() {
         tokio::time::sleep(Duration::from_millis(300)).await;
         assert!(tokio_tungstenite::connect_async(&url).await.is_ok(), "slot not released on close");
     });
-    // 30 failed user-token attempts from one address → 429 for a while, even with a good token.
+    // 30 failed user-token attempts from one address → further bad tokens get 429 for a while.
+    // A good token still passes: behind a proxy one address is many clients, and one device
+    // with a stale token must not lock the others out.
     for _ in 0..30 {
         api_raw(&server, "rp_00000000000000000000000000000000", "GET", "/me", None);
     }
-    let (code, _) = api_raw(&server, &owner, "GET", "/me", None);
+    let (code, _) = api_raw(&server, "rp_00000000000000000000000000000000", "GET", "/me", None);
     assert_eq!(code, 429, "auth failure budget not enforced");
+    let (code, _) = api_raw(&server, &owner, "GET", "/me", None);
+    assert_eq!(code, 200, "a valid token was refused because of someone else's failures");
 }
 
 #[test]

@@ -235,7 +235,9 @@ fn cors_layer(args: &ServeArgs) -> CorsLayer {
 
 /// Reject requests without a valid user token before the handler (and its body extractors) run.
 /// Failures are budgeted per client address so probing is cheap for us and loud in the log
-/// only the first few times.
+/// only the first few times. A valid token always passes: the budget slows guessing, and a
+/// correct credential is not a guess (behind a proxy many clients share one address, so one
+/// device with a stale token must not lock the others out).
 async fn require_user(
     State(state): State<SharedState>,
     axum::extract::ConnectInfo(peer): axum::extract::ConnectInfo<std::net::SocketAddr>,
@@ -253,9 +255,6 @@ async fn require_user(
     } else {
         peer.ip()
     };
-    if state.limits.auth_fails.lock().blocked(&ip) {
-        return (StatusCode::TOO_MANY_REQUESTS, "too many failed attempts; try again later").into_response();
-    }
     let query_token = req
         .uri()
         .query()
@@ -264,11 +263,17 @@ async fn require_user(
     let token = crate::config::extract_token(req.headers(), query_token.as_deref());
     let ok = token.map(|t| state.storage.registry().authenticate(&t).ok().flatten().is_some()).unwrap_or(false);
     if ok {
-        next.run(req).await
-    } else {
-        state.limits.auth_fails.lock().record_failure(ip);
-        (StatusCode::UNAUTHORIZED, "bad token").into_response()
+        return next.run(req).await;
     }
+    let mut fails = state.limits.auth_fails.lock();
+    if fails.blocked(&ip) {
+        return (StatusCode::TOO_MANY_REQUESTS, "too many failed attempts; try again later").into_response();
+    }
+    fails.record_failure(ip);
+    // Path only, never the query (it may carry the token). At most the budget's worth of lines
+    // per address and window, then the 429s above are silent.
+    tracing::warn!(%ip, path = %req.uri().path(), "bad or missing user token");
+    (StatusCode::UNAUTHORIZED, "bad token").into_response()
 }
 
 async fn index() -> &'static str {

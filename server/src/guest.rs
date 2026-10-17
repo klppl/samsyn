@@ -111,13 +111,11 @@ impl Guest {
 /// Validate `(share_id, secret)`; the secret comes as `?secret=` or `Authorization: Bearer`.
 fn authenticate(state: &SharedState, share_id: &str, headers: &HeaderMap, query: &HashMap<String, String>, peer: SocketAddr) -> Result<Guest, Response> {
     let ip = client_ip(state, headers, peer);
-    if state.limits.guest_fails.lock().blocked(&ip) {
-        return Err((StatusCode::TOO_MANY_REQUESTS, "too many failed attempts; try again later").into_response());
-    }
     let presented = extract_token(headers, query.get("secret").or_else(|| query.get("session")).map(String::as_str)).unwrap_or_default();
     // A session id stands in for the secret it was created with.
     // Session ids are prefixed so they can never be mistaken for (or collide with) a secret.
-    let secret = if presented.starts_with("gs_") {
+    let is_session = presented.starts_with("gs_");
+    let secret = if is_session {
         state.guest_sessions.lock().secret_for(&presented, share_id).unwrap_or_default()
     } else {
         presented
@@ -135,8 +133,22 @@ fn authenticate(state: &SharedState, share_id: &str, headers: &HeaderMap, query:
             let _ = reg.touch_grant(&g.share.id, &g.secret);
             Ok(g)
         }
+        None if is_session && secret.is_empty() => {
+            // Unknown or expired session: sessions are 256-bit ids we issued ourselves and they
+            // all die with a restart, so a client with pending blob fetches produces a burst of
+            // these. Not a guess at a secret; it must not trip the per-address budget (behind a
+            // proxy that would lock out every guest). The client re-exchanges its ticket.
+            tracing::debug!(share = %share_id, %ip, "guest session unknown or expired");
+            Err(denied())
+        }
         None => {
-            state.limits.guest_fails.lock().record_failure(ip);
+            // A valid secret is never refused for the address's past failures: the budget slows
+            // guessing, and behind a proxy one address is many clients.
+            let mut fails = state.limits.guest_fails.lock();
+            if fails.blocked(&ip) {
+                return Err((StatusCode::TOO_MANY_REQUESTS, "too many failed attempts; try again later").into_response());
+            }
+            fails.record_failure(ip);
             tracing::warn!(share = %share_id, %ip, "guest auth failed");
             Err(denied())
         }
