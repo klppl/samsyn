@@ -1,4 +1,4 @@
-use rand::RngCore;
+use rand::Rng;
 
 /// 16 hex chars, random. Used for user ids, vault ids and the instance id.
 pub fn new_id() -> String {

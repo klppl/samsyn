@@ -59,7 +59,7 @@ impl GuestSessions {
         }
         let id = format!("gs_{}", hex::encode({
             let mut b = [0u8; 32];
-            rand::RngCore::fill_bytes(&mut rand::rng(), &mut b);
+            rand::Rng::fill_bytes(&mut rand::rng(), &mut b);
             b
         }));
         self.map.insert(id.clone(), GuestSession { share_id: share_id.into(), secret: secret.into(), expires: Instant::now() + SESSION_TTL });

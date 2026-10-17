@@ -401,7 +401,7 @@ impl Registry {
     pub fn create_grant(&self, share_id: &str, label: &str, access: &str) -> anyhow::Result<String> {
         let secret = hex::encode({
             let mut b = [0u8; 32];
-            rand::RngCore::fill_bytes(&mut rand::rng(), &mut b);
+            rand::Rng::fill_bytes(&mut rand::rng(), &mut b);
             b
         });
         let conn = self.conn.lock();
