@@ -34,6 +34,122 @@ pub const MAX_AWARENESS_CLIENTS: usize = 64;
 /// Read-only guests send awareness only; their inbound messages are capped much lower.
 pub const MAX_WS_MESSAGE_READONLY: usize = 4 * 1024 * 1024;
 
+/// lib0 varuint: 7 data bits per byte, high bit = continuation.
+fn read_varuint(data: &[u8], pos: &mut usize) -> Option<u64> {
+    let mut n: u64 = 0;
+    let mut shift = 0;
+    loop {
+        let b = *data.get(*pos)?;
+        *pos += 1;
+        n |= ((b & 0x7f) as u64) << shift;
+        if b & 0x80 == 0 {
+            return Some(n);
+        }
+        shift += 7;
+        if shift > 63 {
+            return None;
+        }
+    }
+}
+
+/// Reject sync messages whose length fields cannot be backed by the bytes actually present,
+/// before the CRDT decoder reserves memory for them. Every count in the y-sync framing is
+/// followed by at least one byte per item, so a count larger than the remaining payload is
+/// never legitimate. Unknown message kinds pass through to the real decoder.
+pub fn plausible_payload(data: &[u8]) -> bool {
+    let mut pos = 0;
+    while pos < data.len() {
+        let Some(kind) = read_varuint(data, &mut pos) else { return false };
+        match kind {
+            // Sync (0): a sub-kind, then a length-prefixed buffer. Our clients only ever send
+            // step 1 (0), step 2 (1) and update (2).
+            0 => {
+                let Some(sub) = read_varuint(data, &mut pos) else { return false };
+                if !matches!(sub, 0 | 1 | 2) {
+                    return false;
+                }
+                if !bounded_buffer(data, &mut pos) {
+                    return false;
+                }
+            }
+            // Awareness (1): a length-prefixed buffer whose first field is the client count.
+            1 => {
+                if !bounded_buffer(data, &mut pos) {
+                    return false;
+                }
+            }
+            // The server only speaks sync + awareness; auth (2), query-awareness (3) and any
+            // unknown kind are refused here rather than handed to the CRDT decoder, which may
+            // allocate from an attacker-chosen count.
+            _ => return false,
+        }
+    }
+    true
+}
+
+/// Read a length-prefixed buffer and require that its declared inner count (every y-sync and
+/// awareness buffer begins with a varuint count of items, each at least one byte) fits in the
+/// bytes actually present. Advances `pos` past the buffer.
+fn bounded_buffer(data: &[u8], pos: &mut usize) -> bool {
+    let Some(len) = read_varuint(data, pos) else { return false };
+    let len = len as usize;
+    if len > data.len().saturating_sub(*pos) {
+        return false;
+    }
+    let buf = &data[*pos..*pos + len];
+    *pos += len;
+    let mut p = 0;
+    let Some(count) = read_varuint(buf, &mut p) else { return false };
+    count as usize <= buf.len()
+}
+
+#[cfg(test)]
+mod framing_tests {
+    use super::*;
+    use yrs::sync::{Message, SyncMessage};
+    use yrs::updates::encoder::Encode;
+    use yrs::{Doc, ReadTxn, Transact};
+
+    #[test]
+    fn real_messages_pass() {
+        let doc = Doc::new();
+        let sv = doc.transact().state_vector();
+        assert!(plausible_payload(&Message::Sync(SyncMessage::SyncStep1(sv)).encode_v1()));
+        let upd = doc.transact().encode_state_as_update_v1(&yrs::StateVector::default());
+        assert!(plausible_payload(&Message::Sync(SyncMessage::Update(upd)).encode_v1()));
+        assert!(plausible_payload(&[]));
+    }
+
+    #[test]
+    fn counts_larger_than_the_payload_are_rejected() {
+        // Sync / Update / 5-byte buffer whose first field claims far more items than 5 bytes.
+        let msg = [0u8, 2, 5, 0xff, 0xff, 0xff, 0xff, 0x0f];
+        assert!(!plausible_payload(&msg));
+        // Buffer longer than the message.
+        assert!(!plausible_payload(&[0u8, 2, 200, 1]));
+        // Awareness with an absurd client count.
+        assert!(!plausible_payload(&[1u8, 3, 0xff, 0xff, 0x7f]));
+        // Kinds the server does not speak are refused outright (query-awareness / auth).
+        assert!(!plausible_payload(&[3u8, 0, 0, 6, 0xff, 0xff, 0xff, 0xff]));
+        assert!(!plausible_payload(&[2u8]));
+    }
+
+    #[test]
+    fn malformed_crdt_message_is_an_error_not_a_panic() {
+        use yrs::sync::{Awareness, DefaultProtocol};
+        use yrs::Doc;
+        // Bytes from the fuzzer: a SyncStep1 whose state vector has a client id with reserved
+        // bits set, which makes yrs 0.28 panic during decode. handle_payload must contain it.
+        let crash: &[u8] = &[0,0,1,0,1,1,0,0,0,49,49,49,49,49,49,49,49,49,49,43,49,49,49,49,49,49,49,49,49,49,49,49,49,49,49,207,206,206,206,206,206,206,215,48,53,0,59,7,7,249,250,200,0,0,63,0,0,1,1];
+        let mut aw = Awareness::new(Doc::new());
+        let mut owned = std::collections::HashSet::new();
+        let mut budget = crate::limits::RequestBudget::new(100, std::time::Duration::from_secs(60));
+        let mut limits = PayloadLimits { doc_bytes: (0, 0), step1: &mut budget };
+        let r = handle_payload(&DefaultProtocol, &mut aw, crash, &mut owned, true, &mut limits);
+        assert!(r.is_err(), "malformed message should be an Err, not a panic");
+    }
+}
+
 /// Shared auth for ws + blob routes.
 pub fn authenticate(state: &SharedState, headers: &HeaderMap, query: &HashMap<String, String>) -> Result<User, Response> {
     let token = extract_token(headers, query.get("token").map(String::as_str));
@@ -232,13 +348,38 @@ pub async fn handle_socket(
 /// Feed one y-sync payload to the document. With `writable == false` (read-only peer) the
 /// peer's document updates are dropped; it can still pull our state and send awareness.
 /// Limits applied while feeding a payload: document size and full-state request budget.
-pub(crate) struct PayloadLimits<'a> {
+pub struct PayloadLimits<'a> {
     /// (current approximate size, max) in bytes; `max == 0` means unlimited.
     pub doc_bytes: (u64, u64),
     pub step1: &'a mut crate::limits::RequestBudget,
 }
 
-pub(crate) fn handle_payload(
+pub fn handle_payload(
+    protocol: &DefaultProtocol,
+    aw: &mut yrs::sync::Awareness,
+    data: &[u8],
+    owned: &mut HashSet<ClientID>,
+    writable: bool,
+    limits: &mut PayloadLimits<'_>,
+) -> Result<Vec<Bytes>, yrs::sync::Error> {
+    if !plausible_payload(data) {
+        return Err(yrs::sync::Error::Other("implausible message framing".into()));
+    }
+    // yrs 0.28 can panic (not just error) while decoding a malformed update or state vector,
+    // e.g. a client id with reserved bits set. parking_lot locks mean such a panic only drops
+    // this connection, but a decoder should never panic: contain it and treat it as a bad
+    // message. The panic happens during decode/apply of untrusted bytes, so nothing is left
+    // half-applied that matters (a client resyncs on reconnect).
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        handle_payload_inner(protocol, aw, data, owned, writable, limits)
+    }));
+    match result {
+        Ok(r) => r,
+        Err(_) => Err(yrs::sync::Error::Other("panic while decoding a client message".into())),
+    }
+}
+
+fn handle_payload_inner(
     protocol: &DefaultProtocol,
     aw: &mut yrs::sync::Awareness,
     data: &[u8],

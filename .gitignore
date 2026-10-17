@@ -7,3 +7,8 @@ plugin/main.js
 data/
 *.log
 .DS_Store
+# Fuzzing (server/fuzz is its own crate)
+server/fuzz/target/
+server/fuzz/corpus/
+server/fuzz/artifacts/
+server/fuzz/Cargo.lock

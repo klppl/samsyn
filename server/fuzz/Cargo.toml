@@ -1,0 +1,55 @@
+[package]
+name = "replica-server-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+arbitrary = { version = "1", features = ["derive"] }
+postcard = { version = "1", features = ["use-std"] }
+yrs = { version = "0.28", features = ["sync"] }
+
+[dependencies.replica-server]
+path = ".."
+
+# Standalone: not a member of the server package's (non-existent) workspace.
+[workspace]
+
+[[bin]]
+name = "ticket_decode"
+path = "fuzz_targets/ticket_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "ysync_payload"
+path = "fuzz_targets/ysync_payload.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "p2p_hello"
+path = "fuzz_targets/p2p_hello.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "keys_and_hashes"
+path = "fuzz_targets/keys_and_hashes.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "text_delta_replay"
+path = "fuzz_targets/text_delta_replay.rs"
+test = false
+doc = false
+bench = false

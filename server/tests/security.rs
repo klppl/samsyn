@@ -9,6 +9,21 @@ use common::*;
 use serde_json::json;
 use std::time::Duration;
 
+/// Connect a WebSocket, retrying briefly: under `cargo test`'s parallelism each test spins its
+/// own runtime, so a connect can transiently fail even though the server is up. Not a product
+/// concern; keeps the suite from flaking.
+async fn ws_connect(url: &str) -> tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>> {
+    for attempt in 0..30 {
+        match tokio_tungstenite::connect_async(url).await {
+            Ok((ws, _)) => return ws,
+            Err(_) if attempt < 29 => tokio::time::sleep(Duration::from_millis(100)).await,
+            Err(e) => panic!("ws connect to {url} failed: {e}"),
+        }
+    }
+    unreachable!()
+}
+
+
 fn hex64(c: char) -> String {
     std::iter::repeat(c).take(64).collect()
 }
@@ -140,7 +155,7 @@ fn websocket_survives_garbage_and_enforces_size_limit() {
     rt.block_on(async {
         use futures::{SinkExt, StreamExt};
         use tokio_tungstenite::tungstenite::Message;
-        let (mut ws, _) = tokio_tungstenite::connect_async(&url).await.expect("connect");
+        let mut ws = ws_connect(&url).await;
         // Random bytes, truncated varints, a huge declared length.
         for payload in [vec![0xffu8; 10], vec![0x00, 0x00, 0xff, 0xff, 0xff, 0xff, 0x0f], vec![1, 2, 3], vec![]] {
             ws.send(Message::Binary(payload.into())).await.expect("send");
@@ -167,7 +182,7 @@ fn websocket_survives_garbage_and_enforces_size_limit() {
         .unwrap_or(false);
         assert!(got, "server stopped answering after garbage");
         // A frame above the limit closes the connection instead of being buffered.
-        let (mut ws2, _) = tokio_tungstenite::connect_async(&url).await.expect("connect");
+        let mut ws2 = ws_connect(&url).await;
         let huge = vec![0u8; 300 * 1024 * 1024];
         let _ = ws2.send(Message::Binary(huge.into())).await;
         let closed = tokio::time::timeout(Duration::from_secs(10), async {
@@ -353,7 +368,7 @@ fn hostile_document_keys_never_escape_the_sync_directory() {
         use yrs::sync::{Message as M, SyncMessage};
         use yrs::updates::encoder::Encode;
         use yrs::{Map, ReadTxn, Text, Transact};
-        let (mut ws, _) = tokio_tungstenite::connect_async(&url).await.expect("connect");
+        let mut ws = ws_connect(&url).await;
         let doc = yrs::Doc::new();
         let texts = doc.get_or_insert_map("texts");
         {
@@ -418,7 +433,7 @@ fn hostile_blob_metadata_and_deltas_do_not_stop_the_server() {
         use yrs::sync::{Message as M, SyncMessage};
         use yrs::updates::encoder::Encode;
         use yrs::{Map, ReadTxn, Text, Transact};
-        let (mut ws, _) = tokio_tungstenite::connect_async(&url).await.expect("connect");
+        let mut ws = ws_connect(&url).await;
         let doc = yrs::Doc::new();
         let texts = doc.get_or_insert_map("texts");
         let blobs = doc.get_or_insert_map("blobs");
@@ -462,8 +477,8 @@ fn revoked_user_token_closes_its_live_websocket() {
     rt.block_on(async {
         use futures::StreamExt;
         use tokio_tungstenite::tungstenite::Message;
-        let (mut ws_phone, _) = tokio_tungstenite::connect_async(format!("ws://127.0.0.1:{}/ws/va?token={phone}", server.port)).await.expect("connect");
-        let (mut ws_owner, _) = tokio_tungstenite::connect_async(format!("ws://127.0.0.1:{}/ws/va?token={owner}", server.port)).await.expect("connect");
+        let mut ws_phone = ws_connect(&format!("ws://127.0.0.1:{}/ws/va?token={phone}", server.port)).await;
+        let mut ws_owner = ws_connect(&format!("ws://127.0.0.1:{}/ws/va?token={owner}", server.port)).await;
         // Drain the hello messages.
         let _ = tokio::time::timeout(Duration::from_secs(2), ws_phone.next()).await;
         let _ = tokio::time::timeout(Duration::from_secs(2), ws_owner.next()).await;
@@ -541,7 +556,7 @@ fn per_token_connection_cap_and_auth_failure_budget() {
         let url = format!("ws://127.0.0.1:{}/ws/va?token={owner}", server.port);
         let mut held = Vec::new();
         for _ in 0..3 {
-            held.push(tokio_tungstenite::connect_async(&url).await.expect("connect"));
+            held.push(ws_connect(&url).await);
         }
         match tokio_tungstenite::connect_async(&url).await {
             Err(tokio_tungstenite::tungstenite::Error::Http(resp)) => assert_eq!(resp.status().as_u16(), 429),
@@ -575,7 +590,7 @@ fn document_size_cap_and_awareness_cap() {
         use yrs::sync::{Message as M, SyncMessage};
         use yrs::updates::encoder::Encode;
         use yrs::{Map, ReadTxn, Transact};
-        let (mut ws, _) = tokio_tungstenite::connect_async(&url).await.expect("connect");
+        let mut ws = ws_connect(&url).await;
         // A 2 MB note into a 1 MB document: refused.
         let doc = yrs::Doc::new();
         let texts = doc.get_or_insert_map("texts");

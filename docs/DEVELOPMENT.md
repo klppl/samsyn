@@ -6,6 +6,10 @@
 - Rust stable (1.80+) with cargo
 - Obsidian desktop, and a phone with Obsidian mobile for mobile testing
 
+## Server crate layout
+
+`server/` is one package with a library and a thin binary. `src/lib.rs` exposes every module (`replica_server::ticket`, `ids`, `limits`, `storage`, `vault`, `bridge`, `presence`, `ws`, `guest`, `sharing`, `remote`, `client`, `app`, …); `src/main.rs` only parses the command line and calls `replica_server::serve` or the CLI/client entry points. Anything that should be reusable in another program (ticket format, path/hash validation, the headless client, the storage layer) is therefore importable with `replica-server = { path = "…" }`, and the fuzz targets in `server/fuzz/` link against it. Unit tests live in the library (`cargo test --lib`).
+
 ## Server
 
 ```sh
@@ -233,6 +237,30 @@ Scenario test: `server/scripts/remote-e2e.sh` (two servers, ports 8798/8799 + p2
 ## Changing the registry schema
 
 Numbered migrations in `server/src/storage/registry.rs` (`migrate()`, `REGISTRY_SCHEMA_VERSION`, `PRAGMA user_version`). Add a step, bump the version, add a `migration_tests` case that opens the old shape. `CREATE TABLE IF NOT EXISTS` never changes an existing table, which is exactly how the first scaffold's reserved `mounts` table survived into a running server and broke it. See docs/STORAGE.md "Schema migrations".
+
+## Fuzzing
+
+`server/fuzz/` (cargo-fuzz, needs nightly: `rustup toolchain install nightly && cargo install cargo-fuzz`). Targets, one per decoder that sees untrusted bytes:
+
+| Target | Exercises |
+|---|---|
+| `ticket_decode` | `Ticket::decode` (base32 + postcard, v1/v2) |
+| `ysync_payload` | `ws::handle_payload`: y-sync updates, state vectors, awareness, with and without write access |
+| `p2p_hello` | postcard decoding of the p2p `Hello` / `HelloReply` |
+| `keys_and_hashes` | `valid_key` / `valid_hash`, asserting the invariants that keep paths inside the vault |
+| `text_delta_replay` | `bridge::replay_text_delta` with arbitrary deltas against arbitrary text; must never panic inside yrs and must leave the text equal to the fallback |
+
+```sh
+cd server/fuzz
+# -O = release, matching the shipped build. yrs has debug-only assertions on malformed CRDT
+# input, so ysync_payload is fuzzed in release; the others keep debug assertions.
+cargo fuzz run -O ysync_payload -- -max_total_time=300 -rss_limit_mb=2048 -malloc_limit_mb=2048   # still finds F-31 (open, upstream yrs)
+cargo fuzz run text_delta_replay -- -max_total_time=300
+```
+
+Why `-O` for `ysync_payload`: yrs 0.28 uses `debug_assert!` in its CRDT decoder (e.g. a client id over 53 bits), which fires only in debug builds and aborts libfuzzer. The server ships in release, where those are compiled out; `handle_payload` additionally wraps the decode in `catch_unwind` and all locks are non-poisoning, so even a debug build contains such a panic as a dropped message (see the `malformed_crdt_message_is_an_error_not_a_panic` test). See [[F-31]] in the vault.
+
+Crashes land in `fuzz/artifacts/<target>/`; turn each into a unit test next to the decoder before fixing. CI runs every target for 90 s on the manual/cron pipeline (`fuzz` step), not on every push.
 
 ## Tests
 

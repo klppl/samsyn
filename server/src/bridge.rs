@@ -285,52 +285,8 @@ fn apply_changes(target: &Arc<LiveDoc>, src_id: &str, changes: &[(String, &Chang
                     Some(Out::YText(t)) => t,
                     _ => texts.insert(&mut txn, key.as_str(), TextPrelim::new("")),
                 };
-                // Check every position against the live length first; yrs panics on an
-                // out-of-range remove/insert and that would happen under the apply lock.
-                let mut pos: u32 = 0;
-                let mut len = t.len(&txn);
-                let fits = delta.iter().all(|d| match d {
-                    OwnedDelta::Retain(n) => {
-                        pos += n;
-                        pos <= len
-                    }
-                    OwnedDelta::Delete(n) => {
-                        if pos + n > len {
-                            return false;
-                        }
-                        len -= n;
-                        true
-                    }
-                    OwnedDelta::Insert(s) => {
-                        let n = s.encode_utf16().count() as u32;
-                        pos += n;
-                        len += n;
-                        true
-                    }
-                });
-                if fits {
-                    let mut pos: u32 = 0;
-                    for d in delta {
-                        match d {
-                            OwnedDelta::Retain(n) => pos += n,
-                            OwnedDelta::Delete(n) => t.remove_range(&mut txn, pos, *n),
-                            OwnedDelta::Insert(s) => {
-                                t.insert(&mut txn, pos, s);
-                                pos += s.encode_utf16().count() as u32;
-                            }
-                        }
-                    }
-                } else {
-                    tracing::warn!("delta for {key} does not fit the target text; setting the whole text instead");
-                    let cur = t.get_string(&txn);
-                    if let Some(d) = diff_text(&cur, full) {
-                        if d.remove > 0 {
-                            t.remove_range(&mut txn, d.index as u32, d.remove as u32);
-                        }
-                        if !d.insert.is_empty() {
-                            t.insert(&mut txn, d.index as u32, &d.insert);
-                        }
-                    }
+                if !replay_text_delta(&mut txn, &t, delta, full) {
+                    tracing::warn!("delta for {key} does not fit the target text; set the whole text instead");
                 }
             }
             ChangeKind::TextSet(content) => match texts.get(&txn, key) {
@@ -377,5 +333,120 @@ fn copy_blob(src: &LiveDoc, dst: &LiveDoc, meta: &Any, key: &str) {
         }
         Ok(None) => tracing::debug!("blob for {key} not present in source yet"),
         Err(e) => tracing::warn!("reading blob for {key} failed: {e}"),
+    }
+}
+
+/// Replay a recorded text delta onto `t`. The delta is first simulated on the current string to
+/// confirm every position lands in range and on a char boundary; only then is it applied to yrs
+/// (whose `insert`/`remove_range` panic on an out-of-range or mid-codepoint position). When it
+/// does not fit (embeds, races, or a hostile source document) the text is set to `full` with a
+/// diff instead. Returns whether the delta fit. Pure over yrs types, so it can be fuzzed.
+pub fn replay_text_delta(txn: &mut yrs::TransactionMut, t: &yrs::TextRef, delta: &[OwnedDelta], full: &str) -> bool {
+    let cur = t.get_string(txn);
+    if delta_fits(&cur, delta) {
+        let mut pos: u32 = 0;
+        for d in delta {
+            match d {
+                OwnedDelta::Retain(n) => pos += n,
+                OwnedDelta::Delete(n) => t.remove_range(txn, pos, *n),
+                OwnedDelta::Insert(s) => {
+                    t.insert(txn, pos, s);
+                    pos += s.len() as u32;
+                }
+            }
+        }
+        return true;
+    }
+    if let Some(d) = diff_text(&cur, full) {
+        if d.remove > 0 {
+            t.remove_range(txn, d.index as u32, d.remove as u32);
+        }
+        if !d.insert.is_empty() {
+            t.insert(txn, d.index as u32, &d.insert);
+        }
+    }
+    false
+}
+
+/// Simulate `delta` on a copy of `cur` (yrs here uses byte offsets). Every position must stay
+/// within the evolving string and on a char boundary, or the delta is rejected.
+fn delta_fits(cur: &str, delta: &[OwnedDelta]) -> bool {
+    let mut buf = cur.to_string();
+    let mut pos: usize = 0;
+    for d in delta {
+        match d {
+            OwnedDelta::Retain(n) => {
+                pos = match pos.checked_add(*n as usize) {
+                    Some(p) => p,
+                    None => return false,
+                };
+                if pos > buf.len() || !buf.is_char_boundary(pos) {
+                    return false;
+                }
+            }
+            OwnedDelta::Delete(n) => {
+                let end = match pos.checked_add(*n as usize) {
+                    Some(e) => e,
+                    None => return false,
+                };
+                if end > buf.len() || !buf.is_char_boundary(pos) || !buf.is_char_boundary(end) {
+                    return false;
+                }
+                buf.replace_range(pos..end, "");
+            }
+            OwnedDelta::Insert(s) => {
+                if pos > buf.len() || !buf.is_char_boundary(pos) {
+                    return false;
+                }
+                buf.insert_str(pos, s);
+                pos += s.len();
+            }
+        }
+    }
+    true
+}
+
+#[cfg(test)]
+mod replay_tests {
+    use super::*;
+    use yrs::{Doc, GetString, Text, Transact};
+
+    fn run(start: &str, delta: &[OwnedDelta], full: &str) -> (bool, String) {
+        let doc = Doc::new();
+        let t = doc.get_or_insert_text("t");
+        let mut txn = doc.transact_mut();
+        t.insert(&mut txn, 0, start);
+        let fit = replay_text_delta(&mut txn, &t, delta, full);
+        (fit, t.get_string(&txn))
+    }
+
+    #[test]
+    fn multibyte_text_replays_in_byte_offsets() {
+        let (fit, s) = run("h\u{e9}llo", &[OwnedDelta::Retain(3), OwnedDelta::Insert("X".into())], "h\u{e9}Xllo");
+        assert!(fit);
+        assert_eq!(s, "h\u{e9}Xllo");
+        let (fit, s) = run("a\u{1f600}b", &[OwnedDelta::Retain(5), OwnedDelta::Delete(1)], "a\u{1f600}");
+        assert!(fit);
+        assert_eq!(s, "a\u{1f600}");
+    }
+
+    #[test]
+    fn out_of_range_delta_falls_back_to_full_text() {
+        let (fit, s) = run("short", &[OwnedDelta::Retain(40), OwnedDelta::Insert("x".into())], "the full text \u{1f600}");
+        assert!(!fit);
+        assert_eq!(s, "the full text \u{1f600}");
+        let (fit, s) = run("", &[OwnedDelta::Delete(3)], "\u{fc}n\u{ef}code");
+        assert!(!fit);
+        assert_eq!(s, "\u{fc}n\u{ef}code");
+    }
+
+    #[test]
+    fn mid_codepoint_position_falls_back_without_panicking() {
+        let (fit, s) = run("\u{e9}", &[OwnedDelta::Retain(1), OwnedDelta::Insert("x".into())], "fallback");
+        assert!(!fit);
+        assert_eq!(s, "fallback");
+        let (fit, s) = run("a\u{e9}b", &[OwnedDelta::Retain(2), OwnedDelta::Delete(1)], "trimmed");
+        assert!(!fit);
+        assert_eq!(s, "trimmed");
     }
 }

@@ -36,6 +36,8 @@ Adding a finding → add a test here first that fails, then fix. Name the test a
 - Anything a stranger can call before authentication must be cheap and bounded (hello frames, hash frames, JSON bodies) and must answer identically for "does not exist" and "wrong secret".
 - Secrets: store hashed when we only need to verify (user tokens, ticket secrets on the owner side); when we must present them later (mount secrets, guest mounts in the plugin) say so in STORAGE.md and treat the file as sensitive. Print a secret at most once, where the operator asked for it.
 - Locks are `parking_lot::Mutex` (never poisoned): a panic in one task must not take the apply lock down for everyone. Still, decoders and bridges must not panic on untrusted input: validate first (`valid_key`, `valid_hash`), bounds-check before calling into yrs.
+- `ws::handle_payload` wraps CRDT decoding in `catch_unwind`; yrs 0.28 can `debug_assert!`-panic on malformed input (compiled out in the release build we ship). With non-poisoning locks a panic drops one message/connection, never the server.
+- Decoders that see untrusted bytes have a fuzz target under `server/fuzz/` (ticket, y-sync payload, p2p hello, key/hash validation, delta replay). A new decoder gets a target; a crash becomes a unit test.
 - No `unsafe` in this crate. Network input is decoded by `yrs`, `postcard`, `serde_json` and `tungstenite`, all with size limits in front of them (`MAX_WS_MESSAGE`, frame caps in `remote.rs`, `DefaultBodyLimit`, axum's JSON limit).
 
 ## Audit log
@@ -44,4 +46,5 @@ Adding a finding → add a test here first that fails, then fix. Name the test a
 |---|---|---|
 | 2026-10-17 | First audit: dependencies, secrets, auth design, memory safety, all public routes, p2p, clients | 18 findings; fixes in the same commit as the test suite |
 | 2026-10-17 | Mitigation batches 1–2 from the plan: document and connection limits, idle unload, presence whitelist, CORS allow-list, token file, auth failure budget, per-user quota, sealed mount secrets, headless guest sessions | 6 more tests; defaults documented in PUBLIC-SERVER.md |
+| 2026-10-17 | Library/binary split and fuzz targets for every network decoder (F-18) | 5 targets, each run ≥ 45 s without findings on day one |
 | 2026-10-17 | Independent second pass over the same surface | 12 more findings (3 high: panics under the apply lock, token revocation not ending sockets); fixed in a second commit with 3 more tests; non-poisoning locks everywhere |

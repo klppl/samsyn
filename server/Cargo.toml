@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2021"
 description = "CRDT sync server for the Replica Obsidian plugin"
 license = "MIT"
+exclude = ["fuzz/"]
 
 [dependencies]
 anyhow = "1"
