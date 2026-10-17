@@ -119,6 +119,10 @@ pub struct ServeArgs {
     #[arg(long, env = "REPLICA_MAX_SHARE_MB", default_value_t = 2048)]
     pub max_share_mb: u64,
 
+    /// Vaults one user may create (0 = unlimited). A vault is created on first use of a name.
+    #[arg(long, env = "REPLICA_MAX_VAULTS_PER_USER", default_value_t = 50)]
+    pub max_vaults_per_user: usize,
+
     /// Behind a reverse proxy: take the client address from the last X-Forwarded-For entry
     /// (for guest rate limiting). Never set this when clients can reach the server directly.
     #[arg(long, env = "REPLICA_TRUST_PROXY", default_value_t = false)]

@@ -2,7 +2,8 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+use parking_lot::Mutex;
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
@@ -79,9 +80,9 @@ impl Engine {
             let conn = conn.clone();
             let doc_dirty = doc_dirty.clone();
             doc.observe_update_v1("replica-client", move |txn, ev| {
-                *doc_dirty.lock().unwrap() = true;
+                *doc_dirty.lock() = true;
                 if is_local(txn.origin()) {
-                    if let Some(tx) = conn.lock().unwrap().as_ref() {
+                    if let Some(tx) = conn.lock().as_ref() {
                         let _ = tx.send(encode(&Message::Sync(SyncMessage::Update(ev.update.clone()))));
                     }
                 }
@@ -94,7 +95,7 @@ impl Engine {
                 if is_local(txn.origin()) {
                     return;
                 }
-                let mut d = dirty.lock().unwrap();
+                let mut d = dirty.lock();
                 for ev in events.iter() {
                     match ev {
                         Event::Map(m) if ev.path().is_empty() => {
@@ -117,7 +118,7 @@ impl Engine {
                 if is_local(txn.origin()) {
                     return;
                 }
-                let mut d = dirty.lock().unwrap();
+                let mut d = dirty.lock();
                 for (k, _) in ev.keys(txn) {
                     d.insert(k.to_string());
                 }
@@ -271,7 +272,7 @@ impl Engine {
             tracing::warn!("protocol start failed: {e}");
         }
         let _ = tx.send(enc.to_vec());
-        *self.conn.lock().unwrap() = Some(tx);
+        *self.conn.lock() = Some(tx);
         tracing::info!("connected");
     }
 
@@ -520,7 +521,7 @@ impl Engine {
     }
 
     pub fn on_disconnected(&mut self) {
-        *self.conn.lock().unwrap() = None;
+        *self.conn.lock() = None;
         self.synced = false;
     }
 
@@ -546,7 +547,7 @@ impl Engine {
                 Err(e) => tracing::warn!("protocol error: {e}"),
             }
         }
-        if let Some(tx) = self.conn.lock().unwrap().as_ref() {
+        if let Some(tx) = self.conn.lock().as_ref() {
             for r in replies {
                 let _ = tx.send(r);
             }
@@ -562,7 +563,7 @@ impl Engine {
 
     async fn flush_remote(&mut self) {
         let paths: Vec<String> = {
-            let mut d = self.dirty_remote.lock().unwrap();
+            let mut d = self.dirty_remote.lock();
             d.drain().collect()
         };
         for rel in paths {
@@ -1121,7 +1122,7 @@ impl Engine {
     }
 
     pub fn flush_persistence(&mut self) {
-        let dirty = std::mem::replace(&mut *self.doc_dirty.lock().unwrap(), false);
+        let dirty = std::mem::replace(&mut *self.doc_dirty.lock(), false);
         if dirty {
             if let Err(e) = self.store.save_doc(self.doc()) {
                 tracing::warn!("saving doc cache failed: {e}");
@@ -1136,7 +1137,7 @@ impl Engine {
     }
 
     pub fn shutdown(&mut self) {
-        *self.doc_dirty.lock().unwrap() = true;
+        *self.doc_dirty.lock() = true;
         self.flush_persistence();
     }
 }

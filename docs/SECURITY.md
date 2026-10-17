@@ -35,10 +35,12 @@ Adding a finding → add a test here first that fails, then fix. Name the test a
 - New routes: authenticate first, scope to the caller (`user_vault`, `owned_share`, mount owner), validate ids with `valid_name` / `valid_hash`, bound body size, log the path only.
 - Anything a stranger can call before authentication must be cheap and bounded (hello frames, hash frames, JSON bodies) and must answer identically for "does not exist" and "wrong secret".
 - Secrets: store hashed when we only need to verify (user tokens, ticket secrets on the owner side); when we must present them later (mount secrets, guest mounts in the plugin) say so in STORAGE.md and treat the file as sensitive. Print a secret at most once, where the operator asked for it.
+- Locks are `parking_lot::Mutex` (never poisoned): a panic in one task must not take the apply lock down for everyone. Still, decoders and bridges must not panic on untrusted input: validate first (`valid_key`, `valid_hash`), bounds-check before calling into yrs.
 - No `unsafe` in this crate. Network input is decoded by `yrs`, `postcard`, `serde_json` and `tungstenite`, all with size limits in front of them (`MAX_WS_MESSAGE`, frame caps in `remote.rs`, `DefaultBodyLimit`, axum's JSON limit).
 
 ## Audit log
 
 | Date | Scope | Result |
 |---|---|---|
-| 2026-10-17 | First audit: dependencies, secrets, auth design, memory safety, all public routes, p2p, clients | Findings and plan in the project vault (Replica/Security); fixes in the same commit as the test suite |
+| 2026-10-17 | First audit: dependencies, secrets, auth design, memory safety, all public routes, p2p, clients | 18 findings; fixes in the same commit as the test suite |
+| 2026-10-17 | Independent second pass over the same surface | 12 more findings (3 high: panics under the apply lock, token revocation not ending sockets); fixed in a second commit with 3 more tests; non-poisoning locks everywhere |

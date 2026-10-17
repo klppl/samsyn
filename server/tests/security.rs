@@ -383,6 +383,146 @@ fn hostile_document_keys_never_escape_the_sync_directory() {
     assert!(server.errors().is_empty(), "{:?}", server.errors());
 }
 
+
+// ------------------------------------------------------------------ second-pass findings
+
+/// Blob metadata and text deltas are collaborator-controlled. A malformed hash or an embed used
+/// to panic inside the bridge while the server-wide apply lock was held, which poisoned it and
+/// stopped all sync until restart.
+#[test]
+fn hostile_blob_metadata_and_deltas_do_not_stop_the_server() {
+    let dir = tmp("sec-poison");
+    let server = Server::start(&dir, "s", &[]);
+    let owner = server.owner_token.clone();
+    let bob = server.add_user("bob");
+    let a = Client::start(&server, &owner, "va", &dir.join("A"), "A");
+    a.write("Projects/X/ok.md", "fine\n");
+    eventually!(10, a.proc.log_contains("reconcile done"), "owner up", a.proc);
+    let r = api_json(&server, &owner, "POST", "/api/vaults/va/shares", Some(json!({"path": "Projects/X", "name": "X"})));
+    let ticket = r["ticket"].as_str().unwrap().to_string();
+    let b = Client::start(&server, &bob, "vb", &dir.join("B"), "B");
+    eventually!(10, b.proc.log_contains("reconcile done"), "bob up", b.proc);
+    api_json(&server, &bob, "POST", "/api/vaults/vb/mounts", Some(json!({"ticket": ticket, "mount_path": "Shared/X"})));
+    eventually!(15, b.exists("Shared/X/ok.md"), "mount works", b.proc);
+
+    let url = format!("ws://127.0.0.1:{}/ws/va?token={owner}", server.port);
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        use futures::SinkExt;
+        use tokio_tungstenite::tungstenite::Message;
+        use yrs::sync::{Message as M, SyncMessage};
+        use yrs::updates::encoder::Encode;
+        use yrs::{Map, ReadTxn, Text, Transact};
+        let (mut ws, _) = tokio_tungstenite::connect_async(&url).await.expect("connect");
+        let doc = yrs::Doc::new();
+        let texts = doc.get_or_insert_map("texts");
+        let blobs = doc.get_or_insert_map("blobs");
+        {
+            let mut txn = doc.transact_mut();
+            // Hashes that must never reach a path: too short, empty, absurdly long, non-hex.
+            for (i, h) in ["zz", "", &"f".repeat(200), &"g".repeat(64)].iter().enumerate() {
+                let mut m = std::collections::HashMap::new();
+                m.insert("hash".to_string(), yrs::Any::String((*h).into()));
+                m.insert("size".to_string(), yrs::Any::Number(yrs::Number::from(1.0)));
+                m.insert("mtime".to_string(), yrs::Any::Number(yrs::Number::from(1.0)));
+                blobs.insert(&mut txn, format!("Projects/X/bad{i}.png"), yrs::Any::Map(std::sync::Arc::new(m)));
+            }
+            // An embed in a shared note, followed by more text: positions after it are off.
+            let t = texts.insert(&mut txn, "Projects/X/embed.md", yrs::TextPrelim::new("hello world"));
+            t.insert_embed(&mut txn, 5, yrs::Any::Bool(true));
+            t.insert(&mut txn, 7, " there");
+            t.remove_range(&mut txn, 0, 2);
+        }
+        let update = doc.transact().encode_state_as_update_v1(&yrs::StateVector::default());
+        ws.send(Message::Binary(M::Sync(SyncMessage::Update(update)).encode_v1().into())).await.expect("send");
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    });
+    // The server must still bridge ordinary edits in both directions.
+    a.append("Projects/X/ok.md", "still-alive");
+    eventually!(15, b.contains("Shared/X/ok.md", "still-alive"), "bridge still works after hostile metadata", b.proc, server.proc);
+    b.append("Shared/X/ok.md", "and-back");
+    eventually!(15, a.contains("Projects/X/ok.md", "and-back"), "bridge still works the other way", a.proc, server.proc);
+    let (code, _) = api_raw(&server, "", "GET", "/health", None);
+    assert_eq!(code, 200);
+    assert!(!server.proc.log_contains("panicked"), "a task panicked:\n{}", server.proc.log_text());
+}
+
+#[test]
+fn revoked_user_token_closes_its_live_websocket() {
+    let dir = tmp("sec-revoke-token");
+    let server = Server::start(&dir, "s", &[]);
+    let owner = server.owner_token.clone();
+    let phone = api_json(&server, &owner, "POST", "/api/me/tokens", Some(json!({"label": "phone"})))["token"].as_str().unwrap().to_string();
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        use futures::StreamExt;
+        use tokio_tungstenite::tungstenite::Message;
+        let (mut ws_phone, _) = tokio_tungstenite::connect_async(format!("ws://127.0.0.1:{}/ws/va?token={phone}", server.port)).await.expect("connect");
+        let (mut ws_owner, _) = tokio_tungstenite::connect_async(format!("ws://127.0.0.1:{}/ws/va?token={owner}", server.port)).await.expect("connect");
+        // Drain the hello messages.
+        let _ = tokio::time::timeout(Duration::from_secs(2), ws_phone.next()).await;
+        let _ = tokio::time::timeout(Duration::from_secs(2), ws_owner.next()).await;
+        // Blocking HTTP must not run on the async runtime thread.
+        let (url, tok) = (format!("{}/api/me/tokens/phone", server.url()), owner.clone());
+        let code = tokio::task::spawn_blocking(move || {
+            reqwest::blocking::Client::new().delete(url).bearer_auth(tok).send().unwrap().status().as_u16()
+        })
+        .await
+        .unwrap();
+        assert_eq!(code, 204);
+        // The re-check runs every 30 s.
+        let closed = tokio::time::timeout(Duration::from_secs(45), async {
+            loop {
+                match ws_phone.next().await {
+                    None | Some(Err(_)) | Some(Ok(Message::Close(_))) => return true,
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .unwrap_or(false);
+        assert!(closed, "socket with a revoked token stayed open");
+        // The owner's own socket is untouched.
+        let still_open = tokio::time::timeout(Duration::from_secs(3), ws_owner.next()).await.is_err()
+            || matches!(ws_owner.next().await, Some(Ok(Message::Binary(_))) | Some(Ok(Message::Ping(_))));
+        assert!(still_open, "unrelated socket was closed too");
+    });
+}
+
+#[test]
+fn reading_never_creates_vaults_and_creation_is_capped() {
+    let dir = tmp("sec-vaults");
+    let server = Server::start(&dir, "s", &["--max-vaults-per-user", "2"]);
+    let owner = server.owner_token.clone();
+    let hash = hex64('a');
+    // A read on a vault that does not exist is 404 and leaves nothing behind.
+    let (code, _) = api_raw(&server, &owner, "GET", &format!("/blobs/ghost/{hash}"), None);
+    assert_eq!(code, 404);
+    let me = api_json(&server, &owner, "GET", "/me", None);
+    assert_eq!(me["vaults"].as_array().unwrap().len(), 0, "{me}");
+    // Writes create, up to the cap.
+    let payload = b"blob";
+    let h = hex::encode(sha2::Sha256::digest(payload));
+    for v in ["one", "two"] {
+        let (code, _) = api_raw_bytes(&server, &owner, "PUT", &format!("/blobs/{v}/{h}"), payload);
+        assert_eq!(code, 201, "vault {v}");
+    }
+    let (code, body) = api_raw_bytes(&server, &owner, "PUT", &format!("/blobs/three/{h}"), payload);
+    assert_eq!(code, 409, "third vault should be refused: {body}");
+    // The WebSocket route refuses to create past the cap too (refusal happens at the upgrade).
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let ws_code = rt.block_on(async {
+        match tokio_tungstenite::connect_async(format!("ws://127.0.0.1:{}/ws/three?token={owner}", server.port)).await {
+            Err(tokio_tungstenite::tungstenite::Error::Http(resp)) => resp.status().as_u16(),
+            Ok(_) => 101,
+            Err(e) => panic!("unexpected error {e}"),
+        }
+    });
+    assert_eq!(ws_code, 409, "WebSocket should refuse to create past the cap");
+    let me = api_json(&server, &owner, "GET", "/me", None);
+    assert_eq!(me["vaults"].as_array().unwrap().len(), 2, "{me}");
+}
+
 // ------------------------------------------------------------------ helpers
 
 fn urlenc(s: &str) -> String {

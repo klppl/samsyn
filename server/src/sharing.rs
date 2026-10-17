@@ -21,13 +21,22 @@ fn err(status: StatusCode, msg: impl Into<String>) -> Response {
 }
 
 fn internal(e: anyhow::Error) -> Response {
+    // Full context goes to the log only; error strings can carry paths and ids.
     tracing::error!("sharing api: {e:#}");
-    err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+    err(StatusCode::INTERNAL_SERVER_ERROR, "internal error; see the server log")
 }
 
 /// Normalise a user-typed path to a folder prefix ("a/b/") or a file key ("a/b.md").
 fn clean_path(p: &str) -> String {
     p.trim().trim_matches('/').replace('\\', "/")
+}
+
+/// Share names are shown in UIs and logs and used in default folder names: printable, bounded.
+fn clean_name(n: &str) -> String {
+    let s: String = n.chars().filter(|c| !c.is_control()).collect();
+    let s = s.trim();
+    let s: String = s.chars().take(128).collect();
+    if s.is_empty() { "share".to_string() } else { s }
 }
 
 fn overlaps(a: &str, b: &str) -> bool {
@@ -186,7 +195,7 @@ pub async fn create_share(
         None => prefix.clone(),
     };
     // Check + insert + attach under one lock, otherwise two concurrent creates could both pass.
-    let _admin = state.docs.share_admin.lock().unwrap();
+    let _admin = state.docs.share_admin.lock();
     match taken_prefixes(&state, &info.id) {
         Ok(taken) => {
             if taken.iter().any(|t| overlaps(t, &full)) {
@@ -195,10 +204,7 @@ pub async fn create_share(
         }
         Err(e) => return internal(e),
     }
-    let name = body
-        .name
-        .filter(|n| !n.trim().is_empty())
-        .unwrap_or_else(|| path.rsplit('/').next().unwrap_or(&path).to_string());
+    let name = clean_name(&body.name.filter(|n| !n.trim().is_empty()).unwrap_or_else(|| path.rsplit('/').next().unwrap_or(&path).to_string()));
 
     let reg = state.storage.registry();
     let share = match reg.create_share(&user.id, &info.id, &name, &prefix, only_file.as_deref()) {
@@ -443,15 +449,25 @@ pub async fn create_mount(
             Err(e) => return internal(e),
         }
     };
-    let access = if grant_access == "ro" || ticket.access == "ro" { "ro" } else { "rw" };
+    // Anything but an explicit "rw" from both the grant and the ticket means read-only; a
+    // peer server could answer with any string.
+    let access = if grant_access == "rw" && ticket.access == "rw" { "rw" } else { "ro" };
+    // A single-note share's file name comes from the peer too: one path segment or nothing.
+    let only_file = only_file.filter(|f| crate::ids::valid_key(f) && !f.contains('/') && !f.starts_with('.'));
 
+    let share_name = clean_name(&share_name);
     let mount_path = clean_path(&body.mount_path.unwrap_or_default());
-    let mount_path = if mount_path.is_empty() { format!("Shared/{}", share_name.replace('/', "-")) } else { mount_path };
+    let mount_path = if mount_path.is_empty() {
+        let candidate = format!("Shared/{}", share_name.replace('/', "-"));
+        if crate::ids::valid_key(&candidate) && !candidate.split('/').any(|s| s.starts_with('.')) { candidate } else { format!("Shared/{}", ticket.share_id) }
+    } else {
+        mount_path
+    };
     if !crate::ids::valid_key(&mount_path) || mount_path.split('/').any(|s| s.starts_with('.')) {
         return err(StatusCode::BAD_REQUEST, "mount path contains '..', hidden, empty or control-character segments");
     }
     let prefix = format!("{mount_path}/");
-    let _admin = state.docs.share_admin.lock().unwrap();
+    let _admin = state.docs.share_admin.lock();
     match taken_prefixes(&state, &info.id) {
         Ok(taken) => {
             if taken.iter().any(|t| overlaps(t, &prefix)) {
@@ -551,7 +567,7 @@ pub async fn move_mount(
     if new_prefix == mount.mount_prefix {
         return Json(serde_json::json!({ "mount_path": new_path })).into_response();
     }
-    let _admin = state.docs.share_admin.lock().unwrap();
+    let _admin = state.docs.share_admin.lock();
     match prefix_taken(&state, &mount.vault_id, None, Some(&mount.id), &new_prefix) {
         Ok(true) => return err(StatusCode::CONFLICT, "the new folder overlaps another share or mount"),
         Ok(false) => {}
@@ -613,7 +629,7 @@ pub async fn move_share(
     if full == old_full {
         return Json(serde_json::json!({ "path": new_path })).into_response();
     }
-    let _admin = state.docs.share_admin.lock().unwrap();
+    let _admin = state.docs.share_admin.lock();
     match prefix_taken(&state, &share.vault_id, Some(&share.id), None, &full) {
         Ok(true) => return err(StatusCode::CONFLICT, "the new path overlaps another share or mount"),
         Ok(false) => {}
@@ -656,9 +672,10 @@ pub async fn inspect_ticket(
     State(state): State<SharedState>,
     Json(body): Json<InspectTicket>,
 ) -> Response {
-    if let Err(r) = authenticate(&state, &headers, &query) {
-        return r;
-    }
+    let user = match authenticate(&state, &headers, &query) {
+        Ok(u) => u,
+        Err(r) => return r,
+    };
     let ticket = match Ticket::decode(&body.ticket) {
         Ok(t) => t,
         Err(e) => return err(StatusCode::BAD_REQUEST, format!("bad ticket: {e}")),
@@ -679,8 +696,10 @@ pub async fn inspect_ticket(
     } else {
         (None, ticket.access.clone(), None)
     };
+    // Only tell the caller about the share's vault when it is their own vault.
     let own_vault = own
         .and_then(|vid| state.storage.registry().vault_by_id(&vid).ok().flatten())
+        .filter(|v| v.user_id == user.id)
         .map(|v| v.name);
     Json(serde_json::json!({
         "share_id": ticket.share_id,

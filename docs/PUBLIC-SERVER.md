@@ -29,7 +29,9 @@ Everything that user can do: read and write all their vaults, create shares, iss
 - The request log carries the path only, never the query string, so secrets and session ids do not end up in log files.
 - Sessions: the plugin presents the secret once (`POST /guest/session/{share}`) and uses the returned session id from then on; sessions expire after 7 days and die immediately when the ticket is revoked.
 - Upload quota per share for guests: `--max-share-mb` (default 2048, `0` = unlimited). The owner's own uploads are not limited by it.
-- Blob size limit for everyone: `--max-blob-mb` (default 256).
+- Blob size limit for everyone: `--max-blob-mb` (default 256). Vaults per user: `--max-vaults-per-user` (default 50); reading never creates a vault.
+- Live sockets re-check their credential every 30 s: a revoked device token or ticket ends the connection within that time.
+- Behind a reverse proxy, start with `--trust-proxy` so the guest rate limiter sees the real client address (last `X-Forwarded-For` entry). Never set it when clients can reach the server directly.
 
 ## Recommended setup
 

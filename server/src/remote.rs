@@ -16,7 +16,8 @@
 
 use std::collections::HashSet;
 use std::str::FromStr;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+use parking_lot::Mutex;
 use std::time::Duration;
 
 use anyhow::Context;
@@ -49,6 +50,11 @@ const MAX_HELLO_FRAME: usize = 4096;
 const MAX_HASH_FRAME: usize = 256;
 /// Streams a peer may have open at once on one connection (control + blob fetches).
 const MAX_STREAMS_PER_CONN: usize = 16;
+/// Incoming p2p connections served at once, over all peers. The node id is public (it is in
+/// every ticket), so anyone can connect; beyond this they wait in the QUIC accept queue.
+const MAX_INCOMING_CONNS: usize = 64;
+/// A peer must finish the hello this fast or the stream is dropped.
+const HELLO_TIMEOUT: Duration = Duration::from_secs(30);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(25);
 const PROTOCOL_VERSION: u8 = 1;
 
@@ -143,13 +149,20 @@ async fn read_frame(r: &mut RecvStream, max: usize) -> anyhow::Result<Option<Vec
     }
     let n = u32::from_le_bytes(len) as usize;
     anyhow::ensure!(n <= max, "frame too large ({n} bytes, limit {max})");
-    let mut buf = vec![0u8; n];
-    r.read_exact(&mut buf).await.map_err(ae)?;
+    // Grow with the data instead of trusting the declared length up front, so a peer that
+    // announces 256 MB and sends nothing costs nothing.
+    let mut buf: Vec<u8> = Vec::with_capacity(n.min(1 << 20));
+    let mut chunk = vec![0u8; 1 << 16];
+    while buf.len() < n {
+        let want = (n - buf.len()).min(chunk.len());
+        r.read_exact(&mut chunk[..want]).await.map_err(ae)?;
+        buf.extend_from_slice(&chunk[..want]);
+    }
     Ok(Some(buf))
 }
 
 fn start_message(doc: &LiveDoc) -> anyhow::Result<Vec<u8>> {
-    let aw = doc.awareness.lock().unwrap();
+    let aw = doc.awareness.lock();
     let mut enc = EncoderV1::new();
     DefaultProtocol.start(&aw, &mut enc).map_err(ae)?;
     Ok(enc.to_vec())
@@ -191,9 +204,9 @@ async fn sync_loop(
             frame = read_frame(recv, MAX_SYNC_FRAME) => {
                 let Some(data) = frame? else { break };
                 let replies = {
-                    let _apply = docs.apply_lock.lock().unwrap();
+                    let _apply = docs.apply_lock.lock();
                     let r = {
-                        let mut aw = doc.awareness.lock().unwrap();
+                        let mut aw = doc.awareness.lock();
                         handle_payload(&protocol, &mut aw, &data, &mut owned, writable)
                     };
                     for h in new_blob_hashes(doc) {
@@ -226,7 +239,7 @@ async fn sync_loop(
         }
     }
     if !owned.is_empty() {
-        let mut aw = doc.awareness.lock().unwrap();
+        let mut aw = doc.awareness.lock();
         for id in owned {
             aw.remove_state(id);
         }
@@ -237,7 +250,7 @@ async fn sync_loop(
 /// Blob hashes in changes recorded since the last propagate that the store lacks.
 /// Must be called with `apply_lock` held, before `propagate` drains the changes.
 fn new_blob_hashes(doc: &LiveDoc) -> Vec<String> {
-    let changes = doc.changes.lock().unwrap();
+    let changes = doc.changes.lock();
     changes
         .iter()
         .filter_map(|c| match &c.kind {
@@ -251,13 +264,22 @@ fn new_blob_hashes(doc: &LiveDoc) -> Vec<String> {
 fn blob_hash(meta: &Any) -> Option<String> {
     let Any::Map(m) = meta else { return None };
     match m.get("hash") {
-        Some(Any::String(h)) => Some(h.to_string()),
+        Some(Any::String(h)) if crate::ids::valid_hash(h) => Some(h.to_ascii_lowercase()),
+        Some(Any::String(h)) => {
+            tracing::warn!("ignoring blob metadata with invalid hash {:?}", h.chars().take(16).collect::<String>());
+            None
+        }
         _ => None,
     }
 }
 
+/// First 12 characters for log lines; safe on any length.
+fn short(hash: &str) -> &str {
+    &hash[..hash.len().min(12)]
+}
+
 fn missing_blobs(doc: &LiveDoc) -> Vec<String> {
-    let aw = doc.awareness.lock().unwrap();
+    let aw = doc.awareness.lock();
     let txn = aw.doc().transact();
     let Some(blobs) = txn.get_map("blobs") else { return vec![] };
     blobs
@@ -302,12 +324,16 @@ async fn serve_one(send: SendStream, mut recv: RecvStream, doc: Arc<Mutex<Option
     serve_blob_request(send, recv, doc).await
 }
 
+fn session_doc(session: &Arc<Session>) -> Arc<Mutex<Option<Arc<LiveDoc>>>> {
+    Arc::new(Mutex::new(session.doc.lock().clone()))
+}
+
 /// Answer one blob request (stream kind byte already consumed): `frame(hash)` → `frame(bytes)`,
 /// empty frame when unknown or when no document is bound to this connection yet.
 async fn serve_blob_request(mut send: SendStream, mut recv: RecvStream, doc: Arc<Mutex<Option<Arc<LiveDoc>>>>) -> anyhow::Result<()> {
     let hash = read_frame(&mut recv, MAX_HASH_FRAME).await?.context("no hash")?;
     let hash = String::from_utf8(hash).context("hash not utf8")?;
-    let doc = doc.lock().unwrap().clone();
+    let doc = doc.lock().clone();
     let bytes = match doc {
         Some(d) if hash.len() == 64 && hash.bytes().all(|b| b.is_ascii_hexdigit()) => d.store.get_blob(&hash)?.unwrap_or_default(),
         _ => Vec::new(),
@@ -332,16 +358,16 @@ async fn fetch_blobs(conn: Connection, docs: Arc<DocRegistry>, doc: Arc<LiveDoc>
                     tracing::warn!(doc = %doc.label, "storing fetched blob failed: {e}");
                     continue;
                 }
-                tracing::info!(doc = %doc.label, "fetched blob {} ({} bytes) from peer", &hash[..12], bytes.len());
+                tracing::info!(doc = %doc.label, "fetched blob {} ({} bytes) from peer", short(&hash), bytes.len());
                 docs.blob_arrived(&doc, &hash);
             }
             Ok(None) => {
                 // Peer does not have it (yet); allow a retry when it is referenced again.
-                tracing::debug!(doc = %doc.label, "peer has no blob {}", &hash[..12]);
+                tracing::debug!(doc = %doc.label, "peer has no blob {}", short(&hash));
                 seen.remove(&hash);
             }
             Err(e) => {
-                tracing::warn!(doc = %doc.label, "fetching blob {} failed: {e}", &hash[..12]);
+                tracing::warn!(doc = %doc.label, "fetching blob {} failed: {e}", short(&hash));
                 seen.remove(&hash);
             }
         }
@@ -367,6 +393,21 @@ async fn fetch_one(conn: &Connection, hash: &str, max_blob: usize) -> anyhow::Re
 #[derive(Clone)]
 pub struct ShareProtocol {
     pub docs: Arc<DocRegistry>,
+    pub conns: Arc<tokio::sync::Semaphore>,
+}
+
+impl ShareProtocol {
+    pub fn new(docs: Arc<DocRegistry>) -> Self {
+        Self { docs, conns: Arc::new(tokio::sync::Semaphore::new(MAX_INCOMING_CONNS)) }
+    }
+}
+
+/// Per-connection state on the owner side: the share doc once the hello succeeded, and
+/// whether a control stream has been claimed (one per connection).
+#[derive(Default)]
+struct Session {
+    doc: Mutex<Option<Arc<LiveDoc>>>,
+    control_taken: std::sync::atomic::AtomicBool,
 }
 
 impl std::fmt::Debug for ShareProtocol {
@@ -378,8 +419,13 @@ impl std::fmt::Debug for ShareProtocol {
 impl ProtocolHandler for ShareProtocol {
     async fn accept(&self, conn: Connection) -> Result<(), AcceptError> {
         let peer = conn.remote_id().fmt_short().to_string();
+        let Ok(_conn_permit) = self.conns.clone().try_acquire_owned() else {
+            tracing::warn!(peer = %peer, "p2p connection refused: too many connections");
+            conn.close(3u32.into(), b"busy");
+            return Ok(());
+        };
         tracing::info!(peer = %peer, "p2p connection accepted");
-        let session: Arc<Mutex<Option<Arc<LiveDoc>>>> = Default::default();
+        let session: Arc<Session> = Default::default();
         let slots = Arc::new(tokio::sync::Semaphore::new(MAX_STREAMS_PER_CONN));
         loop {
             let (send, recv) = match conn.accept_bi().await {
@@ -411,17 +457,24 @@ impl ProtocolHandler for ShareProtocol {
 async fn owner_stream(
     docs: Arc<DocRegistry>,
     conn: Connection,
-    session: Arc<Mutex<Option<Arc<LiveDoc>>>>,
+    session: Arc<Session>,
     mut send: SendStream,
     mut recv: RecvStream,
     peer: &str,
 ) -> anyhow::Result<()> {
     let mut kind = [0u8; 1];
-    recv.read_exact(&mut kind).await.map_err(ae)?;
+    tokio::time::timeout(HELLO_TIMEOUT, recv.read_exact(&mut kind)).await.map_err(|_| anyhow::anyhow!("stream kind timeout"))?.map_err(ae)?;
     match kind[0] {
-        STREAM_BLOB => serve_blob_request(send, recv, session).await,
+        STREAM_BLOB => serve_blob_request(send, recv, session_doc(&session)).await,
         STREAM_CONTROL => {
-            let hello: Hello = postcard::from_bytes(&read_frame(&mut recv, MAX_HELLO_FRAME).await?.context("no hello")?).context("bad hello")?;
+            if session.control_taken.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                anyhow::bail!("second control stream on one connection");
+            }
+            let hello_frame = tokio::time::timeout(HELLO_TIMEOUT, read_frame(&mut recv, MAX_HELLO_FRAME))
+                .await
+                .map_err(|_| anyhow::anyhow!("hello timeout"))??
+                .context("no hello")?;
+            let hello: Hello = postcard::from_bytes(&hello_frame).context("bad hello")?;
             if hello.version != PROTOCOL_VERSION {
                 tracing::warn!(peer = %peer, "p2p hello with protocol v{}, we speak v{PROTOCOL_VERSION}", hello.version);
                 let reply = postcard::to_stdvec(&HelloReply::VersionMismatch { expected: PROTOCOL_VERSION })?;
@@ -452,7 +505,7 @@ async fn owner_stream(
                 }
             };
             let doc = docs.share_doc_for_link(&share)?;
-            *session.lock().unwrap() = Some(doc.clone());
+            *session.doc.lock() = Some(doc.clone());
             let reply = HelloReply::Ok { access: access.clone(), name: share.name.clone(), only_file: share.only_file.clone() };
             write_frame(&mut send, &postcard::to_stdvec(&reply)?).await?;
             tracing::info!(peer = %peer, share = %share.name, "p2p link up via {label} ({access})");

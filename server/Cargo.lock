@@ -3060,6 +3060,7 @@ dependencies = [
  "iroh",
  "iroh-base",
  "notify-debouncer-mini",
+ "parking_lot",
  "postcard",
  "rand 0.9.5",
  "reqwest",

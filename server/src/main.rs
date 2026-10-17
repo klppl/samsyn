@@ -43,8 +43,8 @@ pub struct AppState {
     pub serve: ServeArgs,
     pub storage: Storage,
     pub docs: Arc<DocRegistry>,
-    pub guest_limiter: std::sync::Mutex<guest::GuestLimiter>,
-    pub guest_sessions: std::sync::Mutex<guest::GuestSessions>,
+    pub guest_limiter: parking_lot::Mutex<guest::GuestLimiter>,
+    pub guest_sessions: parking_lot::Mutex<guest::GuestSessions>,
 }
 
 pub type SharedState = Arc<AppState>;
@@ -131,10 +131,10 @@ async fn serve(args: ServeArgs, storage: Storage) -> anyhow::Result<()> {
     };
 
     let max_blob = args.max_blob_mb * 1024 * 1024;
-    let docs = Arc::new(DocRegistry::new(storage.clone(), node_id, endpoint.clone(), max_blob));
+    let docs = Arc::new(DocRegistry::new(storage.clone(), node_id, endpoint.clone(), max_blob, args.max_vaults_per_user));
     let router = endpoint.map(|ep| {
         iroh::protocol::Router::builder(ep)
-            .accept(remote::ALPN, remote::ShareProtocol { docs: docs.clone() })
+            .accept(remote::ALPN, remote::ShareProtocol::new(docs.clone()))
             .spawn()
     });
     let state: SharedState = Arc::new(AppState { docs, storage, serve: args, guest_limiter: Default::default(), guest_sessions: Default::default() });

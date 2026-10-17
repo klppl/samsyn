@@ -26,6 +26,12 @@ pub fn valid_name(id: &str) -> bool {
         && !id.starts_with('.')
 }
 
+/// A content hash as used for blobs: exactly 64 hex characters. Anything else never reaches
+/// the filesystem (blob metadata comes from other people's documents).
+pub fn valid_hash(h: &str) -> bool {
+    h.len() == 64 && h.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
 /// Is this a document key (vault-relative file path) that clients may safely map to a file?
 /// Keys come from other users (shares), so the rules are strict: relative, "/"-separated,
 /// no empty, "." or ".." segments, no control characters, no backslashes, bounded length.

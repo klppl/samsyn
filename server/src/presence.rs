@@ -81,6 +81,7 @@ fn mirror(docs: &DocRegistry, src_id: &str, update: AwarenessUpdate, st: &mut Mi
                 let clock = st.next_clock(&tid, mid);
                 apply(&doc, mid, clock, "null");
             }
+            st.clocks.remove(&(tid, mid));
         }
 
         let mut now: Vec<(String, ClientID)> = Vec::new();
@@ -137,7 +138,7 @@ fn targets_for(docs: &DocRegistry, src_id: &str, json: &serde_json::Value) -> Ve
 fn apply(doc: &LiveDoc, id: ClientID, clock: u32, json: &str) {
     let mut clients = HashMap::new();
     clients.insert(id, AwarenessUpdateEntry { clock, json: json.into() });
-    let mut aw = doc.awareness.lock().unwrap();
+    let mut aw = doc.awareness.lock();
     if let Err(e) = aw.apply_update(AwarenessUpdate { clients }) {
         tracing::debug!(doc = %doc.label, "mirroring presence failed: {e}");
     }

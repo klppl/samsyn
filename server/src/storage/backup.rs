@@ -162,6 +162,8 @@ pub fn restore_backup<R: Read>(input: R, data_dir: &Path, merge: bool) -> anyhow
     let staged_reg = super::Registry::open(&staging.path().join("registry.db"))?;
     let mut seen_users: HashSet<String> = HashSet::new();
     for v in staged_reg.list_vaults(None)? {
+        // Ids from a foreign registry become directory names: accept only our own id shape.
+        anyhow::ensure!(is_hex_id(&v.id) && is_hex_id(&v.user_id), "backup contains a malformed vault or user id ({}/{})", v.user_id, v.id);
         if !seen_users.contains(&v.user_id) {
             if let Some(u) = staged_reg.user_by_id(&v.user_id)? {
                 live.registry().upsert_user(&u)?;
@@ -180,6 +182,10 @@ pub fn restore_backup<R: Read>(input: R, data_dir: &Path, merge: bool) -> anyhow
         let _ = VaultStore::open(&dst, &v)?;
     }
     Ok(())
+}
+
+fn is_hex_id(s: &str) -> bool {
+    s.len() == 16 && s.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
 fn move_path(src: &Path, dst: &Path) -> anyhow::Result<()> {

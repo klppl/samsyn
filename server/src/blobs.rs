@@ -36,8 +36,9 @@ pub async fn put_blob(
     if actual != hash.to_ascii_lowercase() {
         return (StatusCode::BAD_REQUEST, "hash mismatch").into_response();
     }
-    let (_, store) = match state.storage.open_vault_for_user(&user, &vault_name) {
+    let (_, store) = match state.storage.open_vault_for_user(&user, &vault_name, state.serve.max_vaults_per_user) {
         Ok(v) => v,
+        Err(e) if e.to_string().contains("vault limit") => return (StatusCode::CONFLICT, e.to_string()).into_response(),
         Err(e) => {
             tracing::error!("open vault failed: {e}");
             return StatusCode::INTERNAL_SERVER_ERROR.into_response();
@@ -65,8 +66,10 @@ pub async fn get_blob(
     if !valid_name(&vault_name) || !valid_hash(&hash) {
         return (StatusCode::BAD_REQUEST, "invalid id").into_response();
     }
-    let (_, store) = match state.storage.open_vault_for_user(&user, &vault_name) {
-        Ok(v) => v,
+    // Reading never creates a vault.
+    let (_, store) = match state.storage.existing_vault_for_user(&user, &vault_name) {
+        Ok(Some(v)) => v,
+        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
         Err(e) => {
             tracing::error!("open vault failed: {e}");
             return StatusCode::INTERNAL_SERVER_ERROR.into_response();

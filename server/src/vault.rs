@@ -2,7 +2,8 @@
 //! bridges that keep shared subtrees equal between documents.
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+use parking_lot::Mutex;
 
 use bytes::Bytes;
 use tokio::sync::broadcast;
@@ -34,6 +35,8 @@ pub struct LiveDoc {
     pub tx: broadcast::Sender<Bytes>,
     /// Changes recorded by observers, drained by `DocRegistry::propagate`.
     pub changes: Arc<Mutex<Vec<Change>>>,
+    /// Serializes quota check + blob write for guests.
+    pub quota_lock: Mutex<()>,
 }
 
 impl LiveDoc {
@@ -65,7 +68,7 @@ impl LiveDoc {
             let changes = changes.clone();
             texts.observe_deep("replica-bridge", move |txn, events| {
                 let from = origin_source(txn.origin());
-                let mut out = changes.lock().unwrap();
+                let mut out = changes.lock();
                 let mut handled: Vec<String> = Vec::new();
                 for ev in events.iter() {
                     match ev {
@@ -89,18 +92,23 @@ impl LiveDoc {
                             if handled.contains(&key) {
                                 continue;
                             }
-                            let delta: Vec<OwnedDelta> = t
-                                .delta(txn)
-                                .iter()
-                                .filter_map(|d| match d {
-                                    yrs::types::Delta::Retain(n, _) => Some(OwnedDelta::Retain(*n)),
-                                    yrs::types::Delta::Deleted(n) => Some(OwnedDelta::Delete(*n)),
-                                    yrs::types::Delta::Inserted(Out::Any(Any::String(s)), _) => Some(OwnedDelta::Insert(s.to_string())),
-                                    _ => None,
-                                })
-                                .collect();
-                            if !delta.is_empty() {
-                                out.push(Change { key, kind: ChangeKind::TextDelta(delta), from: from.clone() });
+                            // Anything but retain / delete / string insert (an embed, say) makes
+                            // positions untrustworthy: send the whole text instead.
+                            let mut delta: Vec<OwnedDelta> = Vec::new();
+                            let mut plain = true;
+                            for d in t.delta(txn).iter() {
+                                match d {
+                                    yrs::types::Delta::Retain(n, _) => delta.push(OwnedDelta::Retain(*n)),
+                                    yrs::types::Delta::Deleted(n) => delta.push(OwnedDelta::Delete(*n)),
+                                    yrs::types::Delta::Inserted(Out::Any(Any::String(s)), _) => delta.push(OwnedDelta::Insert(s.to_string())),
+                                    _ => plain = false,
+                                }
+                            }
+                            let full = t.target().get_string(txn);
+                            if !plain {
+                                out.push(Change { key, kind: ChangeKind::TextSet(full), from: from.clone() });
+                            } else if !delta.is_empty() {
+                                out.push(Change { key, kind: ChangeKind::TextDelta(delta, full), from: from.clone() });
                             }
                         }
                         _ => {}
@@ -112,7 +120,7 @@ impl LiveDoc {
             let changes = changes.clone();
             blobs.observe("replica-bridge", move |txn, ev| {
                 let from = origin_source(txn.origin());
-                let mut out = changes.lock().unwrap();
+                let mut out = changes.lock();
                 for (k, ch) in ev.keys(txn) {
                     let kind = match ch {
                         EntryChange::Inserted(Out::Any(a)) | EntryChange::Updated(_, Out::Any(a)) => ChangeKind::BlobSet(a.clone()),
@@ -139,17 +147,17 @@ impl LiveDoc {
         }
 
         tracing::info!(doc = %label, "loaded ({n} stored updates)");
-        Ok(Arc::new(LiveDoc { id, label, kind, store, awareness: Mutex::new(awareness), tx, changes }))
+        Ok(Arc::new(LiveDoc { id, label, kind, store, awareness: Mutex::new(awareness), tx, changes, quota_lock: Mutex::new(()) }))
     }
 
     pub fn full_state(&self) -> Vec<u8> {
-        let aw = self.awareness.lock().unwrap();
+        let aw = self.awareness.lock();
         let state = aw.doc().transact().encode_state_as_update_v1(&StateVector::default());
         state
     }
 
     pub fn snapshot(&self, keep: usize) -> anyhow::Result<()> {
-        let aw = self.awareness.lock().unwrap();
+        let aw = self.awareness.lock();
         let path = self.store.write_snapshot(aw.doc(), &self.id)?;
         let full = aw.doc().transact().encode_state_as_update_v1(&StateVector::default());
         drop(aw);
@@ -168,7 +176,7 @@ impl LiveDoc {
 
     /// All keys in `texts` and `blobs`.
     pub fn keys(&self) -> Vec<String> {
-        let aw = self.awareness.lock().unwrap();
+        let aw = self.awareness.lock();
         let txn = aw.doc().transact();
         let mut out: Vec<String> = txn.get_map("texts").map(|m| m.keys(&txn).map(|k| k.to_string()).collect()).unwrap_or_default();
         if let Some(b) = txn.get_map("blobs") {
@@ -206,6 +214,7 @@ pub struct DocRegistry {
     pub endpoint: Option<iroh::Endpoint>,
     /// Largest blob we accept over a p2p link (same limit as the HTTP blob route).
     pub max_blob_bytes: usize,
+    pub max_vaults_per_user: usize,
     /// Awareness changes of every loaded document, consumed by the presence mirror task.
     presence_tx: PresenceSender,
     presence_rx: Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<PresenceEvent>>>,
@@ -215,7 +224,7 @@ pub struct DocRegistry {
 }
 
 impl DocRegistry {
-    pub fn new(storage: Storage, node_id: String, endpoint: Option<iroh::Endpoint>, max_blob_bytes: usize) -> Self {
+    pub fn new(storage: Storage, node_id: String, endpoint: Option<iroh::Endpoint>, max_blob_bytes: usize, max_vaults_per_user: usize) -> Self {
         let (presence_tx, presence_rx) = tokio::sync::mpsc::unbounded_channel();
         Self {
             presence_tx,
@@ -229,6 +238,7 @@ impl DocRegistry {
             share_admin: Mutex::new(()),
             endpoint,
             max_blob_bytes,
+            max_vaults_per_user,
             links: Mutex::new(HashMap::new()),
             link_status: Mutex::new(HashMap::new()),
         }
@@ -236,24 +246,24 @@ impl DocRegistry {
 
     /// Start mirroring presence across bridges. Call once, inside the tokio runtime.
     pub fn start_presence_mirror(self: &Arc<Self>) {
-        if let Some(rx) = self.presence_rx.lock().unwrap().take() {
+        if let Some(rx) = self.presence_rx.lock().take() {
             crate::presence::spawn(self.clone(), rx);
         }
     }
 
     pub fn doc_by_id(&self, id: &str) -> Option<Arc<LiveDoc>> {
-        if let Some(v) = self.vaults.lock().unwrap().get(id).cloned() {
+        if let Some(v) = self.vaults.lock().get(id).cloned() {
             return Some(v);
         }
-        self.shares.lock().unwrap().get(id).cloned()
+        self.shares.lock().get(id).cloned()
     }
 
     pub fn set_link_status(&self, mount_id: &str, status: &str) {
-        self.link_status.lock().unwrap().insert(mount_id.to_string(), status.to_string());
+        self.link_status.lock().insert(mount_id.to_string(), status.to_string());
     }
 
     pub fn link_status(&self, mount_id: &str) -> Option<String> {
-        self.link_status.lock().unwrap().get(mount_id).cloned()
+        self.link_status.lock().get(mount_id).cloned()
     }
 
     /// A blob just landed in `doc`'s store (fetched over a link): copy it to the stores of
@@ -274,11 +284,11 @@ impl DocRegistry {
     /// it the share and its bridge) if needed.
     pub fn share_doc_for_link(self: &Arc<Self>, share: &ShareInfo) -> anyhow::Result<Arc<LiveDoc>> {
         self.load_vault_by_id(&share.vault_id)?;
-        let existing = self.shares.lock().unwrap().get(&share.id).cloned();
+        let existing = self.shares.lock().get(&share.id).cloned();
         match existing {
             Some(d) => Ok(d),
             None => {
-                let _g = self.apply_lock.lock().unwrap();
+                let _g = self.apply_lock.lock();
                 self.load_share(share)
             }
         }
@@ -290,35 +300,35 @@ impl DocRegistry {
 
     /// Live document for `user`'s vault `name`, loading it and its bridges on first use.
     pub fn get_or_load(self: &Arc<Self>, user: &User, name: &str) -> anyhow::Result<Arc<LiveDoc>> {
-        let (info, store) = self.storage.open_vault_for_user(user, name)?;
-        let existing = self.vaults.lock().unwrap().get(&info.id).cloned();
+        let (info, store) = self.storage.open_vault_for_user(user, name, self.max_vaults_per_user)?;
+        let existing = self.vaults.lock().get(&info.id).cloned();
         if let Some(v) = existing {
             return Ok(v);
         }
-        let _g = self.apply_lock.lock().unwrap();
+        let _g = self.apply_lock.lock();
         // Re-check under the apply lock: another connection may have loaded it meanwhile.
-        let existing = self.vaults.lock().unwrap().get(&info.id).cloned();
+        let existing = self.vaults.lock().get(&info.id).cloned();
         if let Some(v) = existing {
             return Ok(v);
         }
         let doc = LiveDoc::load(info.id.clone(), format!("{}/{}", user.name, info.name), DocKind::Vault(info.clone()), store, Some(self.presence_tx.clone()))?;
-        self.vaults.lock().unwrap().insert(info.id.clone(), doc.clone());
+        self.vaults.lock().insert(info.id.clone(), doc.clone());
         self.attach_vault_bridges(&doc, &info);
         Ok(doc)
     }
 
     pub fn loaded_vault(&self, vault_id: &str) -> Option<Arc<LiveDoc>> {
-        self.vaults.lock().unwrap().get(vault_id).cloned()
+        self.vaults.lock().get(vault_id).cloned()
     }
 
     fn load_share(&self, info: &ShareInfo) -> anyhow::Result<Arc<LiveDoc>> {
-        let existing = self.shares.lock().unwrap().get(&info.id).cloned();
+        let existing = self.shares.lock().get(&info.id).cloned();
         if let Some(s) = existing {
             return Ok(s);
         }
         let store = self.storage.share_store(info)?;
         let doc = LiveDoc::load(info.id.clone(), format!("share:{}", info.name), DocKind::Share(info.clone()), store, Some(self.presence_tx.clone()))?;
-        self.shares.lock().unwrap().insert(info.id.clone(), doc.clone());
+        self.shares.lock().insert(info.id.clone(), doc.clone());
         Ok(doc)
     }
 
@@ -359,7 +369,7 @@ impl DocRegistry {
             truth: Side::Vault,
         });
         bridge.reconcile();
-        self.bridges.lock().unwrap().push(bridge.clone());
+        self.bridges.lock().push(bridge.clone());
         self.propagate(&bridge.share);
         Ok(())
     }
@@ -386,12 +396,12 @@ impl DocRegistry {
             truth: Side::Share,
         });
         bridge.reconcile();
-        self.bridges.lock().unwrap().push(bridge.clone());
+        self.bridges.lock().push(bridge.clone());
         self.propagate(&bridge.vault);
         if mount.home_node != self.node_id {
             if self.endpoint.is_some() {
                 let handle = crate::remote::spawn_link(self.clone(), mount.clone(), sdoc);
-                if let Some(old) = self.links.lock().unwrap().insert(mount.id.clone(), handle) {
+                if let Some(old) = self.links.lock().insert(mount.id.clone(), handle) {
                     old.abort();
                 }
             } else {
@@ -404,25 +414,25 @@ impl DocRegistry {
 
     /// Replica document for a remote mount, keyed by mount id in the share map.
     fn load_remote_replica(&self, mount: &MountInfo) -> anyhow::Result<Arc<LiveDoc>> {
-        let existing = self.shares.lock().unwrap().get(&mount.id).cloned();
+        let existing = self.shares.lock().get(&mount.id).cloned();
         if let Some(s) = existing {
             return Ok(s);
         }
         let store = self.storage.mount_store(mount)?;
         let doc = LiveDoc::load(mount.id.clone(), format!("remote:{}", mount.share_name), DocKind::Remote(mount.clone()), store, Some(self.presence_tx.clone()))?;
-        self.shares.lock().unwrap().insert(mount.id.clone(), doc.clone());
+        self.shares.lock().insert(mount.id.clone(), doc.clone());
         Ok(doc)
     }
 
     /// Called by the API after creating a share. Takes the apply lock itself.
     pub fn add_owner_bridge(&self, share: &ShareInfo) -> anyhow::Result<()> {
-        let _g = self.apply_lock.lock().unwrap();
+        let _g = self.apply_lock.lock();
         let vault = self.loaded_vault(&share.vault_id).ok_or_else(|| anyhow::anyhow!("vault not loaded"))?;
         self.attach_owner_bridge_locked(&vault, share)
     }
 
     pub fn add_mount_bridge(self: &Arc<Self>, mount: &MountInfo) -> anyhow::Result<()> {
-        let _g = self.apply_lock.lock().unwrap();
+        let _g = self.apply_lock.lock();
         let vault = self.loaded_vault(&mount.vault_id).ok_or_else(|| anyhow::anyhow!("vault not loaded"))?;
         self.attach_mount_bridge_locked(&vault, mount)
     }
@@ -442,16 +452,16 @@ impl DocRegistry {
         new_file: Option<&str>,
     ) -> anyhow::Result<()> {
         let vault = self.load_vault_by_id(vault_id)?;
-        let _g = self.apply_lock.lock().unwrap();
+        let _g = self.apply_lock.lock();
         // Detach only this bridge; the share document and any link task stay as they are.
-        self.bridges.lock().unwrap().retain(|b| !(b.share_id == share_id && b.mount_id.as_deref() == mount_id));
+        self.bridges.lock().retain(|b| !(b.share_id == share_id && b.mount_id.as_deref() == mount_id));
 
         let (old_root, new_root) = match (old_file, new_file) {
             (Some(of), Some(nf)) => (format!("{old_prefix}{of}"), format!("{new_prefix}{nf}")),
             _ => (old_prefix.to_string(), new_prefix.to_string()),
         };
         let moved = {
-            let aw = vault.awareness.lock().unwrap();
+            let aw = vault.awareness.lock();
             let doc = aw.doc().clone();
             let mut txn = doc.transact_mut_with(Origin::from(b"bridge:move".as_slice()));
             let texts = txn.get_or_insert_map("texts");
@@ -478,7 +488,7 @@ impl DocRegistry {
         };
         // The bridge is detached, so nothing from this transaction reaches the share. Drop the
         // recorded changes rather than letting the next propagate replay them anywhere.
-        vault.changes.lock().unwrap().clear();
+        vault.changes.lock().clear();
 
         let reg = self.storage.registry();
         if let Some(mid) = mount_id {
@@ -498,9 +508,9 @@ impl DocRegistry {
     }
 
     pub fn remove_bridges_for_share(&self, share_id: &str) {
-        let _g = self.apply_lock.lock().unwrap();
-        self.bridges.lock().unwrap().retain(|b| b.share_id != share_id);
-        self.shares.lock().unwrap().remove(share_id);
+        let _g = self.apply_lock.lock();
+        self.bridges.lock().retain(|b| b.share_id != share_id);
+        self.shares.lock().remove(share_id);
     }
 
     pub fn remove_bridges_for_mounts(&self, mount_ids: &[String]) {
@@ -514,21 +524,21 @@ impl DocRegistry {
     }
 
     fn remove_mounts_inner(&self, mount_ids: &[String], abort_links: bool) {
-        let _g = self.apply_lock.lock().unwrap();
-        let mut bridges = self.bridges.lock().unwrap();
+        let _g = self.apply_lock.lock();
+        let mut bridges = self.bridges.lock();
         let before = bridges.len();
         bridges.retain(|b| b.mount_id.as_ref().map(|m| !mount_ids.contains(m)).unwrap_or(true));
         tracing::info!("removed {} mount bridge(s) for {:?}", before - bridges.len(), mount_ids);
         drop(bridges);
-        let mut links = self.links.lock().unwrap();
+        let mut links = self.links.lock();
         for id in mount_ids {
             if let Some(h) = links.remove(id) {
                 if abort_links {
                     h.abort();
                 }
             }
-            self.shares.lock().unwrap().remove(id);
-            self.link_status.lock().unwrap().remove(id);
+            self.shares.lock().remove(id);
+            self.link_status.lock().remove(id);
         }
     }
 
@@ -564,7 +574,6 @@ impl DocRegistry {
     pub fn bridges_for(&self, doc_id: &str) -> Vec<Arc<Bridge>> {
         self.bridges
             .lock()
-            .unwrap()
             .iter()
             .filter(|b| b.vault.id == doc_id || b.share.id == doc_id)
             .cloned()
@@ -577,7 +586,7 @@ impl DocRegistry {
         let mut work: Vec<Arc<LiveDoc>> = vec![start.clone()];
         let mut rounds = 0;
         while let Some(doc) = work.pop() {
-            let changes: Vec<Change> = std::mem::take(&mut *doc.changes.lock().unwrap());
+            let changes: Vec<Change> = std::mem::take(&mut *doc.changes.lock());
             if changes.is_empty() {
                 continue;
             }
@@ -593,15 +602,15 @@ impl DocRegistry {
             }
         }
         // Drop anything recorded on docs without bridges so it does not pile up.
-        for d in self.vaults.lock().unwrap().values().chain(self.shares.lock().unwrap().values()) {
+        for d in self.vaults.lock().values().chain(self.shares.lock().values()) {
             if self.bridges_for(&d.id).is_empty() {
-                d.changes.lock().unwrap().clear();
+                d.changes.lock().clear();
             }
         }
     }
 
     pub fn loaded_count(&self) -> usize {
-        self.vaults.lock().unwrap().len()
+        self.vaults.lock().len()
     }
 
     pub fn maybe_compact(&self, doc: &LiveDoc) {
@@ -616,8 +625,8 @@ impl DocRegistry {
 
     pub fn snapshot_all(&self, keep: usize) {
         let docs: Vec<Arc<LiveDoc>> = {
-            let v = self.vaults.lock().unwrap();
-            let s = self.shares.lock().unwrap();
+            let v = self.vaults.lock();
+            let s = self.shares.lock();
             v.values().chain(s.values()).cloned().collect()
         };
         for d in docs {

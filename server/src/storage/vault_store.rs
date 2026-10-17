@@ -1,7 +1,8 @@
 //! One vault on disk: Yjs update log in SQLite, blobs as files, snapshots as files.
 
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+use parking_lot::Mutex;
 
 use anyhow::Context;
 use rusqlite::{params, Connection};
@@ -79,14 +80,14 @@ impl VaultStore {
     // -------------------------------------------------------------- update log
 
     pub fn load_updates(&self) -> anyhow::Result<Vec<Vec<u8>>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock();
         let mut stmt = conn.prepare("SELECT data FROM updates ORDER BY seq")?;
         let rows = stmt.query_map([], |r| r.get::<_, Vec<u8>>(0))?;
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
 
     pub fn append_update(&self, data: &[u8]) -> anyhow::Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock();
         conn.execute(
             "INSERT INTO updates (data, created_at) VALUES (?1, ?2)",
             params![data, chrono::Utc::now().to_rfc3339()],
@@ -95,7 +96,7 @@ impl VaultStore {
     }
 
     pub fn update_count(&self) -> anyhow::Result<i64> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock();
         Ok(conn.query_row("SELECT COUNT(*) FROM updates", [], |r| r.get(0))?)
     }
 
@@ -105,7 +106,7 @@ impl VaultStore {
 
     /// Replace the whole log with one full-state update.
     pub fn compact(&self, full_state: &[u8]) -> anyhow::Result<()> {
-        let mut conn = self.conn.lock().unwrap();
+        let mut conn = self.conn.lock();
         let tx = conn.transaction()?;
         tx.execute("DELETE FROM updates", [])?;
         tx.execute(
@@ -139,7 +140,7 @@ impl VaultStore {
 
     /// Consistent copy of doc.db for backups.
     pub fn backup_db_to(&self, dest: &Path) -> anyhow::Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock();
         let mut dst = Connection::open(dest)?;
         let backup = rusqlite::backup::Backup::new(&conn, &mut dst)?;
         backup.run_to_completion(256, std::time::Duration::from_millis(5), None)?;
@@ -148,16 +149,22 @@ impl VaultStore {
 
     // ------------------------------------------------------------------ blobs
 
-    fn blob_path(&self, hash: &str) -> PathBuf {
-        self.dir.join("blobs").join(&hash[..2]).join(hash)
+    /// Path for a blob, or `None` for anything that is not a well-formed hash. Hashes arrive
+    /// in document metadata written by other people, so this is the one place that decides.
+    fn blob_path(&self, hash: &str) -> Option<PathBuf> {
+        if !crate::ids::valid_hash(hash) {
+            return None;
+        }
+        let h = hash.to_ascii_lowercase();
+        Some(self.dir.join("blobs").join(&h[..2]).join(h))
     }
 
     pub fn has_blob(&self, hash: &str) -> bool {
-        self.blob_path(hash).exists()
+        self.blob_path(hash).map(|p| p.exists()).unwrap_or(false)
     }
 
     pub fn put_blob(&self, hash: &str, data: &[u8]) -> anyhow::Result<()> {
-        let path = self.blob_path(hash);
+        let path = self.blob_path(hash).ok_or_else(|| anyhow::anyhow!("invalid blob hash"))?;
         if path.exists() {
             return Ok(());
         }
@@ -170,7 +177,7 @@ impl VaultStore {
     }
 
     pub fn get_blob(&self, hash: &str) -> anyhow::Result<Option<Vec<u8>>> {
-        let path = self.blob_path(hash);
+        let Some(path) = self.blob_path(hash) else { return Ok(None) };
         match std::fs::read(&path) {
             Ok(d) => Ok(Some(d)),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
@@ -218,7 +225,9 @@ impl VaultStore {
         let mut removed = 0;
         for h in self.list_blob_hashes()? {
             if !referenced.contains(&h) {
-                std::fs::remove_file(self.blob_path(&h))?;
+                if let Some(p) = self.blob_path(&h) {
+                    std::fs::remove_file(p)?;
+                }
                 removed += 1;
             }
         }

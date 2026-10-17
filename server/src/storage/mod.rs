@@ -142,10 +142,30 @@ impl Storage {
         VaultStore::open(&dir, info)
     }
 
-    /// Resolve `user + vault name` to a store, creating the vault on first use.
-    pub fn open_vault_for_user(&self, user: &User, vault_name: &str) -> anyhow::Result<(VaultInfo, VaultStore)> {
-        let info = self.registry.get_or_create_vault(&user.id, vault_name)?;
+    /// Resolve `user + vault name` to a store, creating the vault on first use unless the user
+    /// already has `max_vaults` of them (0 = unlimited).
+    pub fn open_vault_for_user(&self, user: &User, vault_name: &str, max_vaults: usize) -> anyhow::Result<(VaultInfo, VaultStore)> {
+        let info = match self.registry.vault_by_name(&user.id, vault_name)? {
+            Some(v) => v,
+            None => {
+                if max_vaults > 0 && self.registry.vault_count(&user.id)? >= max_vaults {
+                    anyhow::bail!("vault limit reached ({max_vaults} per user)");
+                }
+                self.registry.get_or_create_vault(&user.id, vault_name)?
+            }
+        };
         let store = self.vault_store(&info)?;
         Ok((info, store))
+    }
+
+    /// Store for an existing vault only; `None` when the user has no vault by that name.
+    pub fn existing_vault_for_user(&self, user: &User, vault_name: &str) -> anyhow::Result<Option<(VaultInfo, VaultStore)>> {
+        match self.registry.vault_by_name(&user.id, vault_name)? {
+            Some(info) => {
+                let store = self.vault_store(&info)?;
+                Ok(Some((info, store)))
+            }
+            None => Ok(None),
+        }
     }
 }

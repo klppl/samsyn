@@ -53,12 +53,15 @@ fn guests_join_with_tickets_only() {
     let (code, body) = api_raw(&server, &secret, "POST", &format!("/guest/session/{share_id}"), None);
     assert_eq!(code, 200, "{body}");
     let session = serde_json::from_str::<serde_json::Value>(&body).unwrap()["session"].as_str().unwrap().to_string();
+    assert!(session.starts_with("gs_"), "session ids are prefixed so they cannot be mistaken for secrets");
     let (code, body) = api_raw(&server, "", "GET", &format!("/guest/shares/{share_id}?session={session}"), None);
     assert_eq!(code, 200, "session as query param: {body}");
     let (code, _) = api_raw(&server, &session, "GET", &format!("/guest/shares/{share_id}"), None);
     assert_eq!(code, 200, "session as bearer");
     let (code, _) = api_raw(&server, "", "GET", &format!("/guest/shares/nope?session={session}"), None);
     assert_eq!(code, 403, "session bound to its share");
+    let (code, _) = api_raw(&server, "", "GET", &format!("/guest/shares/{share_id}?session={session}"), None);
+    assert_eq!(code, 200, "a mismatch elsewhere must not destroy the session");
 
     // Per-device tokens: issue one, use it, revoke it.
     let t = api_json(&server, &owner, "POST", "/api/me/tokens", Some(json!({"label": "phone"})));

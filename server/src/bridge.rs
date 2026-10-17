@@ -19,7 +19,9 @@ pub enum OwnedDelta {
 
 #[derive(Debug, Clone)]
 pub enum ChangeKind {
-    TextDelta(Vec<OwnedDelta>),
+    /// Delta plus the full text after it, so a replay that does not fit (embeds, races) can
+    /// fall back to setting the whole text instead of panicking inside yrs.
+    TextDelta(Vec<OwnedDelta>, String),
     TextSet(String),
     BlobSet(Any),
     Delete,
@@ -130,7 +132,7 @@ impl Bridge {
     /// it first to a sibling folder outside the mount: `<mount> (read-only copy)/<rest>`.
     fn rescue_unshared(&self, share_keys: &[String]) {
         let missing: Vec<String> = {
-            let aw = self.share.awareness.lock().unwrap();
+            let aw = self.share.awareness.lock();
             let txn = aw.doc().transact();
             let texts = txn.get_map("texts");
             let blobs = txn.get_map("blobs");
@@ -150,7 +152,7 @@ impl Bridge {
         let rescue_root = format!("{} (read-only copy)/", self.vault_prefix.trim_end_matches('/'));
         let mut changes: Vec<(String, Change)> = Vec::new();
         {
-            let aw = self.vault.awareness.lock().unwrap();
+            let aw = self.vault.awareness.lock();
             let txn = aw.doc().transact();
             let texts = txn.get_map("texts");
             let blobs = txn.get_map("blobs");
@@ -205,7 +207,7 @@ impl Bridge {
         let truth_mapped: Vec<&String> = truth_keys.iter().map(|(_, m)| m).collect();
         let stale: Vec<String> = other_keys.into_iter().filter(|k| !truth_mapped.contains(&k)).collect();
         if !stale.is_empty() {
-            let aw = other.awareness.lock().unwrap();
+            let aw = other.awareness.lock();
             let doc = aw.doc().clone();
             let mut txn = doc.transact_mut_with(bridge_origin(&truth.id));
             let texts = txn.get_or_insert_map("texts");
@@ -230,7 +232,7 @@ impl Bridge {
         // Read everything from src first so we never hold two awareness locks at once.
         let mut items: Vec<(String, Option<String>, Option<Any>)> = Vec::new();
         {
-            let aw = src.awareness.lock().unwrap();
+            let aw = src.awareness.lock();
             let txn = aw.doc().transact();
             let texts = txn.get_map("texts");
             let blobs = txn.get_map("blobs");
@@ -271,26 +273,62 @@ impl Bridge {
 
 /// Apply mapped changes to `target` in one transaction with origin `bridge:<src>`.
 fn apply_changes(target: &Arc<LiveDoc>, src_id: &str, changes: &[(String, &Change)]) {
-    let aw = target.awareness.lock().unwrap();
+    let aw = target.awareness.lock();
     let doc = aw.doc().clone();
     let mut txn = doc.transact_mut_with(bridge_origin(src_id));
     let texts = txn.get_or_insert_map("texts");
     let blobs = txn.get_or_insert_map("blobs");
     for (key, change) in changes {
         match &change.kind {
-            ChangeKind::TextDelta(delta) => {
+            ChangeKind::TextDelta(delta, full) => {
                 let t = match texts.get(&txn, key) {
                     Some(Out::YText(t)) => t,
                     _ => texts.insert(&mut txn, key.as_str(), TextPrelim::new("")),
                 };
+                // Check every position against the live length first; yrs panics on an
+                // out-of-range remove/insert and that would happen under the apply lock.
                 let mut pos: u32 = 0;
-                for d in delta {
-                    match d {
-                        OwnedDelta::Retain(n) => pos += n,
-                        OwnedDelta::Delete(n) => t.remove_range(&mut txn, pos, *n),
-                        OwnedDelta::Insert(s) => {
-                            t.insert(&mut txn, pos, s);
-                            pos += s.len() as u32;
+                let mut len = t.len(&txn);
+                let fits = delta.iter().all(|d| match d {
+                    OwnedDelta::Retain(n) => {
+                        pos += n;
+                        pos <= len
+                    }
+                    OwnedDelta::Delete(n) => {
+                        if pos + n > len {
+                            return false;
+                        }
+                        len -= n;
+                        true
+                    }
+                    OwnedDelta::Insert(s) => {
+                        let n = s.encode_utf16().count() as u32;
+                        pos += n;
+                        len += n;
+                        true
+                    }
+                });
+                if fits {
+                    let mut pos: u32 = 0;
+                    for d in delta {
+                        match d {
+                            OwnedDelta::Retain(n) => pos += n,
+                            OwnedDelta::Delete(n) => t.remove_range(&mut txn, pos, *n),
+                            OwnedDelta::Insert(s) => {
+                                t.insert(&mut txn, pos, s);
+                                pos += s.encode_utf16().count() as u32;
+                            }
+                        }
+                    }
+                } else {
+                    tracing::warn!("delta for {key} does not fit the target text; setting the whole text instead");
+                    let cur = t.get_string(&txn);
+                    if let Some(d) = diff_text(&cur, full) {
+                        if d.remove > 0 {
+                            t.remove_range(&mut txn, d.index as u32, d.remove as u32);
+                        }
+                        if !d.insert.is_empty() {
+                            t.insert(&mut txn, d.index as u32, &d.insert);
                         }
                     }
                 }

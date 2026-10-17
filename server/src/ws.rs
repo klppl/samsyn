@@ -29,6 +29,11 @@ use crate::SharedState;
 /// bounds vault size over WebSocket; it also bounds what one client can make us allocate.
 pub const MAX_WS_MESSAGE: usize = 256 * 1024 * 1024;
 
+/// Client ids one socket may introduce into a document's awareness.
+pub const MAX_AWARENESS_CLIENTS: usize = 64;
+/// Read-only guests send awareness only; their inbound messages are capped much lower.
+pub const MAX_WS_MESSAGE_READONLY: usize = 4 * 1024 * 1024;
+
 /// Shared auth for ws + blob routes.
 pub fn authenticate(state: &SharedState, headers: &HeaderMap, query: &HashMap<String, String>) -> Result<User, Response> {
     let token = extract_token(headers, query.get("token").map(String::as_str));
@@ -73,24 +78,38 @@ pub async fn ws_handler(
     };
     let vault = match state.docs.get_or_load(&user, &vault_name) {
         Ok(v) => v,
+        Err(e) if e.to_string().contains("vault limit") => {
+            return (StatusCode::CONFLICT, e.to_string()).into_response();
+        }
         Err(e) => {
             tracing::error!(vault = %vault_name, user = %user.name, "failed to load vault: {e}");
             return (StatusCode::INTERNAL_SERVER_ERROR, "failed to load vault").into_response();
         }
     };
     let _ = user;
-    ws.max_message_size(MAX_WS_MESSAGE).max_frame_size(MAX_WS_MESSAGE).on_upgrade(move |socket| handle_socket(socket, state, vault, true, None))
+    let token = extract_token(&headers, query.get("token").map(String::as_str)).unwrap_or_default();
+    ws.max_message_size(MAX_WS_MESSAGE)
+        .max_frame_size(MAX_WS_MESSAGE)
+        .on_upgrade(move |socket| handle_socket(socket, state, vault, true, Some(SessionCheck::User(token))))
+}
+
+/// What keeps a socket alive; re-checked every 30 s so a revoked token or ticket ends the
+/// session instead of living on until the next reconnect.
+pub enum SessionCheck {
+    /// A user token (`rp_…`).
+    User(String),
+    /// A ticket: (share id, secret).
+    Guest(String, String),
 }
 
 /// Pump y-sync between one WebSocket and a live document. `writable == false` drops the
-/// client's document updates (read-only guests); `revoke` = (share id, secret) re-checked every
-/// 30 s so a revoked ticket or deleted share ends the session.
+/// client's document updates (read-only guests).
 pub async fn handle_socket(
     socket: WebSocket,
     state: SharedState,
     vault: std::sync::Arc<crate::vault::LiveDoc>,
     writable: bool,
-    revoke: Option<(String, String)>,
+    check: Option<SessionCheck>,
 ) {
     let (mut sink, mut stream) = socket.split();
     let mut rx = vault.tx.subscribe();
@@ -100,7 +119,7 @@ pub async fn handle_socket(
     revoke_tick.tick().await;
 
     let hello = {
-        let aw = vault.awareness.lock().unwrap();
+        let aw = vault.awareness.lock();
         let mut enc = EncoderV1::new();
         match protocol.start(&aw, &mut enc) {
             Ok(()) => Bytes::from(enc.to_vec()),
@@ -124,9 +143,9 @@ pub async fn handle_socket(
                     Some(Ok(WsMessage::Binary(data))) => {
                         let replies = {
                             // Serialize all CRDT applies server-wide; see DocRegistry.
-                            let _apply = state.docs.apply_lock.lock().unwrap();
+                            let _apply = state.docs.apply_lock.lock();
                             let r = {
-                                let mut aw = vault.awareness.lock().unwrap();
+                                let mut aw = vault.awareness.lock();
                                 handle_payload(&protocol, &mut aw, &data, &mut owned_clients, writable)
                             };
                             state.docs.propagate(&vault);
@@ -153,12 +172,15 @@ pub async fn handle_socket(
                 }
             }
             _ = revoke_tick.tick() => {
-                if let Some((share_id, secret)) = &revoke {
-                    let ok = state.storage.registry().check_grant(share_id, secret).ok().flatten().is_some();
-                    if !ok {
-                        tracing::info!(doc = %label, "ticket revoked or share gone; closing guest socket");
-                        break;
-                    }
+                let reg = state.storage.registry();
+                let ok = match &check {
+                    Some(SessionCheck::User(token)) => reg.authenticate(token).ok().flatten().is_some(),
+                    Some(SessionCheck::Guest(share_id, secret)) => reg.check_grant(share_id, secret).ok().flatten().is_some(),
+                    None => true,
+                };
+                if !ok {
+                    tracing::info!(doc = %label, "credential revoked; closing socket");
+                    break;
                 }
             }
             broadcast = rx.recv() => {
@@ -169,7 +191,7 @@ pub async fn handle_socket(
                     Err(RecvError::Lagged(n)) => {
                         tracing::warn!(vault = %label, "client lagged {n} messages, resyncing");
                         let resync = {
-                            let aw = vault.awareness.lock().unwrap();
+                            let aw = vault.awareness.lock();
                             let mut enc = EncoderV1::new();
                             let _ = protocol.start(&aw, &mut enc);
                             Bytes::from(enc.to_vec())
@@ -183,7 +205,7 @@ pub async fn handle_socket(
     }
 
     if !owned_clients.is_empty() {
-        let mut aw = vault.awareness.lock().unwrap();
+        let mut aw = vault.awareness.lock();
         for id in owned_clients {
             aw.remove_state(id);
         }
@@ -210,6 +232,12 @@ pub(crate) fn handle_payload(
             continue;
         }
         if let Message::Awareness(update) = &msg {
+            // One connection speaks for a handful of clients at most; a message carrying
+            // thousands of ids is an attempt to bloat everyone's awareness state.
+            if owned.len() + update.clients.len() > MAX_AWARENESS_CLIENTS {
+                tracing::warn!("awareness update with {} clients ignored", update.clients.len());
+                continue;
+            }
             owned.extend(update.clients.keys().copied());
         }
         if let Some(reply) = protocol.handle_message(aw, msg)? {

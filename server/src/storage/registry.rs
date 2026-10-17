@@ -1,7 +1,8 @@
 //! Users, tokens and the vault index. One small SQLite file.
 
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+use parking_lot::Mutex;
 
 use anyhow::Context;
 use rusqlite::{params, Connection, OptionalExtension};
@@ -154,7 +155,7 @@ impl Registry {
     pub fn create_user(&self, name: &str) -> anyhow::Result<User> {
         anyhow::ensure!(valid_name(name), "invalid user name (use letters, digits, - _ .)");
         let user = User { id: new_id(), name: name.to_string(), created_at: Self::now() };
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock();
         conn.execute(
             "INSERT INTO users (id, name, created_at) VALUES (?1, ?2, ?3)",
             params![user.id, user.name, user.created_at],
@@ -164,7 +165,7 @@ impl Registry {
     }
 
     pub fn user_by_name(&self, name: &str) -> anyhow::Result<Option<User>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock();
         Ok(conn
             .query_row(
                 "SELECT id, name, created_at FROM users WHERE name = ?1",
@@ -175,7 +176,7 @@ impl Registry {
     }
 
     pub fn user_by_id(&self, id: &str) -> anyhow::Result<Option<User>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock();
         Ok(conn
             .query_row(
                 "SELECT id, name, created_at FROM users WHERE id = ?1",
@@ -186,19 +187,19 @@ impl Registry {
     }
 
     pub fn list_users(&self) -> anyhow::Result<Vec<User>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock();
         let mut stmt = conn.prepare("SELECT id, name, created_at FROM users ORDER BY name")?;
         let rows = stmt.query_map([], |r| Ok(User { id: r.get(0)?, name: r.get(1)?, created_at: r.get(2)? }))?;
         Ok(rows.collect::<Result<_, _>>()?)
     }
 
     pub fn user_count(&self) -> anyhow::Result<i64> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock();
         Ok(conn.query_row("SELECT COUNT(*) FROM users", [], |r| r.get(0))?)
     }
 
     pub fn delete_user(&self, id: &str) -> anyhow::Result<bool> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock();
         Ok(conn.execute("DELETE FROM users WHERE id = ?1", params![id])? > 0)
     }
 
@@ -207,7 +208,7 @@ impl Registry {
     /// Issue a new token for a user. The plaintext is returned once and never stored.
     pub fn create_token(&self, user_id: &str, label: &str) -> anyhow::Result<String> {
         let token = new_token();
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock();
         conn.execute(
             "INSERT INTO tokens (hash, user_id, label, created_at) VALUES (?1, ?2, ?3, ?4)",
             params![token_hash(&token), user_id, label, Self::now()],
@@ -218,7 +219,7 @@ impl Registry {
     /// Resolve a presented token to its user, updating `last_used_at`.
     pub fn authenticate(&self, token: &str) -> anyhow::Result<Option<User>> {
         let hash = token_hash(token);
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock();
         let user = conn
             .query_row(
                 "SELECT u.id, u.name, u.created_at FROM tokens t JOIN users u ON u.id = t.user_id WHERE t.hash = ?1",
@@ -236,7 +237,7 @@ impl Registry {
     }
 
     pub fn list_tokens(&self, user_id: &str) -> anyhow::Result<Vec<TokenInfo>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock();
         let mut stmt =
             conn.prepare("SELECT label, created_at, last_used_at FROM tokens WHERE user_id = ?1 ORDER BY created_at")?;
         let rows = stmt.query_map(params![user_id], |r| {
@@ -246,7 +247,7 @@ impl Registry {
     }
 
     pub fn revoke_tokens(&self, user_id: &str, label: Option<&str>) -> anyhow::Result<usize> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock();
         Ok(match label {
             Some(l) => conn.execute("DELETE FROM tokens WHERE user_id = ?1 AND label = ?2", params![user_id, l])?,
             None => conn.execute("DELETE FROM tokens WHERE user_id = ?1", params![user_id])?,
@@ -257,7 +258,7 @@ impl Registry {
 
     pub fn get_or_create_vault(&self, user_id: &str, name: &str) -> anyhow::Result<VaultInfo> {
         anyhow::ensure!(valid_name(name), "invalid vault name");
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock();
         if let Some(v) = conn
             .query_row(
                 "SELECT id, user_id, name, created_at FROM vaults WHERE user_id = ?1 AND name = ?2",
@@ -276,15 +277,28 @@ impl Registry {
         Ok(v)
     }
 
+    /// Look a vault up without creating it.
+    pub fn vault_by_name(&self, user_id: &str, name: &str) -> anyhow::Result<Option<VaultInfo>> {
+        let conn = self.conn.lock();
+        Ok(conn
+            .query_row("SELECT id, user_id, name, created_at FROM vaults WHERE user_id = ?1 AND name = ?2", params![user_id, name], row_to_vault)
+            .optional()?)
+    }
+
+    pub fn vault_count(&self, user_id: &str) -> anyhow::Result<usize> {
+        let conn = self.conn.lock();
+        Ok(conn.query_row("SELECT count(*) FROM vaults WHERE user_id = ?1", params![user_id], |r| r.get::<_, i64>(0))? as usize)
+    }
+
     pub fn vault_by_id(&self, id: &str) -> anyhow::Result<Option<VaultInfo>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock();
         Ok(conn
             .query_row("SELECT id, user_id, name, created_at FROM vaults WHERE id = ?1", params![id], row_to_vault)
             .optional()?)
     }
 
     pub fn list_vaults(&self, user_id: Option<&str>) -> anyhow::Result<Vec<VaultInfo>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock();
         let mut out = Vec::new();
         match user_id {
             Some(u) => {
@@ -305,13 +319,13 @@ impl Registry {
     }
 
     pub fn delete_vault(&self, id: &str) -> anyhow::Result<bool> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock();
         Ok(conn.execute("DELETE FROM vaults WHERE id = ?1", params![id])? > 0)
     }
 
     /// Re-insert a vault row (used by restore when the registry lacks a vault found on disk).
     pub fn upsert_vault(&self, v: &VaultInfo) -> anyhow::Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock();
         conn.execute(
             "INSERT OR IGNORE INTO vaults (id, user_id, name, created_at) VALUES (?1, ?2, ?3, ?4)",
             params![v.id, v.user_id, v.name, v.created_at],
@@ -320,7 +334,7 @@ impl Registry {
     }
 
     pub fn upsert_user(&self, u: &User) -> anyhow::Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock();
         conn.execute(
             "INSERT OR IGNORE INTO users (id, name, created_at) VALUES (?1, ?2, ?3)",
             params![u.id, u.name, u.created_at],
@@ -330,7 +344,7 @@ impl Registry {
 
     /// Consistent copy of the registry for backups (SQLite online backup API).
     pub fn backup_to(&self, dest: &Path) -> anyhow::Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock();
         let mut dst = Connection::open(dest)?;
         let backup = rusqlite::backup::Backup::new(&conn, &mut dst)?;
         backup.run_to_completion(256, std::time::Duration::from_millis(5), None)?;
@@ -351,7 +365,7 @@ impl Registry {
             only_file: only_file.map(|s| s.to_string()),
             created_at: Self::now(),
         };
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock();
         conn.execute(
             "INSERT INTO shares (id, user_id, vault_id, name, prefix, only_file, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             params![s.id, s.user_id, s.vault_id, s.name, s.prefix, s.only_file, s.created_at],
@@ -360,14 +374,14 @@ impl Registry {
     }
 
     pub fn share_by_id(&self, id: &str) -> anyhow::Result<Option<ShareInfo>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock();
         Ok(conn
             .query_row("SELECT id, user_id, vault_id, name, prefix, only_file, created_at FROM shares WHERE id = ?1", params![id], row_to_share)
             .optional()?)
     }
 
     pub fn shares_for_vault(&self, vault_id: &str) -> anyhow::Result<Vec<ShareInfo>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock();
         let mut stmt = conn.prepare("SELECT id, user_id, vault_id, name, prefix, only_file, created_at FROM shares WHERE vault_id = ?1 ORDER BY prefix")?;
         let rows = stmt.query_map(params![vault_id], row_to_share)?;
         Ok(rows.collect::<Result<_, _>>()?)
@@ -375,12 +389,12 @@ impl Registry {
 
     /// Move a share to another folder or note in the same vault (the share itself is unchanged).
     pub fn update_share_path(&self, id: &str, prefix: &str, only_file: Option<&str>) -> anyhow::Result<bool> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock();
         Ok(conn.execute("UPDATE shares SET prefix = ?1, only_file = ?2 WHERE id = ?3", params![prefix, only_file, id])? > 0)
     }
 
     pub fn delete_share(&self, id: &str) -> anyhow::Result<bool> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock();
         Ok(conn.execute("DELETE FROM shares WHERE id = ?1", params![id])? > 0)
     }
 
@@ -390,7 +404,7 @@ impl Registry {
             rand::RngCore::fill_bytes(&mut rand::rng(), &mut b);
             b
         });
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock();
         conn.execute(
             "INSERT INTO share_grants (share_id, secret_hash, label, access, created_at) VALUES (?1, ?2, ?3, ?4, ?5)",
             params![share_id, token_hash(&secret), label, access, Self::now()],
@@ -400,7 +414,7 @@ impl Registry {
     }
 
     pub fn grants_for_share(&self, share_id: &str) -> anyhow::Result<Vec<GrantInfo>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock();
         let mut stmt = conn.prepare("SELECT label, access, created_at, revoked_at, last_seen_at FROM share_grants WHERE share_id = ?1 ORDER BY created_at")?;
         let rows = stmt.query_map(params![share_id], |r| {
             Ok(GrantInfo { label: r.get(0)?, access: r.get(1)?, created_at: r.get(2)?, revoked_at: r.get(3)?, last_seen_at: r.get(4)? })
@@ -410,7 +424,7 @@ impl Registry {
 
     /// Validate a presented share secret. Returns the grant's access level if valid and not revoked.
     pub fn check_grant(&self, share_id: &str, secret: &str) -> anyhow::Result<Option<(String, String)>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock();
         Ok(conn
             .query_row(
                 "SELECT label, access FROM share_grants WHERE share_id = ?1 AND secret_hash = ?2 AND revoked_at IS NULL",
@@ -422,7 +436,7 @@ impl Registry {
 
     /// Record that a guest just authenticated with this secret.
     pub fn touch_grant(&self, share_id: &str, secret: &str) -> anyhow::Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock();
         conn.execute(
             "UPDATE share_grants SET last_seen_at = ?1 WHERE share_id = ?2 AND secret_hash = ?3",
             params![Self::now(), share_id, token_hash(secret)],
@@ -431,7 +445,7 @@ impl Registry {
     }
 
     pub fn grant_secret_hash(&self, share_id: &str, label: &str) -> anyhow::Result<Option<String>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock();
         Ok(conn
             .query_row("SELECT secret_hash FROM share_grants WHERE share_id = ?1 AND label = ?2", params![share_id, label], |r| r.get(0))
             .optional()?)
@@ -439,7 +453,7 @@ impl Registry {
 
     /// Make a revoked ticket valid again. Returns its secret hash so mounts can be restored too.
     pub fn restore_grant(&self, share_id: &str, label: &str) -> anyhow::Result<Option<String>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock();
         let hash: Option<String> = conn
             .query_row(
                 "SELECT secret_hash FROM share_grants WHERE share_id = ?1 AND label = ?2 AND revoked_at IS NOT NULL",
@@ -455,7 +469,7 @@ impl Registry {
 
     /// Un-revoke the local mounts made with a secret. Returns their ids so bridges can be re-attached.
     pub fn restore_mounts_with_secret(&self, share_id: &str, secret_hash: &str) -> anyhow::Result<Vec<String>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock();
         let mut stmt = conn.prepare("SELECT id, secret FROM mounts WHERE share_id = ?1 AND revoked_at IS NOT NULL")?;
         let ids: Vec<String> = stmt
             .query_map(params![share_id], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
@@ -471,7 +485,7 @@ impl Registry {
 
     /// Remove a revoked ticket for good (it was dead already; this only tidies the list).
     pub fn delete_revoked_grant(&self, share_id: &str, label: &str) -> anyhow::Result<bool> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock();
         let n = conn.execute(
             "DELETE FROM share_grants WHERE share_id = ?1 AND label = ?2 AND revoked_at IS NOT NULL",
             params![share_id, label],
@@ -480,7 +494,7 @@ impl Registry {
     }
 
     pub fn revoke_grant(&self, share_id: &str, label: &str) -> anyhow::Result<bool> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock();
         let n = conn.execute(
             "UPDATE share_grants SET revoked_at = ?1 WHERE share_id = ?2 AND label = ?3 AND revoked_at IS NULL",
             params![Self::now(), share_id, label],
@@ -519,7 +533,7 @@ impl Registry {
             created_at: Self::now(),
             revoked_at: None,
         };
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock();
         conn.execute(
             "INSERT INTO mounts (id, user_id, vault_id, share_id, share_name, mount_prefix, access, home_node, home_addrs, only_file, secret, created_at)              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
             params![m.id, m.user_id, m.vault_id, m.share_id, m.share_name, m.mount_prefix, m.access, m.home_node, m.home_addrs.join(" "), m.only_file, m.secret, m.created_at],
@@ -529,55 +543,55 @@ impl Registry {
 
     /// Mark one mount revoked (used when the owner server denies our secret).
     pub fn revoke_mount(&self, id: &str) -> anyhow::Result<bool> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock();
         Ok(conn.execute("UPDATE mounts SET revoked_at = ?1 WHERE id = ?2 AND revoked_at IS NULL", params![Self::now(), id])? > 0)
     }
 
     pub fn all_mounts(&self) -> anyhow::Result<Vec<MountInfo>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock();
         let mut stmt = conn.prepare(&format!("{MOUNT_COLS} ORDER BY created_at"))?;
         let rows = stmt.query_map([], row_to_mount)?;
         Ok(rows.collect::<Result<_, _>>()?)
     }
 
     pub fn all_shares(&self) -> anyhow::Result<Vec<ShareInfo>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock();
         let mut stmt = conn.prepare(&format!("{SHARE_COLS} ORDER BY created_at"))?;
         let rows = stmt.query_map([], row_to_share)?;
         Ok(rows.collect::<Result<_, _>>()?)
     }
 
     pub fn mount_by_id(&self, id: &str) -> anyhow::Result<Option<MountInfo>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock();
         Ok(conn.query_row(&format!("{MOUNT_COLS} WHERE id = ?1"), params![id], row_to_mount).optional()?)
     }
 
     pub fn mounts_for_vault(&self, vault_id: &str) -> anyhow::Result<Vec<MountInfo>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock();
         let mut stmt = conn.prepare(&format!("{MOUNT_COLS} WHERE vault_id = ?1 ORDER BY mount_prefix"))?;
         let rows = stmt.query_map(params![vault_id], row_to_mount)?;
         Ok(rows.collect::<Result<_, _>>()?)
     }
 
     pub fn mounts_for_share(&self, share_id: &str) -> anyhow::Result<Vec<MountInfo>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock();
         let mut stmt = conn.prepare(&format!("{MOUNT_COLS} WHERE share_id = ?1"))?;
         let rows = stmt.query_map(params![share_id], row_to_mount)?;
         Ok(rows.collect::<Result<_, _>>()?)
     }
 
     pub fn update_mount_prefix(&self, id: &str, prefix: &str) -> anyhow::Result<bool> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock();
         Ok(conn.execute("UPDATE mounts SET mount_prefix = ?1 WHERE id = ?2", params![prefix, id])? > 0)
     }
 
     pub fn delete_mount(&self, id: &str) -> anyhow::Result<bool> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock();
         Ok(conn.execute("DELETE FROM mounts WHERE id = ?1", params![id])? > 0)
     }
 
     pub fn revoke_mounts_with_secret(&self, share_id: &str, secret_hash: &str) -> anyhow::Result<Vec<String>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock();
         let mut stmt = conn.prepare("SELECT id, secret FROM mounts WHERE share_id = ?1 AND revoked_at IS NULL")?;
         let ids: Vec<String> = stmt
             .query_map(params![share_id], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
@@ -733,14 +747,14 @@ mod migration_tests {
     }
 
     fn user_version(reg: &Registry) -> u32 {
-        reg.conn.lock().unwrap().query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap()
+        reg.conn.lock().query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap()
     }
 
     #[test]
     fn fresh_db_is_current() {
         let (_d, reg) = open_with("");
         assert_eq!(user_version(&reg), REGISTRY_SCHEMA_VERSION);
-        assert!(has_column(&reg.conn.lock().unwrap(), "mounts", "home_addrs").unwrap());
+        assert!(has_column(&reg.conn.lock(), "mounts", "home_addrs").unwrap());
     }
 
     #[test]
@@ -751,7 +765,7 @@ mod migration_tests {
              CREATE TABLE mounts (id TEXT PRIMARY KEY, vault_id TEXT NOT NULL, mount_path TEXT NOT NULL, share_id TEXT NOT NULL, remote_server TEXT, created_at TEXT NOT NULL);",
         );
         assert_eq!(user_version(&reg), REGISTRY_SCHEMA_VERSION);
-        let c = reg.conn.lock().unwrap();
+        let c = reg.conn.lock();
         assert!(has_column(&c, "mounts", "user_id").unwrap());
         assert!(has_column(&c, "mounts", "only_file").unwrap());
         drop(c);

@@ -49,23 +49,32 @@ impl GuestSessions {
         if self.map.len() > 50_000 {
             self.map.retain(|_, s| s.expires > Instant::now());
         }
-        let id = hex::encode({
+        if self.map.len() >= 50_000 {
+            // Still full after pruning: drop the oldest half rather than grow without bound.
+            let mut v: Vec<(String, Instant)> = self.map.iter().map(|(k, s)| (k.clone(), s.expires)).collect();
+            v.sort_by_key(|(_, e)| *e);
+            for (k, _) in v.into_iter().take(self.map.len() / 2) {
+                self.map.remove(&k);
+            }
+        }
+        let id = format!("gs_{}", hex::encode({
             let mut b = [0u8; 32];
             rand::RngCore::fill_bytes(&mut rand::rng(), &mut b);
             b
-        });
+        }));
         self.map.insert(id.clone(), GuestSession { share_id: share_id.into(), secret: secret.into(), expires: Instant::now() + SESSION_TTL });
         id
     }
     /// The secret behind a session id, if it is valid for this share.
     fn secret_for(&mut self, id: &str, share_id: &str) -> Option<String> {
         match self.map.get(id) {
-            Some(s) if s.expires > Instant::now() && s.share_id == share_id => Some(s.secret.clone()),
-            Some(_) => {
+            Some(s) if s.expires <= Instant::now() => {
                 self.map.remove(id);
                 None
             }
-            None => None,
+            // A session for another share is simply not valid here; it stays usable there.
+            Some(s) if s.share_id == share_id => Some(s.secret.clone()),
+            _ => None,
         }
     }
 }
@@ -90,6 +99,9 @@ impl GuestLimiter {
     fn record_failure(&mut self, ip: IpAddr) {
         if self.fails.len() > 10_000 {
             self.fails.retain(|_, (_, since)| since.elapsed() < FAILURE_WINDOW);
+            if self.fails.len() > 10_000 {
+                self.fails.clear(); // flooded from many addresses: start over rather than grow
+            }
         }
         let e = self.fails.entry(ip).or_insert((0, Instant::now()));
         if e.1.elapsed() >= FAILURE_WINDOW {
@@ -128,17 +140,17 @@ pub struct Guest {
 /// Validate `(share_id, secret)`; the secret comes as `?secret=` or `Authorization: Bearer`.
 fn authenticate(state: &SharedState, share_id: &str, headers: &HeaderMap, query: &HashMap<String, String>, peer: SocketAddr) -> Result<Guest, Response> {
     let ip = client_ip(state, headers, peer);
-    if state.guest_limiter.lock().unwrap().blocked(ip) {
+    if state.guest_limiter.lock().blocked(ip) {
         return Err((StatusCode::TOO_MANY_REQUESTS, "too many failed attempts; try again later").into_response());
     }
     let presented = extract_token(headers, query.get("secret").or_else(|| query.get("session")).map(String::as_str)).unwrap_or_default();
     // A session id stands in for the secret it was created with.
-    let secret = state
-        .guest_sessions
-        .lock()
-        .unwrap()
-        .secret_for(&presented, share_id)
-        .unwrap_or(presented);
+    // Session ids are prefixed so they can never be mistaken for (or collide with) a secret.
+    let secret = if presented.starts_with("gs_") {
+        state.guest_sessions.lock().secret_for(&presented, share_id).unwrap_or_default()
+    } else {
+        presented
+    };
     let reg = state.storage.registry();
     let found = match reg.share_by_id(share_id) {
         Ok(Some(s)) if secret.len() == 64 => match reg.check_grant(&s.id, &secret) {
@@ -153,7 +165,7 @@ fn authenticate(state: &SharedState, share_id: &str, headers: &HeaderMap, query:
             Ok(g)
         }
         None => {
-            state.guest_limiter.lock().unwrap().record_failure(ip);
+            state.guest_limiter.lock().record_failure(ip);
             tracing::warn!(share = %share_id, %ip, "guest auth failed");
             Err(denied())
         }
@@ -182,7 +194,7 @@ pub async fn session(
         Ok(g) => g,
         Err(r) => return r,
     };
-    let id = state.guest_sessions.lock().unwrap().create(&g.share.id, &g.secret);
+    let id = state.guest_sessions.lock().create(&g.share.id, &g.secret);
     Json(serde_json::json!({
         "session": id,
         "expires_in": SESSION_TTL.as_secs(),
@@ -239,10 +251,11 @@ pub async fn ws(
     };
     tracing::info!(share = %g.share.name, label = %g.label, access = %g.access, "guest connected");
     let writable = g.access == "rw";
-    let revoke = Some((g.share.id.clone(), g.secret.clone()));
-    ws.max_message_size(crate::ws::MAX_WS_MESSAGE)
-        .max_frame_size(crate::ws::MAX_WS_MESSAGE)
-        .on_upgrade(move |socket| crate::ws::handle_socket(socket, state, doc, writable, revoke))
+    let check = Some(crate::ws::SessionCheck::Guest(g.share.id.clone(), g.secret.clone()));
+    let cap = if writable { crate::ws::MAX_WS_MESSAGE } else { crate::ws::MAX_WS_MESSAGE_READONLY };
+    ws.max_message_size(cap)
+        .max_frame_size(cap)
+        .on_upgrade(move |socket| crate::ws::handle_socket(socket, state, doc, writable, check))
 }
 
 // ------------------------------------------------------------------ blobs
@@ -306,6 +319,8 @@ pub async fn put_blob(
         Err(r) => return r,
     };
     let quota = state.serve.max_share_mb * 1024 * 1024;
+    // Check and write under one lock, otherwise parallel uploads all pass the check.
+    let _quota = doc.quota_lock.lock();
     if quota > 0 && !doc.store.has_blob(&actual) {
         let used = doc.store.blob_bytes().unwrap_or(0);
         if used + body.len() as u64 > quota {

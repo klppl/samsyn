@@ -36,6 +36,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 yrs = { version = "0.28", features = ["sync"] }
 iroh = "1.3"
+parking_lot = "0.12"
 
 [profile.release]
 lto = true
