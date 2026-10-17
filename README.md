@@ -39,6 +39,22 @@ it live (even across two separate servers, over an encrypted peer-to-peer link),
 and the whole server is **one binary** with no database, cloud account or runtime
 to deploy. iOS and Android are both first-class.
 
+### Beyond basic sync
+
+- **Share any subfolder**, not the whole vault, with live editing on both sides.
+- **Read-only shares**: grant read-only access, and the other side's local edits
+  are put back (kept as a conflict copy) instead of leaking upstream.
+- **Guest sharing, no account**: a friend joins a share with only a ticket, no
+  user on your server, and nothing outside that one folder is ever exposed.
+- **Cross-server sharing**: two independent servers sync a shared folder over an
+  encrypted [iroh](https://iroh.computer) peer-to-peer link, no open ports.
+- **Per-person, revocable tickets**: issue one ticket per person; revoke it and
+  it dies within 30 seconds for every connection.
+- **Plugin settings sync**: pick which community plugins and settings sync
+  between your own devices, per device (e.g. Iconize's icons and colours).
+- **Mobile-safe by default**: on-device cache in IndexedDB, and a mass-delete
+  guard that holds back accidental bulk deletions.
+
 ## Quick start
 
 **1. Run the server.**
