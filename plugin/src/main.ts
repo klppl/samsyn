@@ -184,11 +184,14 @@ export default class SamsynPlugin extends Plugin {
     this.roots = roots;
   }
 
+  /** The innermost shared root containing `path` (shares may nest; a whole-vault share is ""). */
   private rootOf(path: string): SharedRoot | null {
+    let best: SharedRoot | null = null;
     for (const r of this.roots) {
-      if (path === r.path || (!r.isFile && path.startsWith(r.path + "/"))) return r;
+      const inside = path === r.path || (!r.isFile && (r.path === "" || path.startsWith(r.path + "/")));
+      if (inside && (!best || r.path.length > best.path.length)) best = r;
     }
-    return null;
+    return best;
   }
 
   /** Renames the engines must not replay: blocked moves, our reverts, explicit mount moves. */

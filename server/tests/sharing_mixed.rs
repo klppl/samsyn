@@ -49,9 +49,10 @@ fn whole_vault_read_only_with_writable_paths() {
     assert_eq!(inspect["access"], "ro", "{inspect}");
     assert_eq!(inspect["rw_paths"], json!(["Inbox/", "root.md"]), "{inspect}");
 
-    // Nothing else can be shared in a vault that is shared whole, and the root cannot move.
-    let (code, _) = api_raw(&server, &owner, "POST", "/api/vaults/va/shares", Some(json!({"path": "Notes"})));
-    assert_eq!(code, 409);
+    // The same path twice is refused; the root cannot move.
+    let (code, body) = api_raw(&server, &owner, "POST", "/api/vaults/va/shares", Some(json!({"path": ""})));
+    assert_eq!(code, 409, "{body}");
+    assert!(body.contains("already shared"), "{body}");
     let (code, _) = api_raw(&server, &owner, "PATCH", &format!("/api/shares/{share_id}"), Some(json!({"path": "Elsewhere"})));
     assert_eq!(code, 400);
 
@@ -103,15 +104,48 @@ fn whole_vault_read_only_with_writable_paths() {
     assert_eq!(grants[1]["rw_paths"], json!([]), "{listing}");
     assert_eq!(listing["shares"][0]["path"], "", "{listing}");
 
-    // Restart: the bridge comes back with the same access.
+    // A folder inside the whole-vault share can be shared on its own, to someone else, with its
+    // own access: carol gets Notes/ read & write. Her edits reach the owner and, through the
+    // vault, bob's whole-vault mount; bob still cannot write there.
+    let carol_tok = server.add_user("carol");
+    let c = Client::start(&server, &carol_tok, "vc", &dir.join("C"), "C");
+    eventually!(10, c.proc.log_contains("reconcile done"), "carol up", c.proc);
+    let r = api_json(&server, &owner, "POST", "/api/vaults/va/shares", Some(json!({"path": "Notes", "name": "Notes"})));
+    let notes_id = r["share"]["id"].as_str().expect("share id").to_string();
+    let notes_ticket = r["ticket"].as_str().expect("ticket").to_string();
+    let r = api_json(&server, &carol_tok, "POST", "/api/vaults/vc/mounts", Some(json!({"ticket": notes_ticket, "mount_path": "Shared/N"})));
+    assert_eq!(r["access"], "rw", "carol mount: {r}");
+    eventually!(15, c.contains("Shared/N/a.md", "edited-by-owner") && !c.exists("Shared/N/Inbox"), "carol gets Notes only", c.proc, server.proc);
+    c.append("Shared/N/a.md", "carol-in-notes");
+    eventually!(10, a.contains("Notes/a.md", "carol-in-notes"), "owner sees carol", a.proc, server.proc);
+    eventually!(10, b.contains("Shared/V/Notes/a.md", "carol-in-notes"), "bob sees carol through the vault", b.proc, server.proc);
+    c.write("Shared/N/carol.md", "carol-new\n");
+    eventually!(10, a.read("Notes/carol.md") == "carol-new\n" && b.read("Shared/V/Notes/carol.md") == "carol-new\n", "carol's new note reaches both", a.proc, b.proc, server.proc);
+    make_writable(&b.path("Shared/V/Notes/a.md"));
+    b.append("Shared/V/Notes/a.md", "bob-still-ro");
+    sleep(3.0);
+    assert!(!a.contains("Notes/a.md", "bob-still-ro") && !c.contains("Shared/N/a.md", "bob-still-ro"), "bob's read-only edit leaked");
+    // Moving the inner share is fine; a share containing other shares cannot be moved; a mount
+    // may never overlap a share.
+    let (code, body) = api_raw(&server, &owner, "PATCH", &format!("/api/shares/{notes_id}"), Some(json!({"path": "Archive/Notes"})));
+    assert_eq!(code, 200, "{body}");
+    eventually!(15, a.exists("Archive/Notes/a.md") && b.exists("Shared/V/Archive/Notes/a.md") && c.exists("Shared/N/a.md"), "inner share moved for everyone", a.proc, b.proc, c.proc);
+    let listing = api_json(&server, &owner, "GET", "/api/vaults/va/sharing", None);
+    assert_eq!(listing["shares"].as_array().unwrap().len(), 2, "{listing}");
+    let (code, body) = api_raw(&server, &carol_tok, "POST", "/api/vaults/vc/mounts", Some(json!({"ticket": ticket, "mount_path": "Shared/N/inner"})));
+    assert_eq!(code, 409, "{body}");
+
+    // Restart: the bridges come back with the same access.
     server.restart(&[]);
     b.append("Shared/V/Inbox/i.md", "after-restart");
     eventually!(30, a.contains("Inbox/i.md", "after-restart"), "inbox edit flows after restart", a.proc, server.proc);
-    make_writable(&b.path("Shared/V/Notes/a.md"));
-    b.append("Shared/V/Notes/a.md", "notes-after-restart");
+    c.append("Shared/N/a.md", "carol-after-restart");
+    eventually!(15, a.contains("Archive/Notes/a.md", "carol-after-restart") && b.contains("Shared/V/Archive/Notes/a.md", "carol-after-restart"), "nested share flows after restart", a.proc, b.proc, server.proc);
+    make_writable(&b.path("Shared/V/Archive/Notes/a.md"));
+    b.append("Shared/V/Archive/Notes/a.md", "notes-after-restart");
     sleep(3.0);
-    assert!(!a.contains("Notes/a.md", "notes-after-restart"), "read-only edit reached the owner after restart");
-    eventually!(5, !b.contains("Shared/V/Notes/a.md", "notes-after-restart"), "read-only edit restored after restart", b.proc);
+    assert!(!a.contains("Archive/Notes/a.md", "notes-after-restart"), "read-only edit reached the owner after restart");
+    eventually!(5, !b.contains("Shared/V/Archive/Notes/a.md", "notes-after-restart"), "read-only edit restored after restart", b.proc);
 
     assert!(server.errors().is_empty(), "server errors: {:?}", server.errors());
 }

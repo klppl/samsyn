@@ -53,14 +53,47 @@ fn user_vault(state: &SharedState, user: &User, vault: &str) -> Result<(crate::s
     Ok((info, doc))
 }
 
-fn taken_prefixes(state: &SharedState, vault_id: &str) -> anyhow::Result<Vec<String>> {
+/// Full paths (`Projects/X/`, `Notes/a.md`, `""` for the whole vault) of a vault's shares and
+/// of its active mounts, for the overlap rules: shares may nest inside each other (the vault
+/// document is the hub, every bridge sees each change once), but no two shares may have the
+/// same path, and a mount never overlaps anything, since it is content other people share with
+/// us and must not be shared onward.
+struct Taken {
+    shares: Vec<(String, String)>,
+    mounts: Vec<String>,
+}
+
+fn taken_prefixes(state: &SharedState, vault_id: &str) -> anyhow::Result<Taken> {
     let reg = state.storage.registry();
-    let mut out: Vec<String> = reg.shares_for_vault(vault_id)?.into_iter().map(|s| match s.only_file {
-        Some(f) => format!("{}{}", s.prefix, f),
-        None => s.prefix,
-    }).collect();
-    out.extend(reg.mounts_for_vault(vault_id)?.into_iter().filter(|m| m.revoked_at.is_none()).map(|m| m.mount_prefix));
-    Ok(out)
+    let shares = reg
+        .shares_for_vault(vault_id)?
+        .into_iter()
+        .map(|s| (share_full_path(&s.prefix, s.only_file.as_deref()), s.name))
+        .collect();
+    let mounts = reg.mounts_for_vault(vault_id)?.into_iter().filter(|m| m.revoked_at.is_none()).map(|m| m.mount_prefix).collect();
+    Ok(Taken { shares, mounts })
+}
+
+impl Taken {
+    fn all(&self) -> impl Iterator<Item = &String> {
+        self.shares.iter().map(|(p, _)| p).chain(self.mounts.iter())
+    }
+
+    /// Why a new share at `full` is refused, if it is.
+    fn refuses_share(&self, full: &str) -> Option<String> {
+        let mounts: Vec<String> = self.mounts.iter().filter(|m| overlaps(m, full)).map(|m| show_path(m.trim_end_matches('/'))).collect();
+        if !mounts.is_empty() {
+            return Some(if full.is_empty() {
+                format!("the whole vault cannot be shared while it contains folders other people share with you ({}); unmount those first, or share a folder instead", mounts.join(", "))
+            } else {
+                format!("this path overlaps a folder other people share with you ({}); their content cannot be shared onward", mounts.join(", "))
+            });
+        }
+        if let Some((_, name)) = self.shares.iter().find(|(p, _)| p == full) {
+            return Some(format!("{} is already shared as \"{name}\"; issue another ticket for that share instead", show_path(full.trim_end_matches('/'))));
+        }
+        None
+    }
 }
 
 // ------------------------------------------------------------------ GET /api/vaults/{vault}/sharing
@@ -225,8 +258,8 @@ pub async fn create_share(
     let _admin = state.docs.share_admin.lock();
     match taken_prefixes(&state, &info.id) {
         Ok(taken) => {
-            if taken.iter().any(|t| overlaps(t, &full)) {
-                return err(StatusCode::CONFLICT, "this path overlaps an existing share or mount");
+            if let Some(msg) = taken.refuses_share(&full) {
+                return err(StatusCode::CONFLICT, msg);
             }
         }
         Err(e) => return internal(e),
@@ -507,7 +540,7 @@ pub async fn create_mount(
     let _admin = state.docs.share_admin.lock();
     match taken_prefixes(&state, &info.id) {
         Ok(taken) => {
-            if taken.iter().any(|t| overlaps(t, &prefix)) {
+            if taken.all().any(|t| overlaps(t, &prefix)) {
                 return err(StatusCode::CONFLICT, "mount path overlaps an existing share or mount");
             }
         }
@@ -549,20 +582,16 @@ pub struct MovePath {
     pub path: String,
 }
 
-/// Overlap check for a new prefix, ignoring the row being moved.
-fn prefix_taken(state: &SharedState, vault_id: &str, skip_share: Option<&str>, skip_mount: Option<&str>, full: &str) -> anyhow::Result<bool> {
+/// Overlap check for a mount's new prefix (against every share and every other active mount).
+fn mount_prefix_taken(state: &SharedState, vault_id: &str, skip_mount: &str, full: &str) -> anyhow::Result<bool> {
     let reg = state.storage.registry();
     for s in reg.shares_for_vault(vault_id)? {
-        if Some(s.id.as_str()) == skip_share {
-            continue;
-        }
-        let t = match &s.only_file { Some(f) => format!("{}{}", s.prefix, f), None => s.prefix.clone() };
-        if overlaps(&t, full) {
+        if overlaps(&share_full_path(&s.prefix, s.only_file.as_deref()), full) {
             return Ok(true);
         }
     }
     for m in reg.mounts_for_vault(vault_id)? {
-        if m.revoked_at.is_some() || Some(m.id.as_str()) == skip_mount {
+        if m.revoked_at.is_some() || m.id == skip_mount {
             continue;
         }
         if overlaps(&m.mount_prefix, full) {
@@ -606,7 +635,7 @@ pub async fn move_mount(
         return Json(serde_json::json!({ "mount_path": new_path })).into_response();
     }
     let _admin = state.docs.share_admin.lock();
-    match prefix_taken(&state, &mount.vault_id, None, Some(&mount.id), &new_prefix) {
+    match mount_prefix_taken(&state, &mount.vault_id, &mount.id, &new_prefix) {
         Ok(true) => return err(StatusCode::CONFLICT, "the new folder overlaps another share or mount"),
         Ok(false) => {}
         Err(e) => return internal(e),
@@ -671,9 +700,22 @@ pub async fn move_share(
         return Json(serde_json::json!({ "path": new_path })).into_response();
     }
     let _admin = state.docs.share_admin.lock();
-    match prefix_taken(&state, &share.vault_id, Some(&share.id), None, &full) {
-        Ok(true) => return err(StatusCode::CONFLICT, "the new path overlaps another share or mount"),
-        Ok(false) => {}
+    match taken_prefixes(&state, &share.vault_id) {
+        Ok(taken) => {
+            // Other shares nested inside this one would be carried along without their
+            // registry rows following; refuse rather than guess.
+            let inner: Vec<&String> = taken.shares.iter().map(|(p, _)| p).filter(|p| *p != &old_full && p.starts_with(&old_full)).collect();
+            if !inner.is_empty() {
+                return err(StatusCode::CONFLICT, format!("{} contains other shares ({}); move or unshare those first", show_path(old_full.trim_end_matches('/')), inner.iter().map(|p| p.trim_end_matches('/')).collect::<Vec<_>>().join(", ")));
+            }
+            let others = Taken { shares: taken.shares.iter().filter(|(p, _)| p != &old_full).cloned().collect(), mounts: taken.mounts.clone() };
+            if let Some(msg) = others.refuses_share(&full) {
+                return err(StatusCode::CONFLICT, msg);
+            }
+            if others.shares.iter().any(|(p, _)| p.starts_with(&full)) {
+                return err(StatusCode::CONFLICT, "the new path would contain another share");
+            }
+        }
         Err(e) => return internal(e),
     }
     let doc = match state.docs.load_vault_by_id(&share.vault_id) {

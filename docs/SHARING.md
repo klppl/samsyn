@@ -88,12 +88,17 @@ nothing is lost.
   v2 and v3 all decode. The ticket's `access` and `rw_paths` are for display; the
   owner's registry (or its hello, for remote mounts) is what is enforced.
 
-Overlapping shares or mounts (nested prefixes) in one vault are refused, which
-means a whole-vault share is the only share in that vault. A mount
-prefix must be empty in the vault when mounted, so nothing is overwritten. Share
-and mount creation run under one server-wide lock (overlap check, registry
-insert, bridge attach), so two concurrent requests cannot both pass the overlap
-check.
+Shares may nest: the whole vault read-only to one person and `Projects/X` inside
+it read & write to another, each with its own tickets. The vault document is the
+hub, every bridge sees each change once and the echo filter stops loops, so an
+edit through the inner share reaches the outer share's mounts and vice versa. Two
+shares may not have the same path (issue another ticket instead), and a share
+containing other shares cannot be moved (move or unshare the inner ones first).
+Mounts are stricter: a mount never overlaps a share or another mount, since it is
+content other people share with us and must not be shared onward. A mount prefix
+must be empty in the vault when mounted, so nothing is overwritten. Share and
+mount creation run under one server-wide lock (overlap check, registry insert,
+bridge attach), so two concurrent requests cannot both pass the overlap check.
 
 ## Storage
 

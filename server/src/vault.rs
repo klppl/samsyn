@@ -517,9 +517,11 @@ impl DocRegistry {
             }
             keys.len()
         };
-        // The bridge is detached, so nothing from this transaction reaches the share. Drop the
-        // recorded changes rather than letting the next propagate replay them anywhere.
-        vault.changes.lock().clear();
+        // The moved bridge is detached, so nothing from this transaction reaches its share.
+        // Other bridges on this vault do see the renames: a share that contains the moved
+        // share must follow it, or its mounts go stale. A moved mount never overlaps another
+        // bridge, so for mounts this forwards nothing.
+        self.propagate(&vault);
 
         let reg = self.storage.registry();
         if let Some(mid) = mount_id {

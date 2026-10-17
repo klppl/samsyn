@@ -27,8 +27,9 @@ fn share_mount_edit_revoke_restart() {
     let share_id = r["share"]["id"].as_str().expect("share id").to_string();
     let ticket = r["ticket"].as_str().expect("ticket").to_string();
 
-    // Overlapping creates are refused (the check and the insert are serialized).
-    let (c1, _) = api_raw(&server, &owner, "POST", "/api/vaults/va/shares", Some(json!({"path": "Projects", "name": "P"})));
+    // The same path twice is refused (the check and the insert are serialized); a share may
+    // nest inside another one, that is covered by sharing_mixed.
+    let (c1, _) = api_raw(&server, &owner, "POST", "/api/vaults/va/shares", Some(json!({"path": "Projects/X", "name": "P"})));
     assert_eq!(c1, 409);
 
     // Bob mounts.

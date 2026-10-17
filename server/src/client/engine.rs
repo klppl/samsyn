@@ -379,8 +379,12 @@ impl Engine {
         }
     }
 
+    /// The innermost shared root containing `rel` (shares may nest; a whole-vault share is "").
     fn shared_root_of(&self, rel: &str) -> Option<&SharedRoot> {
-        self.shared_roots.iter().find(|r| if r.is_file { rel == r.path } else { rel.starts_with(r.path.as_str()) })
+        self.shared_roots
+            .iter()
+            .filter(|r| if r.is_file { rel == r.path } else { rel.starts_with(r.path.as_str()) })
+            .max_by_key(|r| r.path.len())
     }
 
     fn keys_under(&self, root: &SharedRoot) -> Vec<String> {
