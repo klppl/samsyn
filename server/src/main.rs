@@ -16,6 +16,12 @@ fn main() -> anyhow::Result<()> {
         .with_writer(std::io::stderr)
         .init();
 
+    // More than one rustls crypto backend is compiled in (aws-lc-rs via hyper-rustls, ring via
+    // tokio-tungstenite). rustls then refuses to guess and the first TLS handshake panics
+    // ("Could not automatically determine the process-level CryptoProvider"), which hit the
+    // headless guest client on every wss:// ticket. Pick one up front; ignore "already set".
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+
     let cli = Cli::parse();
     let command = cli.command.unwrap_or(Command::Serve(ServeArgs::parse_from(["serve"])));
 

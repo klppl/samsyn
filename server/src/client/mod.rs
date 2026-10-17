@@ -20,15 +20,15 @@ use self::ws::WsEvent;
 #[command(name = "sync")]
 pub struct SyncArgs {
     /// Server base URL, e.g. https://sync.example.com or http://127.0.0.1:8787
-    #[arg(long, env = "SAMSYN_SERVER", required_unless_present = "ticket")]
+    #[arg(long, env = "SAMSYN_SERVER", required_unless_present_any = ["ticket", "ticket_file"])]
     pub server: Option<String>,
 
     /// User token (rp_...).
-    #[arg(long, env = "SAMSYN_TOKEN", required_unless_present = "ticket")]
+    #[arg(long, env = "SAMSYN_TOKEN", required_unless_present_any = ["ticket", "ticket_file"])]
     pub token: Option<String>,
 
     /// Vault name on the server (same "Vault ID" as in the plugin).
-    #[arg(long, env = "SAMSYN_VAULT", required_unless_present = "ticket")]
+    #[arg(long, env = "SAMSYN_VAULT", required_unless_present_any = ["ticket", "ticket_file"])]
     pub vault: Option<String>,
 
     /// Guest mode: sync one shared folder or note using a ticket instead of a server account.

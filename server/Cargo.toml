@@ -32,6 +32,9 @@ postcard = { version = "1", features = ["use-std"] }
 tokio = { version = "1", features = ["full"] }
 tower-http = { version = "0.7", features = ["cors", "trace"] }
 notify-debouncer-mini = "0.7"
+# Both aws-lc-rs (hyper-rustls) and ring (tokio-tungstenite) end up linked, so rustls
+# cannot pick a process-level CryptoProvider by itself; main() installs one explicitly.
+rustls = "0.23"
 reqwest = { version = "0.13", default-features = false, features = ["rustls", "charset", "blocking", "json"] }
 tar = "0.4"
 tokio-tungstenite = { version = "0.30", features = ["rustls-tls-webpki-roots"] }
