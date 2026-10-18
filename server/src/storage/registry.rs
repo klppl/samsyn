@@ -84,6 +84,8 @@ pub struct TokenInfo {
     pub label: String,
     pub created_at: String,
     pub last_used_at: Option<String>,
+    /// The token that made the request listing them.
+    pub current: bool,
 }
 
 #[derive(Clone)]
@@ -327,14 +329,47 @@ impl Registry {
         Ok(user)
     }
 
-    pub fn list_tokens(&self, user_id: &str) -> anyhow::Result<Vec<TokenInfo>> {
+    /// A user's tokens, oldest first. `presented` is the plaintext token of the caller, if any,
+    /// so its own row can be marked `current`.
+    pub fn list_tokens(&self, user_id: &str, presented: Option<&str>) -> anyhow::Result<Vec<TokenInfo>> {
+        let own = presented.map(token_hash);
         let conn = self.conn.lock();
-        let mut stmt =
-            conn.prepare("SELECT label, created_at, last_used_at FROM tokens WHERE user_id = ?1 ORDER BY created_at")?;
+        let mut stmt = conn
+            .prepare("SELECT label, created_at, last_used_at, hash FROM tokens WHERE user_id = ?1 ORDER BY created_at")?;
         let rows = stmt.query_map(params![user_id], |r| {
-            Ok(TokenInfo { label: r.get(0)?, created_at: r.get(1)?, last_used_at: r.get(2)? })
+            let hash: String = r.get(3)?;
+            Ok(TokenInfo {
+                label: r.get(0)?,
+                created_at: r.get(1)?,
+                last_used_at: r.get(2)?,
+                current: own.as_deref() == Some(hash.as_str()),
+            })
         })?;
         Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    /// Does this user already have a token with this label? Labels are what tokens are revoked
+    /// by, so they are kept unique per user.
+    pub fn label_taken(&self, user_id: &str, label: &str) -> anyhow::Result<bool> {
+        let conn = self.conn.lock();
+        Ok(conn
+            .query_row("SELECT 1 FROM tokens WHERE user_id = ?1 AND label = ?2", params![user_id, label], |_| Ok(()))
+            .optional()?
+            .is_some())
+    }
+
+    /// Is `presented` one of this user's tokens carrying this label? Used to stop a device
+    /// revoking the token it is talking with.
+    pub fn is_token(&self, user_id: &str, label: &str, presented: &str) -> anyhow::Result<bool> {
+        let conn = self.conn.lock();
+        Ok(conn
+            .query_row(
+                "SELECT 1 FROM tokens WHERE user_id = ?1 AND label = ?2 AND hash = ?3",
+                params![user_id, label, token_hash(presented)],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some())
     }
 
     pub fn revoke_tokens(&self, user_id: &str, label: Option<&str>) -> anyhow::Result<usize> {

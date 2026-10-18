@@ -385,21 +385,26 @@ export class SamsynSettingTab extends PluginSettingTab {
       const r = await new SamsynApi(this.plugin.settings).listTokens();
       if (r.tokens.length === 0) el.createDiv({ cls: "samsyn-empty", text: "No tokens listed." });
       for (const t of r.tokens) {
-        new Setting(el)
+        const row = new Setting(el)
           .setClass("samsyn-grant")
-          .setName(`token “${t.label}”`)
-          .setDesc(`issued ${t.created_at.slice(0, 10)}${t.last_used_at ? ` · last used ${t.last_used_at.slice(0, 16).replace("T", " ")}` : " · never used"}`)
-          .addButton((b) =>
-            b.setButtonText("Revoke").onClick(async () => {
-              try {
-                await new SamsynApi(this.plugin.settings).revokeToken(t.label);
-                new Notice(`Samsyn: token “${t.label}” revoked. If that was this device's token, enter a new one.`);
-                await this.renderDevices(el);
-              } catch (e) {
-                new Notice(`Samsyn: ${(e as Error).message}`);
-              }
-            }),
-          );
+          .setName(`token “${t.label}”${t.current ? " — this device" : ""}`)
+          .setDesc(`issued ${t.created_at.slice(0, 10)}${t.last_used_at ? ` · last used ${t.last_used_at.slice(0, 16).replace("T", " ")}` : " · never used"}`);
+        if (t.current) {
+          // Revoking it would cut this device off; switch to another token first.
+          row.addExtraButton((b) => b.setIcon("lock").setTooltip("This is the token this device uses. To retire it, set up another device token, paste it under Connection, then revoke this one.").setDisabled(true));
+          continue;
+        }
+        row.addButton((b) =>
+          b.setButtonText("Revoke").onClick(async () => {
+            try {
+              await new SamsynApi(this.plugin.settings).revokeToken(t.label);
+              new Notice(`Samsyn: token “${t.label}” revoked.`);
+              await this.renderDevices(el);
+            } catch (e) {
+              new Notice(`Samsyn: ${(e as Error).message}`);
+            }
+          }),
+        );
       }
     } catch (e) {
       el.createDiv({ cls: "samsyn-empty", text: `Cannot list tokens: ${(e as Error).message}` });

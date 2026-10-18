@@ -63,13 +63,21 @@ fn guests_join_with_tickets_only() {
     let (code, _) = api_raw(&server, "", "GET", &format!("/guest/shares/{share_id}?session={session}"), None);
     assert_eq!(code, 200, "a mismatch elsewhere must not destroy the session");
 
-    // Per-device tokens: issue one, use it, revoke it.
+    // Per-device tokens: issue one, use it, revoke it. Labels are unique, the listing marks
+    // the caller's own token, and that one cannot be revoked by accident.
     let t = api_json(&server, &owner, "POST", "/api/me/tokens", Some(json!({"label": "phone"})));
     let phone = t["token"].as_str().unwrap().to_string();
     let (code, _) = api_raw(&server, &phone, "GET", "/me", None);
     assert_eq!(code, 200);
-    let list = api_json(&server, &owner, "GET", "/api/me/tokens", None);
-    assert!(list["tokens"].as_array().unwrap().iter().any(|x| x["label"] == "phone"), "{list}");
+    let (code, body) = api_raw(&server, &owner, "POST", "/api/me/tokens", Some(json!({"label": "phone"})));
+    assert_eq!(code, 409, "duplicate label accepted: {body}");
+    let list = api_json(&server, &phone, "GET", "/api/me/tokens", None);
+    let tokens = list["tokens"].as_array().unwrap();
+    assert_eq!(tokens.len(), 2, "{list}");
+    assert!(tokens.iter().any(|x| x["label"] == "phone" && x["current"] == true), "{list}");
+    assert!(tokens.iter().any(|x| x["label"] == "initial" && x["current"] == false), "{list}");
+    let (code, body) = api_raw(&server, &phone, "DELETE", "/api/me/tokens/phone", None);
+    assert_eq!(code, 409, "a device revoked the token it is using: {body}");
     let (code, _) = api_raw(&server, &owner, "DELETE", "/api/me/tokens/phone", None);
     assert_eq!(code, 204);
     let (code, _) = api_raw(&server, &phone, "GET", "/me", None);

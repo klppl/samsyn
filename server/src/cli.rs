@@ -21,12 +21,13 @@ pub fn user(storage: &Storage, cmd: UserCmd) -> anyhow::Result<()> {
         UserCmd::List => {
             for u in reg.list_users()? {
                 let vaults = reg.list_vaults(Some(&u.id))?.len();
-                let tokens = reg.list_tokens(&u.id)?.len();
+                let tokens = reg.list_tokens(&u.id, None)?.len();
                 println!("{:<24} id={} vaults={} tokens={} created={}", u.name, u.id, vaults, tokens, u.created_at);
             }
         }
         UserCmd::Token { name, label } => {
             let u = reg.user_by_name(&name)?.with_context(|| format!("no such user {name}"))?;
+            anyhow::ensure!(!reg.label_taken(&u.id, &label)?, "{} already has a token labelled '{label}'; revoke it first or pick another label", u.name);
             let token = reg.create_token(&u.id, &label)?;
             println!("token for {} ({label}): {token}", u.name);
         }

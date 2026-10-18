@@ -116,7 +116,7 @@ export class SamsynApi {
   moveShare(shareId: string, path: string): Promise<{ path: string }> {
     return this.call("PATCH", `/api/shares/${shareId}`, { path });
   }
-  listTokens(): Promise<{ user: string; tokens: Array<{ label: string; created_at: string; last_used_at: string | null }> }> {
+  listTokens(): Promise<{ user: string; tokens: Array<{ label: string; created_at: string; last_used_at: string | null; current: boolean }> }> {
     return this.call("GET", `/api/me/tokens`);
   }
   createToken(label: string): Promise<{ token: string; label: string; user: string }> {

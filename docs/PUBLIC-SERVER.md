@@ -20,7 +20,7 @@ Issue one ticket per person. Then a leak costs you one revoke, not a re-invite o
 
 ## What a leaked user token can do
 
-Everything that user can do: read and write all their vaults, create shares, issue tickets. Treat it like a password. Use one token per device (Settings → Server → Devices → *Set up another device…*) so a lost phone means revoking one token. Tokens are stored hashed on the server; the plaintext exists only on the device.
+Everything that user can do: read and write all their vaults, create shares, issue tickets. Treat it like a password. Use one token per device (Settings → Server → Devices → *Set up another device…*) so a lost phone means revoking one token. Labels are unique per user, the token list marks the one the calling device uses, and `DELETE /api/me/tokens/<label>` refuses (409) to revoke that one unless `?force=true` is added, so a device cannot lock itself out by mistake. Tokens are stored hashed on the server; the plaintext exists only on the device.
 
 ## Built-in protection on `/guest/*`
 

@@ -256,8 +256,13 @@ fn users_cannot_reach_each_others_vaults_shares_or_mounts() {
     sleep(2.0);
     assert!(!bc.exists("private.md") && !bc.exists("Shared/X/private.md"));
     // Tokens are per user: revoking a label only touches the caller's own tokens. Both users
-    // have a token labelled "initial"; bob revoking it kills bob's, not alice's.
-    let (code, _) = api_raw(&server, &bob, "DELETE", "/api/me/tokens/initial", None);
+    // have a token labelled "initial". Bob is using his, so revoking it is refused until he
+    // insists; then it kills bob's, not alice's.
+    let (code, body) = api_raw(&server, &bob, "DELETE", "/api/me/tokens/initial", None);
+    assert_eq!(code, 409, "{body}");
+    let (code, _) = api_raw(&server, &bob, "GET", "/me", None);
+    assert_eq!(code, 200, "bob's token revoked despite the guard");
+    let (code, _) = api_raw(&server, &bob, "DELETE", "/api/me/tokens/initial?force=true", None);
     assert_eq!(code, 204);
     let (code, _) = api_raw(&server, &alice, "GET", "/me", None);
     assert_eq!(code, 200, "alice's token revoked by bob");
