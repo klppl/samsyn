@@ -76,7 +76,7 @@ jobs:
       # and the bump logic the release workflow relies on still passes its tests.
       - run: |
           node scripts/version.mjs check
-          node --test scripts/
+          node --test scripts/*.test.mjs
 
   fuzz:
     # Slow sanitizer build; only on manual runs and the weekly schedule.
