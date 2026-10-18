@@ -1,28 +1,61 @@
-name: Plugin release
+name: Release
 
-# Prepares an Obsidian plugin release. Tag the commit with the version number
-# (Obsidian convention: the tag must match the version in manifest.json, e.g.
-# `0.1.0`, no `v` prefix), push the tag, and this builds the plugin and creates a
-# DRAFT GitHub release with the three files Obsidian loads: main.js,
-# manifest.json, styles.css. Review the draft and publish it by hand.
+# Cuts a plugin release end to end: bumps the version, regenerates the changelog
+# (git-cliff), commits, tags, builds, and publishes a GitHub release with the
+# three files Obsidian loads (main.js, manifest.json, styles.css). BRAT installs
+# from these releases; "beta" publishes a GitHub *pre-release*, which BRAT users
+# only see when they opt in to pre-releases for this plugin.
+#
+# Run it from the Actions tab (workflow_dispatch) on main:
+#   channel  beta   -> X.Y.Z-beta.N (pre-release)       stable -> X.Y.Z
+#   level    auto   -> git-cliff decides from the commits since the last stable tag
+#            patch|minor|major -> explicit;  none -> re-use the current manifest version
+#   dry_run  compute, build and show what would happen; push nothing.
+#
+# See docs/DEVELOPMENT.md "Releasing".
 
 on:
-  push:
-    tags: ["*"]
   workflow_dispatch:
     inputs:
-      tag:
-        description: "Version to release (must match manifest.json, no 'v' prefix)"
-        required: true
+      channel:
+        description: "Release channel"
+        type: choice
+        options: [beta, stable]
+        default: beta
+      level:
+        description: "Version bump"
+        type: choice
+        options: [auto, patch, minor, major, none]
+        default: auto
+      dry_run:
+        description: "Dry run: build and print, publish nothing"
+        type: boolean
+        default: false
 
 permissions:
   contents: write
+  actions: write
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+env:
+  GIT_CLIFF_VERSION: 2.14.2
 
 jobs:
   release:
     runs-on: ubuntu-latest
     steps:
+      - name: Refuse to release from anything but main
+        if: github.ref != 'refs/heads/main'
+        run: |
+          echo "::error::Releases are cut from main, got ${GITHUB_REF}"
+          exit 1
+
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # git-cliff needs tags and full history
 
       - uses: actions/setup-node@v4
         with:
@@ -30,35 +63,104 @@ jobs:
           cache: npm
           cache-dependency-path: plugin/package-lock.json
 
-      - name: Build plugin
+      - name: Install git-cliff
+        run: npm install --global "git-cliff@${GIT_CLIFF_VERSION}"
+
+      - name: Compute version
+        id: version
+        env:
+          CHANNEL: ${{ inputs.channel }}
+          LEVEL: ${{ inputs.level }}
+        run: |
+          set -euo pipefail
+          node scripts/version.mjs check
+          CURRENT=$(node scripts/version.mjs current)
+          BASE=$(git cliff --bumped-version | sed 's/^v//')
+          echo "current=$CURRENT  cliff-base=$BASE  channel=$CHANNEL  level=$LEVEL"
+          VERSION=$(node scripts/version.mjs next --channel "$CHANNEL" --level "$LEVEL" --base "$BASE")
+          if git rev-parse -q --verify "refs/tags/$VERSION" >/dev/null; then
+            echo "::error::Tag $VERSION already exists. Pick a different level, or there is nothing new to release."
+            exit 1
+          fi
+          PRERELEASE=false; case "$VERSION" in *-*) PRERELEASE=true;; esac
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "prerelease=$PRERELEASE" >> "$GITHUB_OUTPUT"
+          echo "## Release $VERSION ($CHANNEL, bump: $LEVEL)" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Write version into manifest, package.json, versions.json
+        run: node scripts/version.mjs set "${{ steps.version.outputs.version }}"
+
+      - name: Release notes and changelog
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          PRERELEASE: ${{ steps.version.outputs.prerelease }}
+        run: |
+          set -euo pipefail
+          # Notes: everything since the last *stable* tag (betas fold in).
+          git cliff --unreleased --tag "$VERSION" --strip all --output notes.md
+          if [ ! -s notes.md ]; then echo "No changes recorded since the last release." > notes.md; fi
+          if [ "$PRERELEASE" = "true" ]; then
+            printf '\n---\nPre-release for testers. Install with [BRAT](https://github.com/TfTHacker/obsidian42-brat) and enable pre-releases for this plugin.\n' >> notes.md
+          else
+            # CHANGELOG.md only tracks stable releases.
+            git cliff --tag "$VERSION" --output CHANGELOG.md
+          fi
+          { echo; cat notes.md; } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Build and test plugin
         working-directory: plugin
         run: |
           npm ci
           npm run build
           npm test
+          node -e 'const m=require("./manifest.json"); if (m.version!==process.argv[1]) {console.error("built manifest has",m.version); process.exit(1)}' "${{ steps.version.outputs.version }}"
 
-      - name: Check tag matches manifest version
-        working-directory: plugin
+      - name: Commit, tag and push
+        if: ${{ !inputs.dry_run }}
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
         run: |
-          TAG="${GITHUB_REF_NAME}"
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then TAG="${{ inputs.tag }}"; fi
-          TAG="${TAG#v}"
-          MANIFEST=$(node -p "require('./manifest.json').version")
-          echo "tag=$TAG manifest=$MANIFEST"
-          if [ "$TAG" != "$MANIFEST" ]; then
-            echo "::error::Tag '$TAG' does not match manifest.json version '$MANIFEST'"
-            exit 1
-          fi
-          echo "VERSION=$TAG" >> "$GITHUB_ENV"
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add manifest.json versions.json plugin/package.json plugin/package-lock.json
+          [ -f CHANGELOG.md ] && git add CHANGELOG.md
+          git commit -m "chore(release): $VERSION"
+          git tag -a "$VERSION" -m "Samsyn $VERSION"
+          git push origin HEAD:main "refs/tags/$VERSION"
 
-      - name: Create draft release
+      - name: Publish GitHub release
+        if: ${{ !inputs.dry_run }}
         uses: softprops/action-gh-release@v2
         with:
-          draft: true
-          tag_name: ${{ env.VERSION }}
-          name: ${{ env.VERSION }}
+          tag_name: ${{ steps.version.outputs.version }}
+          name: ${{ steps.version.outputs.version }}
+          body_path: notes.md
+          prerelease: ${{ steps.version.outputs.prerelease == 'true' }}
+          draft: false
+          fail_on_unmatched_files: true
           files: |
             plugin/main.js
             plugin/manifest.json
             plugin/styles.css
-          fail_on_unmatched_files: true
+
+      # Pushes made with GITHUB_TOKEN do not fire other workflows, so kick the
+      # image build for the new tag by hand.
+      - name: Build Docker image for the tag
+        if: ${{ !inputs.dry_run }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run docker.yml --ref "${{ steps.version.outputs.version }}"
+
+      - name: Upload build for inspection (dry run)
+        if: ${{ inputs.dry_run }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: samsyn-${{ steps.version.outputs.version }}-dry-run
+          path: |
+            plugin/main.js
+            plugin/manifest.json
+            plugin/styles.css
+            notes.md
+            CHANGELOG.md
+          if-no-files-found: warn

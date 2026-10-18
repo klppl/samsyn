@@ -3,6 +3,7 @@ server/target/
 # Node
 plugin/node_modules/
 plugin/main.js
+plugin/manifest.json
 # Local data
 data/
 *.log

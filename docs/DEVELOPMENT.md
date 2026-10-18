@@ -34,7 +34,7 @@ The data dir is throwaway; delete `./data` to start from scratch (a new owner to
 
 ## Plugin on desktop
 
-Obsidian loads plugins from `<vault>/.obsidian/plugins/<id>/` and needs three files there: `main.js`, `manifest.json`, `styles.css`.
+Obsidian loads plugins from `<vault>/.obsidian/plugins/<id>/` and needs three files there: `main.js`, `manifest.json`, `styles.css`. `plugin/main.js` and `plugin/manifest.json` are build output (`manifest.json` is copied from the repo root, where Obsidian's community-plugin tooling reads it; edit the root one).
 
 1. Create a scratch vault for development, for example `~/ObsidianDev`.
 2. Point the plugin's build output at it. A symlink is the easiest:
@@ -118,7 +118,7 @@ Wait for the iCloud upload (Finder shows a cloud icon until done), then on the p
 
 **B. On-device vault, copy via Finder/USB.** Connect the phone, open Finder → iPhone → Files → Obsidian → drag the `samsyn` folder into the vault's `.obsidian/plugins/` folder. Finder does show dot-folders here. (On older macOS this is in iTunes → File Sharing.)
 
-**C. BRAT (once we publish pre-releases).** Install the BRAT community plugin on the phone, add this repository as a beta plugin, and it downloads `main.js`/`manifest.json`/`styles.css` from GitHub releases. This is the plan for testers before the community-list release.
+**C. BRAT (recommended for testers).** Install the BRAT community plugin on the phone, *Add beta plugin* → `mrboatsman/samsyn`. BRAT downloads `main.js`/`manifest.json`/`styles.css` from the latest GitHub release and keeps them updated. Enable pre-releases for Samsyn in BRAT to get the `X.Y.Z-beta.N` builds; without it BRAT only installs stable releases. See "Releasing" below for how releases are cut.
 
 **D. Samsyn itself.** Once one device is syncing, you can tick "sync the `.obsidian` folder" in a later version and let Samsyn carry the plugin to the other devices. Not implemented yet, and risky for plugin files; listed for completeness.
 
@@ -282,9 +282,36 @@ cd plugin && node tests/e2e.mjs ws://127.0.0.1:8787/ws rp_yourtoken   # against 
 cd server && cargo test
 ```
 
-## Release checklist (later)
+## Releasing
 
-1. Bump `version` in `plugin/manifest.json`, `plugin/package.json`, `plugin/versions.json`.
-2. `npm run build`, attach `main.js`, `manifest.json`, `styles.css` to a GitHub release tagged with the version.
-3. Submit to the Obsidian community plugin list following the official guidelines (`isDesktopOnly: false`, no `innerHTML`, etc.).
-4. Build server binaries (`cargo build --release`) for Linux x86_64/arm64, macOS, Windows; publish the Docker image.
+Releases are cut by the **Release** workflow (`.github/workflows/release.yml`, Actions tab → Release → Run workflow, on `main`). It does everything: bumps the version, writes the changelog, commits, tags, builds and publishes the GitHub release. Nothing is edited by hand.
+
+| Input | Values | Meaning |
+|---|---|---|
+| `channel` | `beta` (default), `stable` | `beta` publishes a GitHub *pre-release* `X.Y.Z-beta.N`; `stable` publishes `X.Y.Z` |
+| `level` | `auto` (default), `patch`, `minor`, `major`, `none` | `auto` lets git-cliff pick from the commits since the last stable tag (`feat:` → minor, anything else → patch, `!`/`BREAKING CHANGE` → minor while on 0.x). `none` re-uses the version in `manifest.json` (first release) or, on a beta, just increments `N` |
+| `dry_run` | off | Computes, builds and prints the notes; pushes and publishes nothing. Uploads the would-be release files as a workflow artifact |
+
+Version rules (`scripts/version.mjs`, tested in `scripts/version.test.mjs`):
+
+- `0.1.0` + beta/minor → `0.2.0-beta.1`; next beta with `none`/`auto` → `0.2.0-beta.2`.
+- `0.2.0-beta.3` + stable/`none` → `0.2.0` (finishes the beta line).
+- The single source of the version is `/manifest.json`; the workflow mirrors it into `plugin/package.json`, `plugin/package-lock.json`, and (stable only) `/versions.json`. CI fails if they drift (`node scripts/version.mjs check`).
+
+Changelog (`cliff.toml`, [git-cliff](https://git-cliff.org)): release notes list every commit since the last **stable** tag, so betas fold into the stable release that follows. `CHANGELOG.md` is regenerated on stable releases only. Commits need not follow Conventional Commits; `feat:`/`fix:` etc. get their own sections, plain commits land under "Changes", and `chore(release):` commits are skipped.
+
+Typical flow:
+
+1. Merge work to `main`.
+2. Run Release with `channel=beta` (level `auto`). Testers on BRAT with pre-releases enabled get it within BRAT's check interval, or on *Check for updates*.
+3. Repeat step 2 as fixes land; each run increments `N`.
+4. Run Release with `channel=stable`, `level=none` to ship `X.Y.Z`. Everyone on BRAT gets it.
+
+First release of the current `0.1.0`: `channel=stable`, `level=none`.
+
+Pushes made by the workflow use `GITHUB_TOKEN`, which does not trigger other workflows, so the release workflow starts the Docker image build for the tag itself (`gh workflow run docker.yml`). CI does not run on the release commit; it only changes version numbers and `CHANGELOG.md`.
+
+Still manual, later:
+
+- Submit to the Obsidian community plugin list following the official guidelines (`isDesktopOnly: false`, no `innerHTML`, root `manifest.json`/`versions.json`, a stable release). After that, Obsidian itself offers updates and BRAT is only needed for betas.
+- Server binaries (`cargo build --release`) for Linux x86_64/arm64, macOS, Windows. The Docker image is already built per tag.
