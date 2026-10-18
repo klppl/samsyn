@@ -1,0 +1,14 @@
+# Commit message lint (https://commitlint.js.org). Enforced by the commitlint job
+# in .github/workflows/ci.yml. Format and rationale: AGENTS.md.
+extends:
+  - "@commitlint/config-conventional"
+rules:
+  header-max-length: [2, always, 72]
+  # Summaries are sentence case ("Add QR invites"); config-conventional forbids
+  # that by default.
+  subject-case: [0]
+  type-enum:
+    - 2
+    - always
+    - [feat, fix, perf, refactor, docs, test, build, ci, chore, style, revert]
+  scope-case: [2, always, lower-case]
