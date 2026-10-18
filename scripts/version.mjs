@@ -4,7 +4,7 @@
 // file that carries it. See docs/DEVELOPMENT.md "Releasing".
 //
 //   node scripts/version.mjs current
-//   node scripts/version.mjs next --channel beta|stable --level auto|patch|minor|major|none [--base X.Y.Z]
+//   node scripts/version.mjs next --channel beta|stable --level auto|patch|minor|major|none [--base X.Y.Z] [--current-untagged]
 //   node scripts/version.mjs set X.Y.Z[-beta.N]
 //
 // Versions are X.Y.Z (stable) or X.Y.Z-beta.N (pre-release). GitHub pre-releases
@@ -68,8 +68,9 @@ export function bumpBase(current, level) {
  * Next version from the current one.
  *  channel: "stable" -> X.Y.Z, "beta" -> X.Y.Z-beta.N
  *  level:   patch|minor|major|none, or "auto" with `base` (from `git cliff --bumped-version`)
+ *  currentUntagged: the current X.Y.Z has no tag yet, so a beta of it is allowed
  */
-export function nextVersion(current, { channel, level, base }) {
+export function nextVersion(current, { channel, level, base, currentUntagged = false }) {
   const cur = parse(current);
   let target;
   if (level === "auto") {
@@ -89,6 +90,7 @@ export function nextVersion(current, { channel, level, base }) {
   } else if (channel === "beta") {
     const sameBase = compare({ ...cur, pre: null }, target) === 0;
     if (sameBase && cur.pre !== null) next = { ...target, pre: cur.pre + 1 };
+    else if (sameBase && currentUntagged) next = { ...target, pre: 1 }; // first beta of an unreleased X.Y.Z
     else if (sameBase && (level === "none" || level === "auto")) {
       throw new Error(`Current ${current} is already released; pick --level patch|minor|major for a new beta line`);
     } else next = { ...target, pre: 1 };
@@ -96,7 +98,9 @@ export function nextVersion(current, { channel, level, base }) {
     throw new Error(`Unknown channel "${channel}"`);
   }
 
-  if (compare(next, cur) < 0) throw new Error(`Computed ${format(next)} is older than current ${current}`);
+  // A beta of an untagged X.Y.Z sorts below it by design; everything else must move forward.
+  const floor = currentUntagged ? { ...cur, pre: null, patch: cur.patch - 1 } : cur;
+  if (compare(next, floor) < 0) throw new Error(`Computed ${format(next)} is older than current ${current}`);
   return format(next);
 }
 
@@ -179,7 +183,8 @@ if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.me
         const level = arg("--level", rest) ?? "auto";
         const base = arg("--base", rest);
         const current = arg("--current", rest) ?? currentVersion();
-        console.log(nextVersion(current, { channel, level, base }));
+        const currentUntagged = rest.includes("--current-untagged");
+        console.log(nextVersion(current, { channel, level, base, currentUntagged }));
         break;
       }
       case "set": {

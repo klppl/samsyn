@@ -91,7 +91,9 @@ jobs:
             # Beta: base is the pending stable version; N continues from the
             # highest existing beta tag of that base.
             BASE=$(git cliff --bumped-version --unreleased | sed 's/^v//')
-            CANDIDATE=$(node scripts/version.mjs next --channel beta --level "$LEVEL" --base "$BASE" --current "$CURRENT")
+            UNTAGGED=""
+            git rev-parse -q --verify "refs/tags/$CURRENT" >/dev/null || UNTAGGED="--current-untagged"
+            CANDIDATE=$(node scripts/version.mjs next --channel beta --level "$LEVEL" --base "$BASE" --current "$CURRENT" $UNTAGGED)
             CBASE="${CANDIDATE%%-*}"
             LAST_BETA=$(git tag -l "${CBASE}-beta.*" | sort -t. -k4 -n | tail -1)
             if [ -n "$LAST_BETA" ]; then

@@ -22,6 +22,14 @@ test("beta lines", () => {
   assert.throws(() => next("0.1.0", "beta", "none"), /pick --level/);
 });
 
+test("beta of a version that is in manifest.json but not tagged yet", () => {
+  const untagged = (cur, level, base) => nextVersion(cur, { channel: "beta", level, base, currentUntagged: true });
+  assert.equal(untagged("0.1.0", "auto", "0.1.0"), "0.1.0-beta.1");
+  assert.equal(untagged("0.1.0", "none"), "0.1.0-beta.1");
+  assert.equal(untagged("0.1.0", "minor"), "0.2.0-beta.1", "explicit level still bumps");
+  assert.equal(untagged("0.2.0-beta.3", "none"), "0.2.0-beta.4");
+});
+
 test("finishing a beta", () => {
   assert.equal(next("0.2.0-beta.3", "stable", "none"), "0.2.0");
   assert.equal(next("0.2.0-beta.3", "stable", "patch"), "0.2.0");
