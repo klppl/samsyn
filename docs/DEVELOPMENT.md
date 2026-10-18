@@ -284,32 +284,23 @@ cd server && cargo test
 
 ## Releasing
 
-Releases are cut by the **Release** workflow (`.github/workflows/release.yml`, Actions tab → Release → Run workflow, on `main`). It does everything: bumps the version, writes the changelog, commits, tags, builds and publishes the GitHub release. Nothing is edited by hand.
+Two workflows, no hand edits. Both read the version from `/manifest.json` and the changelog from Conventional Commits via [git-cliff](https://git-cliff.org) (`cliff.toml`).
 
-| Input | Values | Meaning |
-|---|---|---|
-| `channel` | `beta` (default), `stable` | `beta` publishes a GitHub *pre-release* `X.Y.Z-beta.N`; `stable` publishes `X.Y.Z` |
-| `level` | `auto` (default), `patch`, `minor`, `major`, `none` | `auto` lets git-cliff pick from the commits since the last stable tag (`feat:` → minor, anything else → patch, `!`/`BREAKING CHANGE` → minor while on 0.x). `none` re-uses the version in `manifest.json` (first release) or, on a beta, just increments `N` |
-| `dry_run` | off | Computes, builds and prints the notes; pushes and publishes nothing. Uploads the would-be release files as a workflow artifact |
+**Stable: merge the release PR.** `.github/workflows/release-pr.yml` runs on every push to `main` and keeps one PR titled `chore(release): X.Y.Z` open (branch `release-pr`, label `release`). It picks the version from the commits since the last stable tag (`feat` → minor, anything else → patch, `!`/`BREAKING CHANGE` → minor while on 0.x), writes it into `manifest.json`, `plugin/package.json`, `plugin/package-lock.json` and `versions.json`, and prepends the section to `CHANGELOG.md`. The PR body is the release notes; review them, then merge. Merging lands the release commit on `main`, and `.github/workflows/release.yml` tags `X.Y.Z`, builds, and publishes the GitHub release with `main.js`, `manifest.json`, `styles.css`. The PR refreshes itself on each push to `main`, so it is always one merge away from a release. GitHub does not run CI on PRs opened with the Actions token; the PR only touches version files, so that is fine.
 
-Version rules (`scripts/version.mjs`, tested in `scripts/version.test.mjs`):
+**Beta: press the button.** Actions → Release → Run workflow (`main`). Inputs: `level` (`auto` default, or `patch`/`minor`/`major` to choose the base) and `dry_run`. It computes `X.Y.Z-beta.N` where `X.Y.Z` is what the release PR would ship and `N` continues from the existing beta tags, stamps that version into the built `manifest.json`, tags, and publishes a GitHub **pre-release**. Nothing is committed to `main`; the repo stays on the last stable version. BRAT users only see betas if they enabled pre-releases for Samsyn.
 
-- `0.1.0` + beta/minor → `0.2.0-beta.1`; next beta with `none`/`auto` → `0.2.0-beta.2`.
-- `0.2.0-beta.3` + stable/`none` → `0.2.0` (finishes the beta line).
-- The single source of the version is `/manifest.json`; the workflow mirrors it into `plugin/package.json`, `plugin/package-lock.json`, and (stable only) `/versions.json`. CI fails if they drift (`node scripts/version.mjs check`).
-
-Changelog (`cliff.toml`, [git-cliff](https://git-cliff.org)): release notes list every commit since the last **stable** tag, so betas fold into the stable release that follows. `CHANGELOG.md` is regenerated on stable releases only. Commits need not follow Conventional Commits; `feat:`/`fix:` etc. get their own sections, plain commits land under "Changes", and `chore(release):` commits are skipped.
+Version arithmetic lives in `scripts/version.mjs` (tests in `scripts/version.test.mjs`): `0.1.0` + `feat` → PR for `0.2.0`, betas `0.2.0-beta.1`, `-beta.2`, …; merging the PR ships `0.2.0` and the next beta line starts fresh. CI fails if the version files drift (`node scripts/version.mjs check`).
 
 Typical flow:
 
-1. Merge work to `main`.
-2. Run Release with `channel=beta` (level `auto`). Testers on BRAT with pre-releases enabled get it within BRAT's check interval, or on *Check for updates*.
-3. Repeat step 2 as fixes land; each run increments `N`.
-4. Run Release with `channel=stable`, `level=none` to ship `X.Y.Z`. Everyone on BRAT gets it.
+1. Merge work to `main`. The release PR updates itself.
+2. Need testers on it? Run Release (beta). Repeat as fixes land; `N` increments.
+3. Happy? Merge the release PR. Stable `X.Y.Z` goes out; everyone on BRAT gets it.
 
-First release of the current `0.1.0`: `channel=stable`, `level=none`.
+First release: the first push after this lands opens `chore(release): 0.1.0` (no stable tag exists yet, so the current version is released as is). Merge it.
 
-Pushes made by the workflow use `GITHUB_TOKEN`, which does not trigger other workflows, so the release workflow starts the Docker image build for the tag itself (`gh workflow run docker.yml`). CI does not run on the release commit; it only changes version numbers and `CHANGELOG.md`.
+Pushes and tags made by the workflows use `GITHUB_TOKEN`, which does not trigger other workflows, so `release.yml` starts the Docker image build for the tag itself (`gh workflow run docker.yml`). `chore(release): …` is reserved for the release PR; do not write it by hand, since the release workflow keys on it.
 
 Still manual, later:
 

@@ -1,0 +1,117 @@
+name: Release PR
+
+# Keeps one "chore(release): X.Y.Z" pull request open against main with the next
+# stable version. Every push to main refreshes it:
+#   1. git-cliff reads the Conventional Commits since the last stable tag and
+#      picks the bump (feat → minor, fix/other → patch, "!" → minor on 0.x).
+#   2. scripts/version.mjs writes that version into manifest.json,
+#      plugin/package.json(+lock) and versions.json; git-cliff prepends the
+#      section to CHANGELOG.md.
+#   3. peter-evans/create-pull-request pushes branch `release-pr` and opens or
+#      updates the PR. Its body is the release notes.
+# Merging the PR fires release.yml, which tags, builds and publishes.
+# Betas never come through here; see release.yml (workflow_dispatch).
+#
+# Note: PRs opened with GITHUB_TOKEN get no CI runs; the PR only touches
+# version files and CHANGELOG.md, so that is acceptable.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: release-pr
+  cancel-in-progress: true
+
+env:
+  GIT_CLIFF_VERSION: 2.14.2
+
+jobs:
+  release-pr:
+    runs-on: ubuntu-latest
+    # Skip forks and the release commit itself (merging the PR lands
+    # "chore(release): X.Y.Z" on main, either as the subject or inside the
+    # merge commit body).
+    if: >-
+      github.repository_owner == 'mrboatsman' &&
+      !contains(github.event.head_commit.message, 'chore(release): ')
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Install git-cliff
+        run: npm install --global "git-cliff@${GIT_CLIFF_VERSION}"
+
+      - name: Determine next stable version
+        id: next
+        run: |
+          set -euo pipefail
+          node scripts/version.mjs check
+          CURRENT=$(node scripts/version.mjs current)
+          BASE=$(git cliff --bumped-version --unreleased | sed 's/^v//')
+          NEXT=$(node scripts/version.mjs next --channel stable --level auto --base "$BASE" --current "$CURRENT")
+          echo "current=$CURRENT  cliff=$BASE  next=$NEXT"
+          if git rev-parse -q --verify "refs/tags/$NEXT" >/dev/null; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "$NEXT is already tagged; nothing to release." | tee -a "$GITHUB_STEP_SUMMARY"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+            echo "version=$NEXT" >> "$GITHUB_OUTPUT"
+            echo "## Release PR for $NEXT (from $CURRENT)" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Write version and changelog
+        if: steps.next.outputs.skip == 'false'
+        env:
+          VERSION: ${{ steps.next.outputs.version }}
+        run: |
+          set -euo pipefail
+          node scripts/version.mjs set "$VERSION"
+          git cliff --unreleased --tag "$VERSION" --strip all --output .release-notes.md
+          if [ -f CHANGELOG.md ]; then
+            git cliff --unreleased --tag "$VERSION" --prepend CHANGELOG.md
+          else
+            git cliff --tag "$VERSION" --output CHANGELOG.md
+          fi
+          {
+            echo "Automated release PR, refreshed on every push to \`main\`."
+            echo
+            echo "Merging it tags \`$VERSION\`, builds the plugin and publishes the GitHub release that BRAT and (later) the Obsidian community list install from."
+            echo
+            cat .release-notes.md
+          } > .release-pr-body.md
+          cat .release-notes.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Ensure the release label exists
+        if: steps.next.outputs.skip == 'false'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh label create release --color 0E8A16 --description "Automated release PR" --force
+
+      - name: Open or update the release PR
+        if: steps.next.outputs.skip == 'false'
+        uses: peter-evans/create-pull-request@v7
+        with:
+          branch: release-pr
+          base: main
+          add-paths: |
+            manifest.json
+            versions.json
+            plugin/package.json
+            plugin/package-lock.json
+            CHANGELOG.md
+          commit-message: "chore(release): ${{ steps.next.outputs.version }}"
+          title: "chore(release): ${{ steps.next.outputs.version }}"
+          body-path: .release-pr-body.md
+          labels: release
+          delete-branch: true

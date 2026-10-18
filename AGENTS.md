@@ -29,7 +29,8 @@ commit outside the format either breaks the version bump or lands in the wrong
 changelog section. CI (`commitlint` job in `.github/workflows/ci.yml`) rejects
 non-conforming commits.
 
-Reserved: `chore(release): X.Y.Z` is written by the release workflow only.
+Reserved: `chore(release): X.Y.Z` is written by the release PR workflow only;
+`release.yml` keys on it to tag and publish. Never write it by hand.
 
 ## Version control: jj, not git
 
@@ -42,6 +43,7 @@ bookmark unless asked.
 
 - The plugin version lives in `/manifest.json` only. `plugin/manifest.json` is
   build output (copied by `plugin/esbuild.config.mjs`); never edit it.
-- Never bump versions by hand. The Release workflow runs
+- Never bump versions by hand. Stable releases come from merging the automated
+  release PR; betas from the Release workflow button. Both run
   `scripts/version.mjs` and `git-cliff`; see docs/DEVELOPMENT.md "Releasing".
 - `third_party/yrs` is a patched vendored copy; do not edit it (see its PATCH.md).
