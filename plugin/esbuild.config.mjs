@@ -1,6 +1,12 @@
 import esbuild from "esbuild";
+import fs from "fs";
 import process from "process";
 import builtins from "builtin-modules";
+
+// manifest.json lives at the repo root (Obsidian's community-plugin tooling reads
+// it there). Copy it next to main.js so plugin/ holds the three files Obsidian
+// loads and the release workflow uploads.
+fs.copyFileSync("../manifest.json", "manifest.json");
 
 const banner = `/*
 Samsyn — conflict-free live sync for Obsidian.

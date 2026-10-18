@@ -11,6 +11,19 @@ on:
     - cron: "0 4 * * 1"
 
 jobs:
+  # Every new commit must follow Conventional Commits (AGENTS.md). Lints the
+  # pushed range on push and all PR commits on pull_request.
+  commitlint:
+    if: github.event_name == 'push' || github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: wagoid/commitlint-github-action@v6
+        with:
+          configFile: .commitlintrc.yml
+
   server-test:
     runs-on: ubuntu-latest
     steps:
@@ -51,6 +64,19 @@ jobs:
           npm run build
           npm test
           npm audit --omit=dev --audit-level=high
+
+  release-tooling:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      # Version carriers (manifest.json, plugin/package.json, versions.json) agree,
+      # and the bump logic the release workflow relies on still passes its tests.
+      - run: |
+          node scripts/version.mjs check
+          node --test scripts/*.test.mjs
 
   fuzz:
     # Slow sanitizer build; only on manual runs and the weekly schedule.

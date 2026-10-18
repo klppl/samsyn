@@ -92,9 +92,12 @@ That is all you need to try it on a LAN. For HTTPS (required for iOS), admin
 commands and the headless client, see [docs/SERVER.md](docs/SERVER.md). To run it
 on the public internet, see [docs/PUBLIC-SERVER.md](docs/PUBLIC-SERVER.md).
 
-**2. Install the plugin.** Until it is in the community list, install it manually
-or with [BRAT](https://github.com/TfTHacker/obsidian42-brat). See
-[docs/DEVELOPMENT.md](docs/DEVELOPMENT.md) for desktop and phone instructions.
+**2. Install the plugin.** Until it is in the community list, install it with
+[BRAT](https://github.com/TfTHacker/obsidian42-brat): install BRAT from the
+community plugins, then *BRAT → Add beta plugin* → `mrboatsman/samsyn`. Stable
+releases are the default; to follow the `X.Y.Z-beta.N` pre-releases, enable
+pre-releases for Samsyn in BRAT. Works on desktop and phone. For a manual install
+or a local build, see [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md).
 
 **3. Connect.** Obsidian → Settings → Samsyn:
 

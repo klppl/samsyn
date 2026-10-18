@@ -34,7 +34,7 @@ The data dir is throwaway; delete `./data` to start from scratch (a new owner to
 
 ## Plugin on desktop
 
-Obsidian loads plugins from `<vault>/.obsidian/plugins/<id>/` and needs three files there: `main.js`, `manifest.json`, `styles.css`.
+Obsidian loads plugins from `<vault>/.obsidian/plugins/<id>/` and needs three files there: `main.js`, `manifest.json`, `styles.css`. `plugin/main.js` and `plugin/manifest.json` are build output (`manifest.json` is copied from the repo root, where Obsidian's community-plugin tooling reads it; edit the root one).
 
 1. Create a scratch vault for development, for example `~/ObsidianDev`.
 2. Point the plugin's build output at it. A symlink is the easiest:
@@ -118,7 +118,7 @@ Wait for the iCloud upload (Finder shows a cloud icon until done), then on the p
 
 **B. On-device vault, copy via Finder/USB.** Connect the phone, open Finder → iPhone → Files → Obsidian → drag the `samsyn` folder into the vault's `.obsidian/plugins/` folder. Finder does show dot-folders here. (On older macOS this is in iTunes → File Sharing.)
 
-**C. BRAT (once we publish pre-releases).** Install the BRAT community plugin on the phone, add this repository as a beta plugin, and it downloads `main.js`/`manifest.json`/`styles.css` from GitHub releases. This is the plan for testers before the community-list release.
+**C. BRAT (recommended for testers).** Install the BRAT community plugin on the phone, *Add beta plugin* → `mrboatsman/samsyn`. BRAT downloads `main.js`/`manifest.json`/`styles.css` from the latest GitHub release and keeps them updated. Enable pre-releases for Samsyn in BRAT to get the `X.Y.Z-beta.N` builds; without it BRAT only installs stable releases. See "Releasing" below for how releases are cut.
 
 **D. Samsyn itself.** Once one device is syncing, you can tick "sync the `.obsidian` folder" in a later version and let Samsyn carry the plugin to the other devices. Not implemented yet, and risky for plugin files; listed for completeness.
 
@@ -282,9 +282,27 @@ cd plugin && node tests/e2e.mjs ws://127.0.0.1:8787/ws rp_yourtoken   # against 
 cd server && cargo test
 ```
 
-## Release checklist (later)
+## Releasing
 
-1. Bump `version` in `plugin/manifest.json`, `plugin/package.json`, `plugin/versions.json`.
-2. `npm run build`, attach `main.js`, `manifest.json`, `styles.css` to a GitHub release tagged with the version.
-3. Submit to the Obsidian community plugin list following the official guidelines (`isDesktopOnly: false`, no `innerHTML`, etc.).
-4. Build server binaries (`cargo build --release`) for Linux x86_64/arm64, macOS, Windows; publish the Docker image.
+Two workflows, no hand edits. Both read the version from `/manifest.json` and the changelog from Conventional Commits via [git-cliff](https://git-cliff.org) (`cliff.toml`).
+
+**Stable: merge the release PR.** `.github/workflows/release-pr.yml` runs on every push to `main` and keeps one PR titled `chore(release): X.Y.Z` open (branch `release-pr`, label `release`). It picks the version from the commits since the last stable tag (`feat` → minor, anything else → patch, `!`/`BREAKING CHANGE` → minor while on 0.x), writes it into `manifest.json`, `plugin/package.json`, `plugin/package-lock.json` and `versions.json`, and prepends the section to `CHANGELOG.md`. The PR body is the release notes; review them, then merge. Merging lands the release commit on `main`, and `.github/workflows/release.yml` tags `X.Y.Z`, builds, and publishes the GitHub release with `main.js`, `manifest.json`, `styles.css`. The PR refreshes itself on each push to `main`, so it is always one merge away from a release. GitHub does not run CI on PRs opened with the Actions token; the PR only touches version files, so that is fine.
+
+**Beta: press the button.** Actions → Release → Run workflow (`main`). Inputs: `level` (`auto` default, or `patch`/`minor`/`major` to choose the base) and `dry_run`. It computes `X.Y.Z-beta.N` where `X.Y.Z` is what the release PR would ship and `N` continues from the existing beta tags, stamps that version into the built `manifest.json`, tags, and publishes a GitHub **pre-release**. Nothing is committed to `main`; the repo stays on the last stable version. BRAT users only see betas if they enabled pre-releases for Samsyn.
+
+Version arithmetic lives in `scripts/version.mjs` (tests in `scripts/version.test.mjs`): `0.1.0` + `feat` → PR for `0.2.0`, betas `0.2.0-beta.1`, `-beta.2`, …; merging the PR ships `0.2.0` and the next beta line starts fresh. CI fails if the version files drift (`node scripts/version.mjs check`).
+
+Typical flow:
+
+1. Merge work to `main`. The release PR updates itself.
+2. Need testers on it? Run Release (beta). Repeat as fixes land; `N` increments.
+3. Happy? Merge the release PR. Stable `X.Y.Z` goes out; everyone on BRAT gets it.
+
+First release: the first push after this lands opens `chore(release): 0.1.0` (no stable tag exists yet, so the current version is released as is). Merge it.
+
+Pushes and tags made by the workflows use `GITHUB_TOKEN`, which does not trigger other workflows, so `release.yml` starts the Docker image build for the tag itself (`gh workflow run docker.yml`). `chore(release): …` is reserved for the release PR; do not write it by hand, since the release workflow keys on it.
+
+Still manual, later:
+
+- Submit to the Obsidian community plugin list following the official guidelines (`isDesktopOnly: false`, no `innerHTML`, root `manifest.json`/`versions.json`, a stable release). After that, Obsidian itself offers updates and BRAT is only needed for betas.
+- Server binaries (`cargo build --release`) for Linux x86_64/arm64, macOS, Windows. The Docker image is already built per tag.

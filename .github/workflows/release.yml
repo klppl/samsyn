@@ -1,28 +1,62 @@
-name: Plugin release
+name: Release
 
-# Prepares an Obsidian plugin release. Tag the commit with the version number
-# (Obsidian convention: the tag must match the version in manifest.json, e.g.
-# `0.1.0`, no `v` prefix), push the tag, and this builds the plugin and creates a
-# DRAFT GitHub release with the three files Obsidian loads: main.js,
-# manifest.json, styles.css. Review the draft and publish it by hand.
+# Publishes plugin releases (main.js, manifest.json, styles.css as GitHub
+# release assets; BRAT installs from them). Two entry points:
+#
+# * Stable: push to main of the "chore(release): X.Y.Z" commit, i.e. merging the
+#   PR that release-pr.yml maintains. Tags X.Y.Z from manifest.json, builds,
+#   publishes a release.
+# * Beta: workflow_dispatch. Computes X.Y.Z-beta.N from the pending stable
+#   version (git-cliff) and the existing beta tags, builds with that version
+#   stamped into manifest.json, tags, publishes a GitHub *pre-release*. Nothing
+#   is committed to main; the repo keeps the last stable version.
+#
+# Pushes and tags made here use GITHUB_TOKEN, which fires no other workflows,
+# so the Docker image build for the tag is dispatched explicitly.
 
 on:
   push:
-    tags: ["*"]
+    branches: [main]
   workflow_dispatch:
     inputs:
-      tag:
-        description: "Version to release (must match manifest.json, no 'v' prefix)"
-        required: true
+      level:
+        description: "Beta of which bump? auto = git-cliff decides from the commits since the last stable tag"
+        type: choice
+        options: [auto, patch, minor, major]
+        default: auto
+      dry_run:
+        description: "Dry run: build and print, publish nothing"
+        type: boolean
+        default: false
 
 permissions:
   contents: write
+  actions: write
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+env:
+  GIT_CLIFF_VERSION: 2.14.2
 
 jobs:
   release:
     runs-on: ubuntu-latest
+    if: >-
+      github.repository_owner == 'mrboatsman' &&
+      (github.event_name == 'workflow_dispatch' ||
+       contains(github.event.head_commit.message, 'chore(release): '))
     steps:
+      - name: Refuse to cut betas from anything but main
+        if: github.event_name == 'workflow_dispatch' && github.ref != 'refs/heads/main'
+        run: |
+          echo "::error::Betas are cut from main, got ${GITHUB_REF}"
+          exit 1
+
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - uses: actions/setup-node@v4
         with:
@@ -30,35 +64,121 @@ jobs:
           cache: npm
           cache-dependency-path: plugin/package-lock.json
 
-      - name: Build plugin
+      - name: Install git-cliff
+        run: npm install --global "git-cliff@${GIT_CLIFF_VERSION}"
+
+      - name: Determine version
+        id: version
+        env:
+          EVENT: ${{ github.event_name }}
+          LEVEL: ${{ inputs.level || 'auto' }}
+        run: |
+          set -euo pipefail
+          node scripts/version.mjs check
+          CURRENT=$(node scripts/version.mjs current)
+
+          if [ "$EVENT" = "push" ]; then
+            # Stable: the merged release commit already carries the version.
+            VERSION="$CURRENT"
+            case "$VERSION" in *-*) echo "::error::manifest.json has pre-release version $VERSION on main"; exit 1;; esac
+            if git rev-parse -q --verify "refs/tags/$VERSION" >/dev/null; then
+              echo "Tag $VERSION already exists; nothing to do." | tee -a "$GITHUB_STEP_SUMMARY"
+              echo "skip=true" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            PRERELEASE=false
+          else
+            # Beta: base is the pending stable version; N continues from the
+            # highest existing beta tag of that base.
+            BASE=$(git cliff --bumped-version --unreleased | sed 's/^v//')
+            UNTAGGED=""
+            git rev-parse -q --verify "refs/tags/$CURRENT" >/dev/null || UNTAGGED="--current-untagged"
+            CANDIDATE=$(node scripts/version.mjs next --channel beta --level "$LEVEL" --base "$BASE" --current "$CURRENT" $UNTAGGED)
+            CBASE="${CANDIDATE%%-*}"
+            LAST_BETA=$(git tag -l "${CBASE}-beta.*" | sort -t. -k4 -n | tail -1)
+            if [ -n "$LAST_BETA" ]; then
+              VERSION=$(node scripts/version.mjs next --channel beta --level none --current "$LAST_BETA")
+            else
+              VERSION="$CANDIDATE"
+            fi
+            echo "current=$CURRENT  cliff-base=$BASE  level=$LEVEL  last-beta=${LAST_BETA:-none}"
+            if git rev-parse -q --verify "refs/tags/$VERSION" >/dev/null; then
+              echo "::error::Tag $VERSION already exists"; exit 1
+            fi
+            PRERELEASE=true
+          fi
+
+          { echo "skip=false"; echo "version=$VERSION"; echo "prerelease=$PRERELEASE"; } >> "$GITHUB_OUTPUT"
+          echo "## Release $VERSION" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Stamp beta version into the build (not committed)
+        if: steps.version.outputs.skip == 'false' && steps.version.outputs.prerelease == 'true'
+        run: node scripts/version.mjs set "${{ steps.version.outputs.version }}"
+
+      - name: Release notes
+        if: steps.version.outputs.skip == 'false'
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          PRERELEASE: ${{ steps.version.outputs.prerelease }}
+        run: |
+          set -euo pipefail
+          # Everything since the last stable tag; betas fold in, chore(release) is skipped.
+          git cliff --unreleased --tag "$VERSION" --strip all --output notes.md
+          if [ ! -s notes.md ]; then echo "No changes recorded since the last release." > notes.md; fi
+          if [ "$PRERELEASE" = "true" ]; then
+            printf '\n---\nPre-release for testers. Install with [BRAT](https://github.com/TfTHacker/obsidian42-brat) and enable pre-releases for this plugin.\n' >> notes.md
+          fi
+          { echo; cat notes.md; } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Build and test plugin
+        if: steps.version.outputs.skip == 'false'
         working-directory: plugin
         run: |
           npm ci
           npm run build
           npm test
+          node -e 'const m=require("./manifest.json"); if (m.version!==process.argv[1]) {console.error("built manifest has",m.version); process.exit(1)}' "${{ steps.version.outputs.version }}"
 
-      - name: Check tag matches manifest version
-        working-directory: plugin
+      - name: Tag
+        if: steps.version.outputs.skip == 'false' && !inputs.dry_run
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
         run: |
-          TAG="${GITHUB_REF_NAME}"
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then TAG="${{ inputs.tag }}"; fi
-          TAG="${TAG#v}"
-          MANIFEST=$(node -p "require('./manifest.json').version")
-          echo "tag=$TAG manifest=$MANIFEST"
-          if [ "$TAG" != "$MANIFEST" ]; then
-            echo "::error::Tag '$TAG' does not match manifest.json version '$MANIFEST'"
-            exit 1
-          fi
-          echo "VERSION=$TAG" >> "$GITHUB_ENV"
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -a "$VERSION" -m "Samsyn $VERSION"
+          git push origin "refs/tags/$VERSION"
 
-      - name: Create draft release
+      - name: Publish GitHub release
+        if: steps.version.outputs.skip == 'false' && !inputs.dry_run
         uses: softprops/action-gh-release@v2
         with:
-          draft: true
-          tag_name: ${{ env.VERSION }}
-          name: ${{ env.VERSION }}
+          tag_name: ${{ steps.version.outputs.version }}
+          name: ${{ steps.version.outputs.version }}
+          body_path: notes.md
+          prerelease: ${{ steps.version.outputs.prerelease == 'true' }}
+          draft: false
+          fail_on_unmatched_files: true
           files: |
             plugin/main.js
             plugin/manifest.json
             plugin/styles.css
-          fail_on_unmatched_files: true
+
+      - name: Build Docker image for the tag
+        if: steps.version.outputs.skip == 'false' && !inputs.dry_run
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run docker.yml --ref "${{ steps.version.outputs.version }}"
+
+      - name: Upload build for inspection (dry run)
+        if: steps.version.outputs.skip == 'false' && inputs.dry_run
+        uses: actions/upload-artifact@v4
+        with:
+          name: samsyn-${{ steps.version.outputs.version }}-dry-run
+          path: |
+            plugin/main.js
+            plugin/manifest.json
+            plugin/styles.css
+            notes.md
+          if-no-files-found: warn
