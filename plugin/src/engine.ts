@@ -23,6 +23,8 @@ export interface EngineEvents {
    * moved and the server moved the keys), so the engine must not replay it as delete + create.
    */
   claimRename?(oldPath: string, newPath: string): boolean;
+  /** A folder that is a share or mount root: never pruned when a remote delete empties it. */
+  isSharedRoot?(folderPath: string): boolean;
 }
 
 /**
@@ -505,7 +507,32 @@ export class SyncEngine {
     this.forgetSynced(key);
     const f = this.fileOf(key);
     if (f instanceof TFile) {
+      const parent = f.parent?.path ?? "";
       await this.app.fileManager.trashFile(f);
+      await this.pruneEmptyFolders(parent);
+    }
+  }
+
+  /**
+   * A remote delete emptied a folder (typically a folder renamed on another device, which
+   * arrives here as delete + create): remove it and any parent it leaves empty, so the old
+   * name does not linger as an empty shell. Stops at the engine root and at shared roots.
+   */
+  private async pruneEmptyFolders(folderPath: string): Promise<void> {
+    const root = this.target.root.replace(/\/$/, "");
+    let p = folderPath;
+    while (p && p !== "/" && p !== root) {
+      if (this.events.isSharedRoot?.(p)) return;
+      const folder = this.app.vault.getAbstractFileByPath(p);
+      if (!(folder instanceof TFolder) || folder.children.length > 0) return;
+      try {
+        await this.app.vault.delete(folder);
+      } catch {
+        return; // something arrived meanwhile; leave it
+      }
+      const i = p.lastIndexOf("/");
+      if (i < 0) return;
+      p = p.slice(0, i);
     }
   }
 

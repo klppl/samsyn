@@ -401,6 +401,7 @@ export default class SamsynPlugin extends Plugin {
     const engine = new SyncEngine(this.app, this.settings, this.persistence(scope), target, {
       onStatus: () => this.renderAggregateStatus(),
       claimRename: (o, n) => this.claimRename(o, n),
+      isSharedRoot: (p) => this.roots.some((r) => !r.isFile && r.path === p),
     });
     this.engines.set(target.id, engine);
     created?.(engine);

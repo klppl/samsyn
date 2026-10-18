@@ -42,7 +42,7 @@ One Yjs document per vault, two top-level maps:
 | `texts` | path | `Y.Text`                       | character-level CRDT merge      |
 | `blobs` | path | `{hash, size, mtime}`          | last writer wins per key        |
 
-Delete = remove the key. Rename = new key with a copy + remove old key. The server never interprets the content; it only stores and relays updates, so the schema can evolve on the plugin side.
+Delete = remove the key. Rename = new key with a copy + remove old key; a folder rename is that for every file in it, and a client applying the deletes removes the folders they leave empty (stopping at the sync root and at shared roots), so the old name does not linger on other devices. The server never interprets the content; it only stores and relays updates, so the schema can evolve on the plugin side.
 
 ## Schema migrations
 

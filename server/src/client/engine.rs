@@ -712,7 +712,27 @@ impl Engine {
         std::fs::create_dir_all(dest.parent().unwrap())?;
         std::fs::rename(&abs, &dest)?;
         tracing::info!("removed {rel} (kept in {})", dest.display());
+        if let Some(parent) = abs.parent() {
+            self.prune_empty_dirs(parent.to_path_buf());
+        }
         Ok(())
+    }
+
+    /// A remote delete emptied a folder (typically a folder renamed on another device, which
+    /// arrives as delete + create): drop it and any parent it leaves empty, stopping at the sync
+    /// root and at shared roots, which must stay where they are.
+    fn prune_empty_dirs(&self, mut dir: PathBuf) {
+        let keep: Vec<PathBuf> =
+            self.shared_roots.iter().filter(|r| !r.is_file).map(|r| self.abs(r.path.trim_end_matches('/'))).collect();
+        while dir != self.root && dir.starts_with(&self.root) {
+            if keep.contains(&dir) || std::fs::remove_dir(&dir).is_err() {
+                return; // a shared root, not empty, or already gone
+            }
+            match dir.parent() {
+                Some(p) => dir = p.to_path_buf(),
+                None => return,
+            }
+        }
     }
 
     async fn download_blob(&mut self, rel: &str, meta: &BlobMeta) -> anyhow::Result<()> {

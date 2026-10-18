@@ -126,6 +126,16 @@ fn share_mount_edit_revoke_restart() {
     assert_eq!(code, 200, "moving to a folder that is only shared on the other side is fine on this side");
     eventually!(15, b.exists("Projects/a.md"), "moved again", b.proc);
 
+    // A folder renamed inside the share arrives elsewhere as delete + create; the emptied old
+    // folder is removed too, not left as an empty shell.
+    b.write("Projects/Sub/Deep/one.md", "one\n");
+    b.write("Projects/Sub/two.md", "two\n");
+    eventually!(10, a.exists("Projects/X/Sub/Deep/one.md") && a.exists("Projects/X/Sub/two.md"), "owner gets the subfolder", a.proc, server.proc);
+    std::fs::rename(a.path("Projects/X/Sub"), a.path("Projects/X/Moved")).unwrap();
+    eventually!(15, b.exists("Projects/Moved/Deep/one.md") && b.exists("Projects/Moved/two.md"), "bob gets the renamed folder", b.proc, server.proc);
+    eventually!(10, !b.exists("Projects/Sub"), "bob keeps an empty shell of the old folder", b.proc);
+    assert!(b.exists("Projects/a.md"), "mount root pruned");
+
     // Moving the mount folder on disk is undone by the headless client (the plugin blocks it the
     // same way); only the API/Move… dialog may relocate a mount. The client learns the current
     // roots within 20 s of the remount.
